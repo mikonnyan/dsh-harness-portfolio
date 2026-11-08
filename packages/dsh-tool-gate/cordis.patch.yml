@@ -1,0 +1,5 @@
+# dsh-tool-gate bundle layer: hide rarely used tool groups; unlock via tool_unlock or /tools.
+- insert:
+    - id: tool-gate
+      name: '@dsh-external/dsh-tool-gate'
+      config: {}

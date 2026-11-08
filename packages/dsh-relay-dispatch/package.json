@@ -1,0 +1,35 @@
+{
+  "name": "@dsh-external/dsh-relay-dispatch",
+  "version": "0.1.0",
+  "description": "Heterogeneous multi-model master-worker dispatch & zero-flicker sidebar session tree for DeepSeek Harness",
+  "author": "mikonnyan",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "dispatch-modes.example.yaml",
+    "README.md"
+  ],
+  "license": "BSD-3-Clause",
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/client.js",
+    "test": "node test/unit.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "dsh": {
+    "client": {
+      "inject": [],
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

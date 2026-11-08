@@ -1,0 +1,5 @@
+# dsh-relay-dispatch bundle layer: host tools + client sidebar tree.
+- insert:
+    - id: relay-dispatch
+      name: '@dsh-external/dsh-relay-dispatch'
+      config: {}

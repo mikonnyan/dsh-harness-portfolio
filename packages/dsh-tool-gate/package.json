@@ -1,0 +1,38 @@
+{
+  "name": "@dsh-external/dsh-tool-gate",
+  "version": "0.1.0",
+  "description": "Tool-surface governance and on-demand skill loading for DeepSeek Harness (tool_unlock, /tools, skill_search, skill_load)",
+  "author": "mikonnyan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikonnyan/dsh-harness-portfolio.git",
+    "directory": "packages/dsh-tool-gate"
+  },
+  "homepage": "https://github.com/mikonnyan/dsh-harness-portfolio/tree/main/packages/dsh-tool-gate",
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./lib/index.js",
+    "./skill-search": "./lib/skill-search.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "peerDependencies": {
+    "cordis": ">=4.0.0-rc <5"
+  },
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/skill-search.js && node --check test/gate.test.mjs && node --check test/skill-search.test.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

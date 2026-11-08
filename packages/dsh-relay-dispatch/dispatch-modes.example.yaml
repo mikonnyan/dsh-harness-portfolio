@@ -1,0 +1,99 @@
+# dispatch-modes.example.yaml
+# 复制到 ~/.dsh/dispatch-modes.yaml（或通过环境变量 DSH_DISPATCH_MODES_PATH 指定），每次派发自动热读。
+#
+# 核心设计理念：
+# 1. 异构模型交叉验证（Heterogeneous Verification）：实现（implement）与验证/审查（verify / review）采用不同模型家族候选链，避免同模型自审共享盲区。
+# 2. 候选链自动降级（Fallback Chain）：按顺序先对照 list_capabilities 过滤不可用模型，若调用 start_run 遇到 429/5xx/超时/模型不存在等渠道异常，自动切换下一候选模型。
+
+aliases:
+  models:
+    - sonnet=copilot/claude-sonnet-5.5
+    - opus=cursor/claude-opus-5-5
+    - gemini-pro=google/gemini-3.8-pro
+    - gemini-flash=google/gemini-3.8-flash
+    - grok-fast=cursor/grok-4.7-fast
+    - gpt-codex=openai/gpt-5.3-codex
+
+investigate:
+  permission: read-only
+  agentPreset: standard-lean
+  models:
+    - grok-fast
+    - gemini-flash
+    - sonnet
+  taskPrefix: |
+    通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
+  deliverable: |
+    交付格式（总长尽量短，不贴整段代码）：
+    status: done | blocked
+    summary: ≤8 行，先给结论；证据路径与行号只列关键 3~5 条
+
+implement:
+  permission: danger-full-access
+  agentPreset: standard-lean
+  models:
+    - sonnet
+    - gpt-codex
+    - opus
+  taskPrefix: |
+    通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
+  deliverable: |
+    交付格式（总长尽量短，不贴整段代码或完整 diff）：
+    status: done | blocked
+    changed_files: [...]
+    verification: 跑了什么命令、结果如何
+    risks: ...
+    rollback: 如何回滚
+    summary: ≤10 行，先给结论；证据路径只列关键 3~5 条
+
+verify:
+  permission: read-only
+  agentPreset: standard-lean
+  models:
+    - gemini-pro
+    - gpt-codex
+    - sonnet
+  taskPrefix: |
+    通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
+    你是独立验证者（Verifier），必须独立执行检查命令与边界核验，不得轻信前序子任务的自述结论。
+  deliverable: |
+    交付格式（总长尽量短）：
+    status: done | blocked
+    verification: 逐项列出通过/不通过清单与复现命令
+    risks: 残余风险与边界条件
+    summary: ≤8 行，先给结论；证据路径只列关键 3~5 条
+
+review:
+  permission: read-only
+  agentPreset: standard-lean
+  models:
+    - opus
+    - gemini-pro
+    - gpt-codex
+  taskPrefix: |
+    通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
+    请从架构一致性、并发竞态、故障恢复、安全边界四个维度进行只读代码审查。
+  deliverable: |
+    交付格式（总长尽量短）：
+    status: done | blocked
+    risks: 按严重度（P0/P1/P2）列出发现的问题与精确文件行号
+    summary: ≤8 行，先给结论；证据路径只列关键 3~5 条
+
+heavy:
+  permission: danger-full-access
+  agentPreset: standard-lean
+  checkpoint: true
+  models:
+    - opus
+    - sonnet
+    - gpt-codex
+  taskPrefix: |
+    通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
+  deliverable: |
+    交付格式（总长尽量短，不贴整段代码或完整 diff）：
+    status: done | blocked
+    changed_files: [...]
+    verification: 跑了什么命令、结果如何
+    risks: ...
+    rollback: 如何回滚
+    summary: ≤10 行，先给结论；证据路径只列关键 3~5 条

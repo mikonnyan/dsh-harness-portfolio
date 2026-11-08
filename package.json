@@ -1,0 +1,26 @@
+{
+  "name": "dsh-harness-portfolio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production-grade Agent Infrastructure & Harness Engineering Portfolio for DeepSeek Harness: Tool-Surface Governance, Heterogeneous Multi-Agent Orchestration, and Surgical Context Compaction.",
+  "author": "mikonnyan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikonnyan/dsh-harness-portfolio.git"
+  },
+  "homepage": "https://github.com/mikonnyan/dsh-harness-portfolio#readme",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test:tool-gate": "npm --prefix packages/dsh-tool-gate test",
+    "test:relay-dispatch": "npm --prefix packages/dsh-relay-dispatch test",
+    "test:context-compact": "npm --prefix packages/dsh-context-compact test",
+    "test": "npm run test:tool-gate && npm run test:relay-dispatch && npm run test:context-compact",
+    "check": "npm --prefix packages/dsh-tool-gate run check && npm --prefix packages/dsh-relay-dispatch run check"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

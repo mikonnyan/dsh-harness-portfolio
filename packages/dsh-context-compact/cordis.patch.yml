@@ -1,0 +1,5 @@
+# dsh-context-compact bundle layer: precise context compaction and recall tools.
+- insert:
+    - id: context-compact
+      name: '@dsh-external/dsh-context-compact'
+      config: {}
