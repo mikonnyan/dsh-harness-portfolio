@@ -31,6 +31,8 @@ const DEFAULTS = {
   titlePollFirstMs: 400,
   titlePollIntervalMs: 3000,
   titlePollMaxAttempts: 40,
+  wakeDelayMs: 300, // 后台 job 结算后检查主会话 idle 未消费通知并补唤醒的延时（毫秒）
+  maxConsecutiveWakes: 15, // 插件侧连续自动唤醒主会话的安全上限
   defaultProvider: 'copilot',
   defaultModel: 'claude-sonnet-5.5',
   defaultAgentPreset: undefined, // 默认不设，沿用官方 preset；按需可配置为 'standard-lean'
@@ -604,6 +606,16 @@ export function isTransientPollError(err) {
   return /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|network|connection (failed|refused|reset|closed)|timed? ?out|\b50[234]\b/i.test(s)
 }
 
+/** 检查 agent 信箱中是否仍有未消费消息（兼容 ReactLoopAgent.inbox 与测试 mock）。 */
+export function hasPendingInbox(agent) {
+  const inbox = agent && agent.inbox
+  if (!inbox || typeof inbox !== 'object') return false
+  if (inbox.hasPending === true) return true
+  if (Array.isArray(inbox.nextStep) && inbox.nextStep.length > 0) return true
+  if (Array.isArray(inbox.nextTurn) && inbox.nextTurn.length > 0) return true
+  return false
+}
+
 export function apply(ctx, rawConfig) {
   const config = { ...DEFAULTS, ...(rawConfig || {}) }
   const tools = ctx.tools
@@ -614,6 +626,121 @@ export function apply(ctx, rawConfig) {
   let startChain = Promise.resolve()
   const activeStarts = new Set()
   const titleTasks = new Set()
+  const wakeTimers = new Set()
+  const wakeStates = new WeakMap()
+
+  function getWakeState(agent) {
+    const events = agent && agent.session && Array.isArray(agent.session.events) ? agent.session.events : null
+    let st = wakeStates.get(agent)
+    if (!st) {
+      st = { count: 0, lastCheckedLen: events ? events.length : 0 }
+      wakeStates.set(agent, st)
+      return st
+    }
+    if (events) {
+      for (let i = st.lastCheckedLen; i < events.length; i++) {
+        const e = events[i]
+        const src = (e && e.data && e.data.source) || (e && e.source)
+        if (e && e.type === 'user/message' && src && src.kind === 'user') {
+          st.count = 0
+        }
+      }
+      st.lastCheckedLen = events.length
+    }
+    return st
+  }
+
+  if (ctx && typeof ctx.on === 'function') {
+    try {
+      ctx.on('agent/inbox/claimed', ({ agent: claimedAgent, message }) => {
+        if (claimedAgent && message && message.source && message.source.kind === 'user') {
+          wakeStates.delete(claimedAgent)
+        }
+      })
+    } catch {}
+  }
+
+  /**
+   * 后台 job 结算完成（finish）后延时约 300ms 检查主会话 owner：
+   * 若 dsh-tool-jobs 因 maxConsecutiveWakes=3 走 inject 静默入队而未唤醒 idle 的 owner，
+   * 在连续派发安全上限（默认 15 次）内主动触发一次唤醒。
+   */
+  function scheduleOwnerWake(owner) {
+    if (disposed || !owner || typeof owner !== 'object') return
+    const wakeDelayMs = config.wakeDelayMs ?? DEFAULTS.wakeDelayMs
+    const maxWakes = config.maxConsecutiveWakes ?? DEFAULTS.maxConsecutiveWakes
+    if (!(maxWakes > 0)) return
+    const st = getWakeState(owner)
+    const wasIdleAtSettle = owner.status === 'idle'
+    let followedUp = false
+    let injectedMsg = null
+    const origFollowup = typeof owner.followup === 'function' ? owner.followup : null
+    const origInject = typeof owner.inject === 'function' ? owner.inject : null
+    let hooked = false
+    const unhook = () => {
+      if (!hooked) return
+      hooked = false
+      try {
+        if (origFollowup && owner.followup === wrappedFollowup) owner.followup = origFollowup
+        if (origInject && owner.inject === wrappedInject) owner.inject = origInject
+      } catch {}
+    }
+    const wrappedFollowup = function (msg) {
+      followedUp = true
+      st.count += 1
+      unhook()
+      return origFollowup.call(this, msg)
+    }
+    const wrappedInject = function (msg) {
+      injectedMsg = msg
+      unhook()
+      return origInject.call(this, msg)
+    }
+    try {
+      if (origFollowup) owner.followup = wrappedFollowup
+      if (origInject) owner.inject = wrappedInject
+      hooked = true
+    } catch {}
+    Promise.resolve().then(() => Promise.resolve().then(unhook))
+    const cancelWake = () => {
+      unhook()
+      clearTimeout(timer)
+      wakeTimers.delete(cancelWake)
+    }
+    const timer = setTimeout(() => {
+      wakeTimers.delete(cancelWake)
+      unhook()
+      if (disposed || !owner || owner.status !== 'idle') return
+      const curState = getWakeState(owner)
+      if (curState.count >= maxWakes) return
+      const pending = hasPendingInbox(owner)
+      const needsWake = pending || (!followedUp && wasIdleAtSettle && injectedMsg !== null)
+      if (!needsWake) return
+      curState.count += 1
+      try {
+        if (pending && typeof owner.wakeDriver === 'function') {
+          owner.wakeDriver()
+          return
+        }
+        if (pending && owner.inbox && Array.isArray(owner.inbox.nextStep) && owner.inbox.nextStep.length > 0 && typeof owner.followup === 'function') {
+          const msg = owner.inbox.nextStep[0]
+          if (typeof owner.inbox.remove === 'function' && msg && msg.id) owner.inbox.remove(msg.id)
+          else owner.inbox.nextStep.shift()
+          owner.followup(msg)
+          return
+        }
+        if (injectedMsg !== null && typeof owner.followup === 'function') {
+          owner.followup(injectedMsg)
+          return
+        }
+        if (typeof owner.wakeDriver === 'function') {
+          owner.wakeDriver()
+        }
+      } catch {}
+    }, Math.max(0, wakeDelayMs))
+    if (timer && typeof timer.unref === 'function') timer.unref()
+    wakeTimers.add(cancelWake)
+  }
 
   const emitWarn = (msg) => {
     try {
@@ -653,6 +780,10 @@ export function apply(ctx, rawConfig) {
       try { cancel() } catch {}
     }
     titleTasks.clear()
+    for (const cancel of [...wakeTimers]) {
+      try { cancel() } catch {}
+    }
+    wakeTimers.clear()
   })
 
   if (config.linkParentSession !== false) {
@@ -1000,6 +1131,7 @@ export function apply(ctx, rawConfig) {
       const cancelGraceMs = config.cancelGraceMs ?? config.cancelTimeoutMs ?? DEFAULTS.cancelGraceMs
       const deadline = getNow() + (args.maxWaitMinutes || config.maxWaitMinutes) * 60000
       const agent = exec.agent
+      if (agent && typeof agent === 'object') getWakeState(agent)
       let jobId
 
       jobId = jobs.start({
@@ -1010,7 +1142,11 @@ export function apply(ctx, rawConfig) {
           const abort = new AbortController()
           let cancelled = false
           let pending = ''
-          const finish = (r) => { pending += (r.output || '') + '\n' + modelNote; return r }
+          const finish = (r) => {
+            pending += (r.output || '') + '\n' + modelNote
+            if (!cancelled) scheduleOwnerWake(agent)
+            return r
+          }
           const done = (async () => {
             let snap = started
             let cancelRequestedAt = snap && snap.cancelRequested ? (parseTimeMs(snap.cancelRequestedAt ?? snap.canceledAt) ?? getNow()) : null

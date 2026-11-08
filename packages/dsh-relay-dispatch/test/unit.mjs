@@ -1065,3 +1065,82 @@ import { sendSessionNotice, isTransientPollError } from '../lib/index.js'
   assert(notices[0].includes('fetch failed'))
 }
 console.log('polish ok')
+
+// ───────── 连续派发超过 3 次（dsh-tool-jobs maxConsecutiveWakes=3）插件侧自动唤醒保障测试 ─────────
+import { hasPendingInbox } from '../lib/index.js'
+{
+  assert.equal(hasPendingInbox(null), false)
+  assert.equal(hasPendingInbox({ inbox: { nextStep: [], nextTurn: [] } }), false)
+  assert.equal(hasPendingInbox({ inbox: { nextStep: [{ id: 'm1' }], nextTurn: [] } }), true)
+  assert.equal(hasPendingInbox({ inbox: { hasPending: true } }), true)
+
+  // 场景 A：真实 ReactLoopAgent 形态（带 inbox.nextStep / nextTurn 与 wakeDriver），dsh-tool-jobs 默认 maxConsecutiveWakes=3
+  const consumed = []
+  const regTools = new Map()
+  const fakeCtx = new Context()
+  const inbox = {
+    nextStep: [],
+    nextTurn: [],
+    get hasPending() { return this.nextStep.length > 0 || this.nextTurn.length > 0 },
+  }
+  const fakeAgent = {
+    id: 'sess-wake-chain',
+    status: 'idle',
+    ctx: fakeCtx,
+    inbox,
+    session: { header: { id: 'sess-wake-chain' }, events: [] },
+    wakeDriver() {
+      const batch = [...this.inbox.nextStep.splice(0), ...this.inbox.nextTurn.splice(0, 1)]
+      for (const m of batch) consumed.push({ via: 'wakeDriver', text: m.content[0].text })
+    },
+    followup(msg) {
+      this.inbox.nextTurn.push(msg)
+      this.wakeDriver()
+    },
+    inject(msg) {
+      // 模拟 ReactLoopAgent.inject：只放入 nextStep，不唤醒 driver（status 保持 idle）
+      this.inbox.nextStep.push(msg)
+    },
+  }
+  let runSeq = 0
+  fakeCtx.provide('agents', { get: (id) => (id === fakeAgent.id ? fakeAgent : undefined) }, true)
+  fakeCtx.provide('systemPrompt', { section: () => {} }, true)
+  fakeCtx.provide('tools', {
+    register: (t) => { regTools.set(t.name, t); return () => regTools.delete(t.name) },
+    execute: async (c) => {
+      if (c.name.endsWith('start_run')) return { isError: false, value: { runId: `run-w-${++runSeq}` } }
+      if (c.name.endsWith('wait_run')) return { isError: false, value: { runId: `run-w-${runSeq}`, status: 'succeeded', assistantText: `完成#${runSeq}` } }
+      return { isError: false, value: {} }
+    },
+  }, true)
+  new LocalJobRegistry(fakeCtx, { maxConcurrentJobsPerOwner: 10 })
+  // 故意使用 dsh-tool-jobs 默认配置（maxConsecutiveWakes = 3）
+  applyToolJobs(fakeCtx, {})
+  // 插件侧配置 maxConsecutiveWakes = 5, wakeDelayMs = 20
+  apply(fakeCtx, { modesPath: yp, linkParentSession: false, refreshTitle: false, wakeDelayMs: 20, maxConsecutiveWakes: 5 })
+  const dispatchTool = regTools.get('relay_dispatch')
+
+  // 连续派发 5 次：前 3 次由 tool-jobs followup 唤醒，第 4、5 次 tool-jobs 走 inject 静默入队，由 relay-dispatch 延时唤醒
+  for (let i = 1; i <= 5; i++) {
+    await dispatchTool.execute({ startArgs: { workspace: 'W', task: `T${i}` } }, { agent: fakeAgent })
+    for (let w = 0; w < 20 && consumed.length < i; w++) await new Promise((r) => setTimeout(r, 10))
+    assert.equal(consumed.length, i, `第 ${i} 次连续派发应被成功唤醒并消费通知`)
+    assert(consumed[i - 1].text.includes(`完成#${i}`))
+    assert.equal(inbox.hasPending, false, `第 ${i} 次唤醒后信箱应被清空`)
+  }
+
+  // 第 6 次超出插件侧上限（maxConsecutiveWakes = 5）：应停止自动唤醒，消息留在 inbox.nextStep
+  await dispatchTool.execute({ startArgs: { workspace: 'W', task: 'T6' } }, { agent: fakeAgent })
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(consumed.length, 5, '超过 maxConsecutiveWakes 上限后不应继续自动唤醒')
+  assert.equal(inbox.nextStep.length, 1, '第 6 次通知应留在 nextStep 信箱中等待用户交互')
+  inbox.nextStep.length = 0
+
+  // 用户发送新消息后重置连续唤醒计数，第 7 次派发恢复自动唤醒
+  fakeAgent.session.events.push({ type: 'user/message', data: { source: { kind: 'user' } } })
+  await dispatchTool.execute({ startArgs: { workspace: 'W', task: 'T7' } }, { agent: fakeAgent })
+  for (let w = 0; w < 20 && consumed.length < 6; w++) await new Promise((r) => setTimeout(r, 10))
+  assert.equal(consumed.length, 6, '用户新消息后连续唤醒计数重置，应恢复自动唤醒')
+  assert(consumed[5].text.includes('完成#7'))
+}
+console.log('wake ok')
