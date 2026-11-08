@@ -1,0 +1,36 @@
+{
+  "name": "@dsh-external/dsh-eval-bench",
+  "version": "0.1.0",
+  "description": "Reproducible empirical evaluation benchmark and adversarial Needle-in-Compacted-Haystack (NICH) suite for DeepSeek Harness plugins (dsh-tool-gate, dsh-context-compact, dsh-relay-dispatch)",
+  "author": "mikonnyan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mikonnyan/dsh-harness-portfolio.git",
+    "directory": "packages/dsh-eval-bench"
+  },
+  "homepage": "https://github.com/mikonnyan/dsh-harness-portfolio/tree/main/packages/dsh-eval-bench",
+  "type": "module",
+  "main": "./lib/index.js",
+  "bin": {
+    "dsh-eval-bench": "./bin/bench.mjs"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "fixtures",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "check": "node --check lib/index.js && node --check bin/bench.mjs && node --check test/bench.test.mjs",
+    "test": "node --test test/*.test.mjs",
+    "bench": "node bin/bench.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

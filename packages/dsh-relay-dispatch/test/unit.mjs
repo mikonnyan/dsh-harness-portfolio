@@ -38,7 +38,7 @@ assert.equal(ap.args.permissionPreset, 'workspace-write')
 assert(ap.args.task.startsWith('PFX') && ap.args.task.includes('T') && ap.args.task.endsWith('DLV'))
 assert.equal(ap.candidates.length, 2)
 assert.equal(applyMode(pm.x, { task: 'T', model: 'z' }).candidates.length, 0)
-const rp = applyMode(pm.r, { task: 'hi' }); assert.equal(rp.args.task, 'hi'); assert.equal(rp.args.workspace, 'C:\\w')
+const rOut = applyMode(pm.r, { task: 'hi' }); assert.equal(rOut.args.task, 'hi'); assert.equal(rOut.args.workspace, 'C:\\w')
 
 // 能力识别
 assert(collectModelIds({ providers: [{ provider: 'a', models: ['m1'] }, { id: 'b', models: [{ id: 'm2' }] }] }).has('a/m1'))
@@ -708,7 +708,7 @@ import {
     }
   }
 
-  // 2a) run 状态直接变为 cancelled：立即结束 job，状态标为 cancelled，通知里写明「已取消」
+  // 2a) run 状态直接变为 cancelled：立即结束 job；宿主 job status 为 killed，通知 detail 仍写 status: cancelled
   {
     const env = createNotifyEnv()
     env.setStartResp({ runId: 'run-cancel-direct', sessionId: 'child-c1', webUrl: 'http://127.0.0.1:3080/?sessionId=child-c1' })
@@ -726,7 +726,8 @@ import {
     assert(env.notices[0].text.includes('已取消'), `通知应含「已取消」，实际：${env.notices[0].text}`)
     assert(!env.notices[0].text.includes('wait timeout'))
     const snap = env.fakeCtx.jobs.get(res.jobId, env.fakeAgent)
-    assert.equal(snap.status, 'cancelled')
+    assert.equal(snap.status, 'killed')
+    assert(String(snap.detail || '').includes('status: cancelled'))
     const out = await env.jobOutputTool.execute({ job_id: res.jobId }, { agent: env.fakeAgent })
     assert(out.text.includes('已取消'))
   }
@@ -763,7 +764,8 @@ import {
     assert(env.notices[0].text.includes('status: cancelled') && env.notices[0].text.includes('已取消'))
     assert(env.notices[0].text.includes('卡在某个长耗时工具前输出的文字'))
     const snap = env.fakeCtx.jobs.get(res.jobId, env.fakeAgent)
-    assert.equal(snap.status, 'cancelled')
+    assert.equal(snap.status, 'killed')
+    assert(String(snap.detail || '').includes('status: cancelled'))
   }
 
   // 2c) cancelRequested:true 且宿主子会话已终止（如 turn/end 已闭合但 relay status 仍为 running）：无需等满 1 分钟，立即按 cancelled 结束
@@ -782,7 +784,8 @@ import {
     const res = await env.dispatchTool.execute({ startArgs: { workspace: 'W', task: 'T' } }, { agent: env.fakeAgent })
     for (let i = 0; i < 20 && env.notices.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
     assert.equal(waitCalls, 1, '子会话已终止时首次观测到 cancelRequested 即立即结束')
-    assert.equal(env.fakeCtx.jobs.get(res.jobId, env.fakeAgent).status, 'cancelled')
+    assert.equal(env.fakeCtx.jobs.get(res.jobId, env.fakeAgent).status, 'killed')
+    assert(String(env.fakeCtx.jobs.get(res.jobId, env.fakeAgent).detail || '').includes('status: cancelled'))
     assert(env.notices[0].text.includes('已取消'))
   }
 

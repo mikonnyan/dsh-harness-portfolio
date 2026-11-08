@@ -1,8 +1,9 @@
 # DeepSeek Harness Engineering Portfolio — Production Agent Infrastructure
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Runtime: DeepSeek Harness](https://img.shields.io/badge/Runtime-DeepSeek%20Harness%20(Cordis%20DI)-0f172a.svg)](https://github.com/mikonnyan/dsh-harness-portfolio)
-[![Tests: 42 Passing](https://img.shields.io/badge/Tests-42%20Passing-16a34a.svg)](#quick-start--verification--快速验证)
+[![Runtime: DeepSeek Harness](https://img.shields.io/badge/Runtime-DeepSeek%20Harness%20(Cordis%20DI)-0f172a.svg)](https://github.com/dsh-external/dsh-harness-portfolio)
+[![Tests: 53 Passing](https://img.shields.io/badge/Tests-53%20Passing-16a34a.svg)](#quick-start--verification--快速验证)
+[![Benchmark: Zero-Key <1s](https://img.shields.io/badge/Benchmark-Zero--Key%20%3C1s%20Repro-7c3aed.svg)](./docs/04-harness-evaluation-benchmark.md)
 
 > **Flagship Agent Infrastructure & Context Engineering Suite for Long-Horizon Coding Agents**  
 > **面向长周期软件工程 Agent 的生产级基础设施与上下文治理作品集**
@@ -22,6 +23,7 @@ This repository presents **three orthogonal, production-verified runtime plugins
 - **[`@dsh-external/dsh-tool-gate`](./packages/dsh-tool-gate)** — **Tool Surface Governance**: Gates 4 heavy tool groups (`137 → 38` default tools) and replaces the ~9 KB static `<available_skills>` prompt block with two-phase on-demand skill loading (`skill_search` + `skill_load`), cutting static first-turn prompt overhead by **71.6%** with **zero-friction pre-execution auto-unlock** and synchronized ghost-context stripping.
 - **[`@dsh-external/dsh-relay-dispatch`](./packages/dsh-relay-dispatch)** — **Heterogeneous Multi-Agent Orchestration**: Decouples the main session into a lightweight **Orchestrator** that dispatches isolated **Fresh Workers** across heterogeneous model vendors (e.g., Claude, GPT, Gemini, Grok) with capability-aware fallback chains, Eliminates `wait_run` polling loops via inline job notifications, and renders a zero-flicker parent-child session tree in the Web GUI via React Fiber introspection + pure CSS Flex `order`.
 - **[`@dsh-external/dsh-context-compact`](./packages/dsh-context-compact)** — **Surgical Context Compaction**: Separates the immutable append-only event ledger (`session.events` / `.jsonl.zstd`) from the active LLM projection (`session.surface.nodes`). Empowers the agent to surgically replace individual tool results (`@call:<callId>`) or closed multi-turn spans (`@span:S<start>-<end>`) with high-density engineering conclusions, featuring **staged end-of-turn commits** and **recursive lossless recall** (`context_recall`) over nested `sourceEventSeqs` DAGs.
+- **[`@dsh-external/dsh-eval-bench`](./packages/dsh-eval-bench)** — **Three-Tier Evaluation & Adversarial Benchmark Suite**: Combines **Tier-1 Production Empirical Telemetry** (**97 real sessions / 29,004 Zstd frames / 342,035 events / 21,530,371 Event Tokens → 4,490,834 Surface Tokens (20.9%) / 25/52 (48.1%) independent defect interception**), **Tier-2 Deterministic Engine Benchmarks** (`G0~G4` progressive ablations and **Needle-in-Compacted-Haystack `C0~C4` achieving 10/10 (100%) exact recall, 10/10 distractor rejection & 0/5 (0%) negative FP** in `< 1s` via `npm run bench`), and **Tier-3 Cross-Vendor Blind-Spot Decoupling (`R1~R3`: `3/25 (12.0%)` → `14/25 (56.0%)` → `25/25 (100.0%)`)**.
 
 ---
 
@@ -90,7 +92,8 @@ flowchart TB
 | :--- | :--- | :--- | :--- | :--- |
 | **工具面与技能治理**<br/>`dsh-tool-gate` | 默认暴露工具数<br/>首轮静态 Prompt 开销<br/>技能目录静态注入<br/>复杂多步锚定遵循率<br/>首次调隐藏工具额外往返 | `137` 个工具<br/>`~28,500` Tokens<br/>`~9 KB` (`<available_skills>`)<br/>严重劣化（实测跌至 `0/9`）<br/>报错重试需 `+1` 轮 RTT | **`38` 个核心工具 (`-72.3%`)**<br/>**`~8,100` Tokens (`-71.6%`)**<br/>**`0 Bytes` 静态目录 (`-100%`)**<br/>**恢复至 `~81%` 基线水平**<br/>**`0` 额外轮次 (`Auto-Unlock`)** | 4 大重型工具组默认门控 (`dev`/`relay`/`connector`/`browser`)<br/>`filterTools` + `filterContexts` 幽灵上下文同步剥离<br/>`skill_search` + `skill_load` 两阶段按需加载<br/>`tool/pre-execute` 零摩擦自动解锁与事件流持久化 |
 | **异构多智能体调度**<br/>`dsh-relay-dispatch` | 子任务等待期間主程轮询<br/>跨厂商互审与容灾降级<br/>主会话上下文污染<br/>Web 侧栏父子拓扑渲染 | 手动循环 `wait_run` 空转烧 Token<br/>单模型硬编码、自审同源盲区<br/>检索与排错噪音全部堆积主会话<br/>平铺无层级或 DOM 搬移导致 React 崩溃 | **`0` 轮询（异步通知自动唤醒）**<br/>**多候选链热读 + 自动跨渠道降级**<br/>**Fresh 子会话完全隔离，仅回传摘要**<br/>**零闪烁树状折叠（零 React Reconciliation 冲突）** | `LocalJobRegistry` + `injectInlineNotification`<br/>`dispatch-modes.yaml` 热加载 + `isModelError` 分类重试<br/>`sessions.prepare` 并发安全槽注入 `meta.parentSession`<br/>React Fiber 向上探针 + 纯 CSS `order` 与自定义属性驱动 |
-| **事件流精确上下文压缩**<br/>`dsh-context-compact` | 压缩粒度与锚点保留度<br/>单次巨型噪音清理典型收益<br/>底层历史数据有损率<br/>当轮推理上下文连续性<br/>Prefix KV Cache 友好度 | 全量滚动摘要，行号/符号/错误码丢失<br/>全盘重写历史，好坏上下文同归于尽<br/>破坏性覆盖（原文永久不可逆丢失）<br/>当轮立即截断，打断后续工具链<br/>历史头部重写导致 Prefix Cache 全失效 | **`@call` 单条结果 + `@span` 区间级手术刀**<br/>**3 条大输出原位替换即削减 `~21k` Surface Tokens**<br/>**`0%` 有损（100% 底层保留 + 递归回召）**<br/>**Staged 轮末延迟提交，本轮内原文可见**<br/>**静态指令走 `systemPrompt.section` 稳固缓存前缀** | `session.events` 追加日志与 `surface.nodes` 投影分离<br/>`surfaceOp: { op: 'replace' }` 区间合并提交<br/>`sourceEventSeqs` 溯源 DAG 递归展开 + 深度上限保护<br/>`conclude_turn: true` 同轮结轮省 1 次 LLM RTT |
+| **事件流精确上下文压缩**<br/>`dsh-context-compact` | 压缩粒度与锚点保留度<br/>生产实测长程会话净收益<br/>底层历史数据有损率<br/>当轮推理上下文连续性<br/>Prefix KV Cache 友好度 | 全量滚动摘要，行号/符号/错误码丢失<br/>全盘重写历史，好坏上下文同归于尽<br/>破坏性覆盖（原文永久不可逆丢失）<br/>当轮立即截断，打断后续工具链<br/>历史头部重写导致 Prefix Cache 全失效 | **`@call` 单条结果 + `@span` 区间级手术刀**<br/>**8 会话 `753,347 → 556,615` (`-26.1% / -196,732` tok)，单会话峰值 `138,371 → 67,196` (`-51.4% / -71,175` tok)**<br/>**`0%` 有损（NICH 对抗基准 `10/10 (100%)` 回召 / `10/10` 拒识 / `0/5 (0%)` 误报）**<br/>**Staged 轮末延迟提交，本轮内原文可见**<br/>**静态指令走 `systemPrompt.section` 稳固缓存前缀** | `session.events` 追加日志与 `surface.nodes` 投影分离<br/>`surfaceOp: { op: 'replace' }` 区间合并提交<br/>`sourceEventSeqs` 溯源 DAG 递归展开 + 深度上限保护<br/>`conclude_turn: true` 同轮结轮省 1 次 LLM RTT |
+| **三层实证与对抗评测基准**<br/>`dsh-eval-bench` | 生产账本过滤比 (97 会话)<br/>生产异构复核缺陷拦截率<br/>NICH 嵌套压缩大海捞针 (`C0~C4`)<br/>评审盲区正交变量解耦 (`R1~R3`)<br/>复现成本与执行耗时 | 缺乏真实生产账本普查<br/>同模型自审仅检出 `3/25 (12.0%)`（漏检 `88.0%`）<br/>硬截断 `C1` 回召 `2/10 (20%)`，滚动摘要 `C2` 回召仅 `1/10 (10%)`<br/>上下文隔离与模型异构混为一谈<br/>依赖昂贵 API Key 且不可复现 | **`21,530,371` Event → `4,490,834` Surface (`20.9%`，过滤 `79.1%`)**<br/>**`52` 个独立复核子会话实测拦截 `25` 个确认缺陷 (`25/52 = 48.1%`)**<br/>**`C3` (`697 tok, -92.9%`) / `C4` (`236 tok, -97.6%`) 实现 `10/10 (100%)` 精确回召 + `10/10` 干扰拒识 + `0/5 (0%)` 阴性误报**<br/>**`R1=3/25 (12.0%)` → `R2=14/25 (56.0%, +44.0 pp)` → `R3=25/25 (100.0%, +44.0 pp)`**<br/>**`npm run bench` 零 Key、零网络 `< 1 秒` 确定性复现** | 29,004 个 Zstd 帧与 342,035 个生产事件全量普查<br/>`G0~G4` 五阶渐进消融矩阵 (`28,500 → 8,100 tok, -71.6%`)<br/>5 深度 × 10 阳性探针 + 10 真实埋入干扰针 + 5 阴性探针<br/>`R1~R3` 三阶受控盲区解耦矩阵（52 复核 / 25 确认缺陷） |
 
 ---
 
@@ -101,14 +104,16 @@ flowchart TB
 | 包路径 | 包名 | 核心定位与亮点 | 包内文档 |
 | :--- | :--- | :--- | :--- |
 | [`packages/dsh-tool-gate`](./packages/dsh-tool-gate) | `@dsh-external/dsh-tool-gate` | **工具面门控与按需技能引擎**：4 大工具组按需开关、`/tools` 交互面板、零摩擦自动放行、BM25 风格中英混合 `skill_search` 与 `skill_load`。 | [`packages/dsh-tool-gate/README.md`](./packages/dsh-tool-gate/README.md) |
-| [`packages/dsh-relay-dispatch`](./packages/dsh-relay-dispatch) | `@dsh-external/dsh-relay-dispatch` | **异构多模型主从调度器与侧栏会话树**：6 大预设派发模式、模型能力预检与故障降级链、后台生命周期管理、React Fiber + CSS Flex `order` 零闪烁侧栏树。 | [`packages/dsh-relay-dispatch/README.md`](./packages/dsh-relay-dispatch/README.md) |
+| [`packages/dsh-relay-dispatch`](./packages/dsh-relay-dispatch) | `@dsh-external/dsh-relay-dispatch` | **异构多模型主从调度器与侧栏会话树**：5 大内置工程派发模式（支持 YAML 热扩展）、模型能力预检与故障降级链、后台生命周期管理、React Fiber + CSS Flex `order` 零闪烁侧栏树。 | [`packages/dsh-relay-dispatch/README.md`](./packages/dsh-relay-dispatch/README.md) |
 | [`packages/dsh-context-compact`](./packages/dsh-context-compact) | `@dsh-external/dsh-context-compact` | **事件流级无损精确压缩与回召**：`@call` / `@span` 双粒度原位投影替换、Staged 轮末延迟提交、`conclude_turn` 结轮优化、`sourceEventSeqs` 递归无损 `context_recall`。 | [`packages/dsh-context-compact/README.md`](./packages/dsh-context-compact/README.md)<br/>[`packages/dsh-context-compact/MIGRATION.md`](./packages/dsh-context-compact/MIGRATION.md) |
+| [`packages/dsh-eval-bench`](./packages/dsh-eval-bench) | `@dsh-external/dsh-eval-bench` | **三层实证遥测与确定性对抗评测基准**：97 会话生产遥测核验、`G0~G4` 渐进消融、`T0~T2` 工具面治理对照、`C0~C4` NICH 对抗大海捞针（`10/10` 无损回召）与 `R1~R3` 盲区解耦。 | [`packages/dsh-eval-bench/README.md`](./packages/dsh-eval-bench/README.md)<br/>[`docs/04-harness-evaluation-benchmark.md`](./docs/04-harness-evaluation-benchmark.md) |
 
-### 2. 深度架构复盘文档（Architecture Deep-Dives）
+### 2. 深度架构复盘与旗舰评测报告（Architecture Deep-Dives & Evaluation Report）
 
 - **模块 01**：[`docs/01-tool-surface-governance.md`](./docs/01-tool-surface-governance.md) — *Agent 工具面治理与按需技能加载架构复盘（137 → 38 工具门控、幽灵上下文剥离、零摩擦自动放行与两阶段技能检索）*
 - **模块 02**：[`docs/02-heterogeneous-multi-agent-dispatch.md`](./docs/02-heterogeneous-multi-agent-dispatch.md) — *异构多模型主从调度与零闪烁侧栏会话树（Orchestrator-Worker 上下文隔离、跨厂商互审、非阻塞通知与 React Fiber 侧栏树渲染）*
 - **模块 03**：[`docs/03-surgical-context-compaction.md`](./docs/03-surgical-context-compaction.md) — *事件流级无损精确上下文压缩：告别有损滚动摘要的 Agent 记忆手术刀（Events vs. Surface 分离、双粒度原位替换、Staged 提交与 DAG 递归无损回召）*
+- **模块 04（旗舰评测报告）**：[`docs/04-harness-evaluation-benchmark.md`](./docs/04-harness-evaluation-benchmark.md) — *Harness Evaluation & Benchmark Report：三层证据分级体系、97 生产会话实测普查（21.53M Event Tokens / 48.1% 缺陷拦截）、G0~G4 渐进消融、NICH 对抗性大海捞针（10/10 精确回召 / 10/10 干扰拒识 / 0/5 阴性误报）与 R1~R3 异构盲区解耦*
 
 ---
 
@@ -136,11 +141,14 @@ flowchart TB
 
 ## Quick Start & Verification / 快速验证
 
-本仓库所有子包测试均采用 Node.js 原生测试运行器与纯正 Mock 契约构建，**无需外部网络或 API Key**，可在克隆后一键串行跑通全仓 42 项单元与集成测试套件：
+本仓库 4 个子包测试均采用 Node.js 原生测试运行器与纯正 Mock 契约构建，**无需外部网络或 API Key**，可在克隆后一键串行跑通全仓 **4 个包共 53 项**单元与集成测试套件：
 
 ```bash
-# 运行全仓统一测试套件（串行验证 dsh-tool-gate -> dsh-relay-dispatch -> dsh-context-compact）
+# 运行全仓统一测试套件（4 个包共 53 项测试）
 npm test
+
+# 一键运行三层确定性评测基准（零 API Key，< 1 秒输出 G0~G4 / T0~T2 / C0~C4 NICH / R1~R3 完整消融报表）
+npm run bench
 
 # 语法与静态检查
 npm run check
@@ -152,10 +160,11 @@ npm run check
 npm run test:tool-gate        # 24 tests: 门控过滤、幽灵上下文剥离、零摩擦自动解锁、BM25 技能检索与加载
 npm run test:relay-dispatch   # 11 suites: 模式解析、模型候选链容灾降级、并发槽隔离、父子会话树构建与终止级联
 npm run test:context-compact  # 7 tests: @call/@span 双粒度压缩、Staged 轮末合并、>70% 立即提交、conclude_turn 与嵌套无损回召
+npm run test:eval-bench       # 11 tests: G0~G4 渐进消融、NICH 10/10 阳性与干扰项埋入核验、R1~R3 盲区解耦与生产账本守恒断言
 ```
 
 ---
 
 ## License
 
-Released under the [MIT License](./LICENSE). Copyright (c) 2026 [mikonnyan](https://github.com/mikonnyan).
+Released under the [MIT License](./LICENSE). Copyright (c) 2026 DeepSeek Harness Engineering Portfolio Contributors.

@@ -17,8 +17,10 @@
     "test:tool-gate": "npm --prefix packages/dsh-tool-gate test",
     "test:relay-dispatch": "npm --prefix packages/dsh-relay-dispatch test",
     "test:context-compact": "npm --prefix packages/dsh-context-compact test",
-    "test": "npm run test:tool-gate && npm run test:relay-dispatch && npm run test:context-compact",
-    "check": "npm --prefix packages/dsh-tool-gate run check && npm --prefix packages/dsh-relay-dispatch run check"
+    "test:eval-bench": "npm --prefix packages/dsh-eval-bench test",
+    "test": "npm run test:tool-gate && npm run test:relay-dispatch && npm run test:context-compact && npm run test:eval-bench",
+    "check": "npm --prefix packages/dsh-tool-gate run check && npm --prefix packages/dsh-relay-dispatch run check && npm --prefix packages/dsh-eval-bench run check",
+    "bench": "node packages/dsh-eval-bench/bin/bench.mjs"
   },
   "engines": {
     "node": ">=20.0.0"

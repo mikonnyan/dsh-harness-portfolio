@@ -1156,8 +1156,9 @@ export function apply(ctx, rawConfig) {
               }
               if (cancelled || cancelledRun || (snap && snap.status === 'cancelled')) {
                 const output = buildCancelConclusion(snap, cancelReason)
+                // job_list 只接受 running|stopping|completed|killed|failed；取消语义留在 detail 的 status: cancelled。
                 const deliv = buildDelivery('cancelled', output)
-                return { status: 'cancelled', ...deliv, output }
+                return { status: 'killed', ...deliv, output }
               }
               const output = fullConclusion(snap)
               const ok = snap && snap.status === 'succeeded'
@@ -1167,7 +1168,7 @@ export function apply(ctx, rawConfig) {
               if (cancelled || cancelledRun || (snap && snap.status === 'cancelled')) {
                 const output = buildCancelConclusion(snap, cancelReason)
                 const deliv = buildDelivery('cancelled', output)
-                return { status: 'cancelled', ...deliv, output }
+                return { status: 'killed', ...deliv, output }
               }
               const output = fullConclusion(snap)
               return { status: 'failed', detail: String((err && err.message) || err), output }

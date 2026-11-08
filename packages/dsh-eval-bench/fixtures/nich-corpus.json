@@ -1,0 +1,295 @@
+{
+  "schemaVersion": "1.0.0",
+  "name": "NICH-Adversarial-v1",
+  "description": "Adversarial Needle-in-Compacted-Haystack (NICH) benchmark corpus across 5 depth levels (10%, 30%, 50%, 70%, 90%) with Windows backslash paths, Unicode/CJK/grapheme clusters, multi-line stack traces, near-miss Distractor Needles, and non-existent Negative Needles.",
+  "haystackConfig": {
+    "paddingLinesPerTurn": 75,
+    "openEvaluationTurn": 6
+  },
+  "turns": [
+    {
+      "turn": 1,
+      "depthPct": 10,
+      "callId": "call-t1",
+      "toolName": "read",
+      "userPrompt": "Inspect Zstd frame decompression and CRC validation in session store.",
+      "compactSummary": "Investigated Zstd frame reader in session store; identified CRC mismatch failure mode.",
+      "headerLines": [
+        "[trace] scanning C:\\work\\dsh-core\\packages\\session\\src\\zstd-frame.ts",
+        "[trace] frame_index=1042 magic=0xFD2FB528 window_log=21"
+      ],
+      "embeddedLines": [
+        {
+          "offsetRatio": 0.35,
+          "text": "DIAG_PATH_ANCHOR: C:\\work\\dsh-core\\packages\\session\\src\\zstd-frame.ts:418:13 [primary-fault-site]"
+        },
+        {
+          "offsetRatio": 0.38,
+          "text": "DIAG_PATH_SHADOW: C:\\work\\dsh-core\\packages\\session\\src\\zstd-frame.ts:419:13 (distractor-shadow-copy)"
+        },
+        {
+          "offsetRatio": 0.72,
+          "text": "DIAG_CRC_ERR: ERR_ZSTD_FRAME_CRC_MISMATCH (sha=7f4a9c2e8b1d04f6a3c5e9d2b7f1a8c4e6d0b2a9)"
+        },
+        {
+          "offsetRatio": 0.75,
+          "text": "DIAG_CRC_NOISE: ERR_ZSTD_FRAME_CRC_MISMATCH (sha=7f4a9c2e8b1d04f6a3c5e9d2b7f1a8c4e6d0b2a0)"
+        }
+      ]
+    },
+    {
+      "turn": 2,
+      "depthPct": 30,
+      "callId": "call-t2",
+      "toolName": "pwsh",
+      "userPrompt": "Run UTF-8 grapheme segmentation and surface replay diagnostics.",
+      "compactSummary": "Verified UTF-8 grapheme boundary handling and surface replay stack trace.",
+      "headerLines": [
+        "[pwsh] executing grapheme boundary check on multi-byte stream",
+        "[pwsh] locale=zh-CN.UTF-8 segmenter=granularity:grapheme"
+      ],
+      "embeddedLines": [
+        {
+          "offsetRatio": 0.30,
+          "text": "UNICODE_PROBE_PASS: UNICODE_GUARD_令牌_𠮷野家_👨‍👩‍👧‍👦_offset=1847 [verified=true]"
+        },
+        {
+          "offsetRatio": 0.33,
+          "text": "UNICODE_PROBE_DRIFT: UNICODE_GUARD_令牌_𠮷野家_👨‍👩‍👧‍👦_offset=1848 [verified=false]"
+        },
+        {
+          "offsetRatio": 0.68,
+          "text": "STACK_TRACE_HEAD: Error: surface node sequence gap detected\n    at SessionStore.replaySurface (C:\\work\\dsh-core\\packages\\session\\src\\surface.ts:279:21)\n    at AgentRunner.restoreContext (C:\\work\\dsh-core\\packages\\agent\\src\\runner.ts:114:9)"
+        },
+        {
+          "offsetRatio": 0.74,
+          "text": "STACK_TRACE_SHADOW: Error: surface node sequence gap shadow\n    at SessionStore.replaySurface (C:\\work\\dsh-core\\packages\\session\\src\\surface.ts:280:21)\n    at AgentRunner.restoreContext (C:\\work\\dsh-core\\packages\\agent\\src\\runner.ts:115:9)"
+        }
+      ]
+    },
+    {
+      "turn": 3,
+      "depthPct": 50,
+      "callId": "call-t3",
+      "toolName": "grep",
+      "userPrompt": "Check relay slot mutex ownership and Windows named pipe sandbox endpoints.",
+      "compactSummary": "Checked relay slot mutex ownership and Windows named pipe IPC endpoint.",
+      "headerLines": [
+        "[grep] searching active slot locks and sandbox IPC pipes",
+        "[grep] matched 4 entries in runtime diagnostics"
+      ],
+      "embeddedLines": [
+        {
+          "offsetRatio": 0.40,
+          "text": "MUTEX_STATE_ACTIVE: LOCK_SLOT_HEX=0x7ffe94a0c3b8 (owner=relay-dispatch-slot-19)"
+        },
+        {
+          "offsetRatio": 0.43,
+          "text": "MUTEX_STATE_STALE: LOCK_SLOT_HEX=0x7ffe94a0c3b9 (owner=relay-dispatch-slot-18)"
+        },
+        {
+          "offsetRatio": 0.78,
+          "text": "SANDBOX_IPC_ENDPOINT: \\\\.\\pipe\\dsh-sandbox-ipc-8841-a7c3 [mode=workspace-write]"
+        },
+        {
+          "offsetRatio": 0.84,
+          "text": "SANDBOX_IPC_STALE: \\\\.\\pipe\\dsh-sandbox-ipc-8841-a7c4 [mode=read-only]"
+        }
+      ]
+    },
+    {
+      "turn": 4,
+      "depthPct": 70,
+      "callId": "call-t4",
+      "toolName": "read",
+      "userPrompt": "Audit compaction tool-pairing balance and UTF-8 byte budget truncation.",
+      "compactSummary": "Audited tool-pairing balance invariant and 3000-byte detail truncation budget.",
+      "headerLines": [
+        "[audit] verifying tool-pairing cut balance across surface nodes",
+        "[audit] checking detail budget byte ceiling"
+      ],
+      "embeddedLines": [
+        {
+          "offsetRatio": 0.36,
+          "text": "PAIRING_AUDIT_RECORD: ERR_TOOL_PAIRING_IMBALANCE [seq=142..149, delta=-1]"
+        },
+        {
+          "offsetRatio": 0.39,
+          "text": "PAIRING_AUDIT_STALE: ERR_TOOL_PAIRING_IMBALANCE [seq=142..148, delta=-2]"
+        },
+        {
+          "offsetRatio": 0.74,
+          "text": "TRUNCATION_TRACE: Error: detail payload exceeded budget\nCaused by: RangeError: byteBudgetExceeded (limit=3000, actual=4819, graphemeSafe=true)\n    at buildDelivery (C:\\work\\dsh-core\\packages\\relay\\src\\index.js:138:19)"
+        },
+        {
+          "offsetRatio": 0.80,
+          "text": "TRUNCATION_TRACE_SHADOW: Error: detail payload exceeded shadow budget\nCaused by: RangeError: byteBudgetExceeded (limit=3000, actual=4820, graphemeSafe=false)\n    at buildDelivery (C:\\work\\dsh-core\\packages\\relay\\src\\index.js:139:19)"
+        }
+      ]
+    },
+    {
+      "turn": 5,
+      "depthPct": 90,
+      "callId": "call-t5",
+      "toolName": "pwsh",
+      "userPrompt": "Finalize architecture verification verdict and record config SHA-256.",
+      "compactSummary": "Finalized architecture verification (ARCH_VERDICT: surface-index-cut-verified-v2.4) and recorded config digest.",
+      "headerLines": [
+        "[verify] final pre-commit verification pass",
+        "[verify] computing configuration digest"
+      ],
+      "embeddedLines": [
+        {
+          "offsetRatio": 0.45,
+          "text": "VERDICT_TAG: ARCH_VERDICT: surface-index-cut-verified-v2.4"
+        },
+        {
+          "offsetRatio": 0.50,
+          "text": "VERDICT_TAG_STALE: ARCH_VERDICT: surface-index-cut-verified-v2.3 (superseded-candidate)"
+        },
+        {
+          "offsetRatio": 0.82,
+          "text": "CONFIG_DIGEST: CFG_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "offsetRatio": 0.88,
+          "text": "CONFIG_DIGEST_STALE: CFG_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b800"
+        }
+      ]
+    }
+  ],
+  "positiveNeedles": [
+    {
+      "id": "N-01",
+      "turn": 1,
+      "depthPct": 10,
+      "callId": "call-t1",
+      "category": "windows-path-line",
+      "query": "zstd-frame.ts:418:13",
+      "expectedLiteral": "C:\\work\\dsh-core\\packages\\session\\src\\zstd-frame.ts:418:13",
+      "distractorLiteral": "C:\\work\\dsh-core\\packages\\session\\src\\zstd-frame.ts:419:13 (distractor-shadow-copy)"
+    },
+    {
+      "id": "N-02",
+      "turn": 1,
+      "depthPct": 10,
+      "callId": "call-t1",
+      "category": "error-code-sha",
+      "query": "7f4a9c2e8b1d04f6a3c5e9d2b7f1a8c4e6d0b2a9",
+      "expectedLiteral": "ERR_ZSTD_FRAME_CRC_MISMATCH (sha=7f4a9c2e8b1d04f6a3c5e9d2b7f1a8c4e6d0b2a9)",
+      "distractorLiteral": "ERR_ZSTD_FRAME_CRC_MISMATCH (sha=7f4a9c2e8b1d04f6a3c5e9d2b7f1a8c4e6d0b2a0)"
+    },
+    {
+      "id": "N-03",
+      "turn": 2,
+      "depthPct": 30,
+      "callId": "call-t2",
+      "category": "unicode-cjk-grapheme",
+      "query": "offset=1847",
+      "expectedLiteral": "UNICODE_GUARD_令牌_𠮷野家_👨‍👩‍👧‍👦_offset=1847",
+      "distractorLiteral": "UNICODE_GUARD_令牌_𠮷野家_👨‍👩‍👧‍👦_offset=1848"
+    },
+    {
+      "id": "N-04",
+      "turn": 2,
+      "depthPct": 30,
+      "callId": "call-t2",
+      "category": "multiline-stack-frame",
+      "query": "surface.ts:279:21",
+      "expectedLiteral": "at SessionStore.replaySurface (C:\\work\\dsh-core\\packages\\session\\src\\surface.ts:279:21)",
+      "distractorLiteral": "at SessionStore.replaySurface (C:\\work\\dsh-core\\packages\\session\\src\\surface.ts:280:21)"
+    },
+    {
+      "id": "N-05",
+      "turn": 3,
+      "depthPct": 50,
+      "callId": "call-t3",
+      "category": "hex-pointer-slot",
+      "query": "0x7ffe94a0c3b8",
+      "expectedLiteral": "LOCK_SLOT_HEX=0x7ffe94a0c3b8 (owner=relay-dispatch-slot-19)",
+      "distractorLiteral": "LOCK_SLOT_HEX=0x7ffe94a0c3b9 (owner=relay-dispatch-slot-18)"
+    },
+    {
+      "id": "N-06",
+      "turn": 3,
+      "depthPct": 50,
+      "callId": "call-t3",
+      "category": "windows-named-pipe",
+      "query": "dsh-sandbox-ipc-8841-a7c3",
+      "expectedLiteral": "\\\\.\\pipe\\dsh-sandbox-ipc-8841-a7c3",
+      "distractorLiteral": "\\\\.\\pipe\\dsh-sandbox-ipc-8841-a7c4"
+    },
+    {
+      "id": "N-07",
+      "turn": 4,
+      "depthPct": 70,
+      "callId": "call-t4",
+      "category": "invariant-seq-range",
+      "query": "seq=142..149, delta=-1",
+      "expectedLiteral": "ERR_TOOL_PAIRING_IMBALANCE [seq=142..149, delta=-1]",
+      "distractorLiteral": "ERR_TOOL_PAIRING_IMBALANCE [seq=142..148, delta=-2]"
+    },
+    {
+      "id": "N-08",
+      "turn": 4,
+      "depthPct": 70,
+      "callId": "call-t4",
+      "category": "multiline-caused-by",
+      "query": "actual=4819, graphemeSafe=true",
+      "expectedLiteral": "Caused by: RangeError: byteBudgetExceeded (limit=3000, actual=4819, graphemeSafe=true)",
+      "distractorLiteral": "Caused by: RangeError: byteBudgetExceeded (limit=3000, actual=4820, graphemeSafe=false)"
+    },
+    {
+      "id": "N-09",
+      "turn": 5,
+      "depthPct": 90,
+      "callId": "call-t5",
+      "category": "high-level-verdict",
+      "query": "surface-index-cut-verified-v2.4",
+      "expectedLiteral": "ARCH_VERDICT: surface-index-cut-verified-v2.4",
+      "distractorLiteral": "ARCH_VERDICT: surface-index-cut-verified-v2.3"
+    },
+    {
+      "id": "N-10",
+      "turn": 5,
+      "depthPct": 90,
+      "callId": "call-t5",
+      "category": "sha256-digest",
+      "query": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expectedLiteral": "CFG_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "distractorLiteral": "CFG_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b800"
+    }
+  ],
+  "negativeNeedles": [
+    {
+      "id": "NEG-01",
+      "target": "@turn:1",
+      "query": "ERR_QUANTUM_FLUX_UNDERFLOW_9999",
+      "description": "Non-existent error code probe in Turn 1"
+    },
+    {
+      "id": "NEG-02",
+      "target": "@turn:2",
+      "query": "C:\\\\work\\\\dsh-core\\\\packages\\\\session\\\\src\\\\nonexistent-ghost.ts:999:1",
+      "description": "Non-existent Windows file path probe in Turn 2"
+    },
+    {
+      "id": "NEG-03",
+      "target": "@call:call-t3",
+      "query": "LOCK_SLOT_HEX=0xdeadbeefcafebabe",
+      "description": "Non-existent hex lock pointer probe in Turn 3"
+    },
+    {
+      "id": "NEG-04",
+      "target": "@call:call-t4",
+      "query": "UNICODE_GUARD_不存在的幽灵探针_offset=99999",
+      "description": "Non-existent Unicode/CJK probe in Turn 4"
+    },
+    {
+      "id": "NEG-05",
+      "target": "@turn:5",
+      "query": "sha=0000000000000000000000000000000000000000",
+      "description": "Non-existent all-zero SHA probe in Turn 5"
+    }
+  ]
+}
