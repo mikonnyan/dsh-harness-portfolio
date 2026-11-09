@@ -193,6 +193,31 @@ sequenceDiagram
 
 ---
 
+### 2.4 增量待压缩池软水位自动提醒（Soft Watermark Auto-Hint）与 Prompt Cache 经济学
+
+在长周期会话中，如果完全依赖模型自行判断何时调用 `context_compact`，往往面临三大工程摩擦：
+1. **额外往返开销**：模型若先调用 `context_compact({ inspect: true })` 查看哪些轮次或 `callId` 值得压缩，会平白消耗一整轮 LLM 请求往返（多付一次全量 Input Tokens）。
+2. **总量水位误报陷阱（Baseline False-Positive Trap）**：如果简单按会话总 `surfaceTokens >= 60k` 触发提醒，在经历过数次阶段压缩的长会话中，基底上下文（系统提示词 + 已生成的历史 `@span`/`@call` 摘要节点 + 最近 `keepRecentTurns = 5` 轮活跃对话）本身就可能占据 `40k~70k` Tokens。若按总表面 Token 判定，刚压缩完下一轮仍会持续误报。
+3. **长后台任务导致的 5 分钟 Prompt Cache 过期重算与摘要 Output 成本膨胀**：主流推理提供商（如 Anthropic Claude / DeepSeek）的 Ephemeral Prompt Cache TTL 通常为 **5 分钟**。当主控 Agent 派发耗时超过 5 分钟的后台子任务（如 `relay_dispatch`、`claude_code` 或长时构建）时，等待期间前缀缓存必然自然过期；若不在派发前顺手压缩，后台任务完成唤醒主会话时将按全额膨胀体积重新计算 Uncached Input Tokens。同时，若模型撰写冗长的自然语言摘要，高昂的 Output Token 单价反而会抵消压缩收益。
+
+为此，`dsh-context-compact` 引入了 **基于增量待压缩池（`compactableTokens`）的零往返软水位自动提醒机制（`inspectSoftWatermark` / `buildSoftWatermarkHint`）**：
+
+- **严格按「待压缩池增量（`compactableTokens`）」而非总上下文判定**：
+  - 定义 `compactableTokens` = 当前表面节点中，**排除掉已压缩摘要节点（`@span` / `@call`，即 `surfaceOp !== 'append'` 或已在当轮队列暂存）且排除掉最近 `keepRecentTurns`（默认 `5` 轮）活跃对话之后，真正处于可压缩区间（`turn:A..turn:B`）内的未压缩节点 Token 总和**（以及区间外未压缩的大单条 `tool/result >= 500t`）。
+  - 刚完成压缩时，`compactableTokens` 立即归零（`0`）；即便历史摘要与最近 5 轮活跃对话合计高达 `70k+` Tokens，只要新增待压缩池未达标就绝不误报。
+- **双维度软水位触发阈值（可通过插件 `config` 配置，默认开启）**：
+  - `softWatermarkTokens`: 默认 `60000`（待压缩池增量 `compactableTokens >= 60k` tokens）
+  - `softWatermarkTurns`: 默认 `20`（自上次 `span` 压缩以来未压缩已闭合轮次 `uncompactedClosedTurns >= 20` 轮）
+  - `keepRecentTurns`: 默认 `5`（推荐 `spans` 区间时自动保留最近 5 轮不压）
+- **零额外往返参数预喂 + 按压缩周期锁存防快照膨胀 + 电报体摘要引导**：
+  当任一软水位达标时，通过 `systemPrompt.context` 动态上下文输出如下单行机器指令，并按压缩周期（最新 `compaction/*` 事件 `seq`）锁存首次达标时的提醒字符串（去掉实时变化的浮点 `k` 数），保证未执行新压缩前每轮返回完全相同的字符串，避免宿主每轮追加持久化 `user/message` 快照。来源为 `@deepseek-ai/dsh-system-prompt` 的持久化快照本身也不计入待压缩池；大块目录与水位提醒按表面版本共享一次 Token 测量，表面变化后立即失效。提醒直接给出可原样传入 `context_compact` 的 `turn:A..turn:B` 区间与 Top 3 最大 `callId`：
+  ```text
+  [context-compact 水位提醒: 待压缩池已达软水位（共 24 轮未压缩）。请在本步调用工具（特别是派发长后台任务前，防 5 分钟缓存过期全额重算）或回复（配 conclude_turn:true）时顺手调用 context_compact，无需先调 inspect:true；summary 请用 ≤120 tokens 电报体（路径:行号+结论）以压低输出成本。建议已完成区间: turn:1..turn:19；最大单条结果: call_xxx(read,1607t), call_yyy(grep,1249t)]
+  ```
+  模型无需先调 `inspect: true`，即可在派发长后台任务的同一步或输出最终回复（配 `conclude_turn: true`）时零往返完成压缩，并以 `≤120 tokens` 的电报体摘要（`路径:行号+结论`）将单次压缩的 Output 成本控制在最低水平。
+
+---
+
 ## 3. 无损回召（Lossless Recall）：基于 `sourceEventSeqs` 的多级溯源展开
 
 任何有工程价值的压缩，都必须回答一个终极问题：**如果 10 轮之后，Agent 突然需要查看被压缩日志里第 138 行的具体堆栈，怎么办？**
@@ -284,9 +309,9 @@ export function resolveLeafSurfaceSeqs(events, rootSeqs) {
 | **源码审计阶段收敛**：4 条源码/测试文件 `read` 批量剪枝 | `results` × 4 | `35,238` tok | `312` tok | **`-34,926` tok** | **99.1%** | 4 个 `@call:*` 标签随时支持按行或正则无损回召 |
 | **长程会话宏观对账**：`220k` 总事件会话清理巨型 `grep`/`read` | `spans` + `results` | `59,140` tok (Surface) | `37,660` tok (Surface) | **`-21,480` tok** | **单次削减 36.3% 活跃上下文** | 穿透二级嵌套 Checkpoint 找回 Turn 1 原始叶子 |
 
-### 4.2 工程完备性验证矩阵（7 大集成测试全绿）
+### 4.2 工程完备性验证矩阵（10 大集成测试全绿）
 
-通过运行 `node --test test/compact.test.mjs`，全部 7 项核心工程不变量 100% 验证通过：
+通过运行 `node --test test/unit.mjs`（或 `node --test test/compact.test.mjs`），全部 10 项核心工程不变量 100% 验证通过：
 
 1. **单条结果压缩 + 影子计费（Shadow Pricing）+ 分页回召**：验证 `beforeTokens - afterTokens === committed.savings`，且 140 行原始文本通过 `[1, 120]` 与 `[121, 200]` 两页完整无损召回。
 2. **多轮区间压缩 + 二级嵌套压缩 + 持久化恢复一致性**：验证同次调用中 `spans` 自动剔除已覆盖的 `call_t1`，二次嵌套跨轮压缩后 `@call:call_t1`、`@turn:2` 与 `@span:S...` 均能穿透两层 `replace` 找回原始锚点，且 `sessions.prepare(..., { seedSource: 'persistence' })` 重放后 `surface.nodes` 与 `deriveMessages()` 完全一致。
@@ -295,3 +320,6 @@ export function resolveLeafSurfaceSeqs(events, rootSeqs) {
 5. **Turn Abort 跨轮保留与多会话隔离**：验证 `turnsBack:2` 在暂存期归一化为 `turn:1`，Turn 3 被 `abort` 后队列跨 `turn/end` 存活，并在 Turn 4 结束时准确压缩 Turn 1（不会因轮次推进而误压 Turn 2）；不同 `Session` 队列严格隔离。
 6. **提交失败有界重试（最多 2 次）与已压缩目标静默跳过**：验证瞬态锁失败后自动重入队重试，重试前若目标已被手动压缩则静默跳过，连续失败满 2 次后移入 `dropped` 队列不再死循环。
 7. **同轮重复区间去重与重叠/包含区间优雅跳过**：验证同轮重复暂存同一区间（含等价的 `turn:1..turn:2` 与 `turnsBack:3..turnsBack:2`）原地更新摘要，存在部分重叠或包含关系的区间在提交时自动跳过并附带原因说明，零异常中断。
+8. **软水位线零往返自动提醒与按压缩周期锁存防快照膨胀**：验证未达软水位时不输出提醒；达到 `>= 20` 个未压缩闭合轮次时自动生成包含精确 `turn:1..turn:19` 与 Top 3 `callId` 的提醒，经 `systemPrompt.context` 输出并按压缩周期（最新 `compaction/*` 事件 `seq`）锁存完全相同的字符串；暂存或提交压缩后提醒自动消失。
+9. **增量待压缩池（`compactableTokens`）高基底防误报验证**：验证即便历史已压缩摘要与最近 `keepRecentTurns = 5` 轮活跃对话合计占据 `>70k` 表面 Tokens，只要新攒出的 `compactableTokens` 未达 `60k` 阈值就绝不误报；唯有新增待压缩池跨过 `60k` 时才精准触发，并在压缩后立即归零。
+10. **持久化系统提示快照防膨胀与测量缓存**：验证 `@deepseek-ai/dsh-system-prompt` 持久化快照真实增加表面 Tokens、却不抬升待压缩池或误触发水位；同一表面版本的大块目录与水位提醒只测量一次，追加新表面节点后缓存立即失效并重新测量。

@@ -7,9 +7,11 @@ import {
   apply,
   buildLargeBlocksDirectory,
   buildInspectReport,
+  buildSoftWatermarkHint,
   checkConcludeTurnEligibility,
   classifySpanOverlap,
   getStagedQueueSnapshot,
+  inspectSoftWatermark,
   isResultAlreadyCompacted,
   isSameSpanTarget,
   isSpanAlreadyCompacted,
@@ -1017,4 +1019,219 @@ test('same-turn duplicate span deduplication in staging + overlapping/contained 
   session.append('step/end', { turn: 4, step: 1 })
   await emitTurnStopping(fakeAgent, 4, ctrl.signal)
   session.append('turn/end', { turn: 4, reason: { kind: 'completed' } })
+})
+
+test('soft watermark auto-hint: (1) silent below watermark; (2) triggers at >=20 closed turns or >=60k compactable tokens with exact turn:A..turn:B and Top 3 callId, latches identical string per compaction cycle without floating-point k numbers; (3) disappears after compaction', async () => {
+  const { sessions, tokenMeter, registeredTools, promptContexts, emitTurnStopping } = await createTestHarness()
+  const session = sessions.prepare('test-soft-watermark-turns', { meta: { cwd: TEST_CWD } })
+  const compactTool = registeredTools.get('context_compact')
+  const directoryCtx = promptContexts.get('context-compact:directory')
+  const ctrl = new AbortController()
+  const fakeAgent = { id: 'agent-watermark-1', session }
+
+  // (1) Add 10 closed turns (< 20 turns, < 60k compactable tokens) -> NO watermark hint
+  for (let t = 1; t <= 10; t++) {
+    const lines = t === 2 ? 95 : t === 5 ? 80 : t === 8 ? 65 : 20
+    const out = Array.from({ length: lines }, (_, i) => `T${t}_L${i + 1}: payload_${t}_${i + 1} ${'X'.repeat(32)}`).join('\n')
+    const toolName = t === 5 ? 'grep' : 'read'
+    addCompleteTurnWithTool(session, t, `call_wm_${t}`, toolName, out)
+  }
+
+  const eventsBeforeCheck1 = session.events.length
+  const wmBelow = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(wmBelow.triggered, false, 'should not trigger when turns < 20 and compactableTokens < 60k')
+  assert.equal(wmBelow.hint, '')
+  assert.equal(buildSoftWatermarkHint(session, tokenMeter), '')
+  assert.equal(session.events.length, eventsBeforeCheck1, 'must not pollute session.events')
+
+  // (2a) Continue to 24 closed turns -> triggers turn-based soft watermark (>= 20 turns), keeps recent 5 (20..24), suggests turn:1..turn:19 + Top 3 callIds
+  for (let t = 11; t <= 24; t++) {
+    const out = Array.from({ length: 18 }, (_, i) => `T${t}_L${i + 1}: small_${t}_${i + 1} ${'Y'.repeat(24)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_wm_${t}`, 'read', out)
+  }
+
+  session.append('turn/start', { turn: 25 })
+  session.append('step/start', { turn: 25, step: 1 })
+  const eventsSnapshotBeforeReq = session.events.length
+  const surfaceSnapshotBeforeReq = [...session.surface.nodes]
+
+  const wmTriggered = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(wmTriggered.triggered, true)
+  assert.equal(wmTriggered.uncompactedClosedTurns, 24)
+  assert.equal(wmTriggered.compactableTurns, 19)
+  assert.deepEqual(wmTriggered.suggestedSpan && { from: wmTriggered.suggestedSpan.from, to: wmTriggered.suggestedSpan.to }, {
+    from: 'turn:1',
+    to: 'turn:19',
+  })
+  assert.equal(wmTriggered.topCandidates.length, 3)
+  assert.deepEqual(
+    wmTriggered.topCandidates.map((c) => `${c.callId}:${c.toolName}`),
+    ['call_wm_2:read', 'call_wm_5:grep', 'call_wm_8:read']
+  )
+  assert.ok(wmTriggered.hint.includes('[context-compact 水位提醒: 待压缩池已达软水位（共 24 轮未压缩）'))
+  assert.ok(!/~\d+\.\d+k/.test(wmTriggered.hint), 'hint must not contain real-time changing floating-point k numbers')
+  assert.ok(wmTriggered.hint.includes('建议已完成区间: turn:1..turn:19'))
+  assert.ok(wmTriggered.hint.includes('call_wm_2(read,'))
+  assert.ok(wmTriggered.hint.includes('call_wm_5(grep,'))
+  assert.ok(wmTriggered.hint.includes('call_wm_8(read,'))
+
+  const firstContextText = directoryCtx.text({ agent: fakeAgent })
+  const firstLatchedHint = buildSoftWatermarkHint(session, tokenMeter)
+  assert.ok(firstContextText.includes('建议已完成区间: turn:1..turn:19'))
+  assert.equal(session.events.length, eventsSnapshotBeforeReq, 'session.events must remain completely untouched')
+  assert.deepEqual(session.surface.nodes, surfaceSnapshotBeforeReq, 'session.surface.nodes must remain untouched')
+
+  // (2b) Finish turn 25 without compacting and advance to turn 26 -> systemPrompt.context MUST stay byte-for-byte identical
+  // within the same compaction cycle (no new compaction/* event), preventing host from appending new user/message snapshots every turn!
+  session.append('step/end', { turn: 25, step: 1 })
+  session.append('turn/end', { turn: 25, reason: { kind: 'completed' } })
+  const out26 = Array.from({ length: 18 }, (_, i) => `T26_L${i + 1}: small_26_${i + 1} ${'Y'.repeat(24)}`).join('\n')
+  addCompleteTurnWithTool(session, 26, 'call_wm_26', 'read', out26)
+  session.append('turn/start', { turn: 27 })
+  session.append('step/start', { turn: 27, step: 1 })
+
+  const wmTurn27Live = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(wmTurn27Live.uncompactedClosedTurns, 25)
+  assert.equal(wmTurn27Live.suggestedSpan.to, 'turn:20')
+  assert.equal(buildSoftWatermarkHint(session, tokenMeter), firstLatchedHint, 'latched watermark hint must stay identical before any new compaction')
+  assert.equal(directoryCtx.text({ agent: fakeAgent }), firstContextText, 'systemPrompt.context output must remain identical across turns in same compaction cycle')
+
+  // (3) Compact turn:1..turn:20 -> watermark drops to 5 uncompacted turns (0 compactable turns/tokens) and latched hint disappears!
+  await compactTool.execute({
+    spans: [{ from: 'turn:1', to: 'turn:20', summary: 'Turns 1-20 telegraphic checkpoint: anchors verified.' }],
+  }, { callId: 'call_compact_wm', agent: fakeAgent, signal: ctrl.signal })
+
+  // Even while staged in the current turn, watermark immediately recognizes the staged span and stops nagging
+  assert.equal(inspectSoftWatermark(session, tokenMeter).triggered, false, 'staged span immediately clears watermark in same turn')
+  assert.equal(buildSoftWatermarkHint(session, tokenMeter), '', 'staged compaction immediately clears latched hint')
+
+  session.append('step/end', { turn: 27, step: 1 })
+  await emitTurnStopping(fakeAgent, 27, ctrl.signal)
+  session.append('turn/end', { turn: 27, reason: { kind: 'completed' } })
+
+  const wmAfterCompact = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(wmAfterCompact.triggered, false, 'watermark must disappear after compacting turn:1..turn:20')
+  assert.equal(wmAfterCompact.compactableTurns, 0)
+  assert.equal(wmAfterCompact.compactableTokens, 0, 'compactableTokens must reset to 0 right after compaction')
+  assert.equal(wmAfterCompact.uncompactedClosedTurns, 5)
+  assert.equal(wmAfterCompact.hint, '')
+  assert.equal(buildSoftWatermarkHint(session, tokenMeter), '')
+})
+
+test('incremental compactableTokens watermark: high baseline (compacted summaries + recent 5 turns occupying >70k tokens) NEVER false-triggers until new compactableTokens >= 60k', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-soft-watermark-delta-pool', { meta: { cwd: TEST_CWD } })
+
+  // Step 1: Create 6 early turns (~36k tokens) and compact turns 1..6 into a historical checkpoint (~20k tokens)
+  for (let t = 1; t <= 6; t++) {
+    const out = Array.from({ length: 220 }, (_, i) => `HIST_${t}_${i}: ${'H'.repeat(100)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_hist_${t}`, 'read', out)
+  }
+  const hugeHistoricalSummary = Array.from({ length: 240 }, (_, i) => `checkpoint_anchor_${i}:${'S'.repeat(300)}`).join('\n')
+  const histPlan = planSpanCompaction(session, tokenMeter, {
+    from: 'turn:1',
+    to: 'turn:6',
+    summary: hugeHistoricalSummary,
+  }, 1)
+  commitSpanCompaction(session, tokenMeter, histPlan)
+
+  // Step 2: Add recent 5 turns (turns 7..11, protected by keepRecentTurns = 5) whose active dialogue occupies >55k tokens
+  // Total surface tokens (historical summary + recent 5 turns) > 75,000 tokens (> 60k!), while compactableTokens === 0!
+  for (let t = 7; t <= 11; t++) {
+    const bigUserDialogue = Array.from({ length: 140 }, (_, i) => `Active dialogue turn ${t} line ${i}: ${'D'.repeat(320)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_recent_${t}`, 'read', 'short tool output < 500t', bigUserDialogue)
+  }
+
+  const wmHighBaseline = inspectSoftWatermark(session, tokenMeter)
+  assert.ok(
+    wmHighBaseline.surfaceTokens >= 70000,
+    `Expected total surfaceTokens >= 70000 to test high-baseline immunity, got ${wmHighBaseline.surfaceTokens}`
+  )
+  assert.equal(wmHighBaseline.compactableTokens, 0, 'compactableTokens must be 0 when only historical summaries + recent 5 turns exist')
+  assert.equal(wmHighBaseline.compactableTurns, 0)
+  assert.equal(wmHighBaseline.triggered, false, 'MUST NOT false-trigger when baseline is >70k but compactableTokens is 0')
+  assert.equal(wmHighBaseline.hint, '')
+
+  // Step 3: Accumulate 3 new turns (turns 12..14, pushing turns 7..9 into the compactable span turn:7..turn:9)
+  // Because turns 7..9 had >30k tokens + we add another ~35k in turn 12 so turn:7..turn:10 exceeds 60k compactableTokens:
+  const hugeToolOut7 = Array.from({ length: 280 }, (_, i) => `DELTA_BIG_${i}: ${'M'.repeat(320)}`).join('\n')
+  addCompleteTurnWithTool(session, 12, 'call_delta_12', 'read', hugeToolOut7)
+  for (let t = 13; t <= 17; t++) {
+    addCompleteTurnWithTool(session, t, `call_delta_${t}`, 'grep', 'small recent output')
+  }
+
+  // Now uncompacted closed turns are 7..17 (11 turns < 20), recent 5 turns are 13..17,
+  // and the compactable span is turn:7..turn:12 whose compactableTokens >= 60,000!
+  const wmDeltaTriggered = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(wmDeltaTriggered.uncompactedClosedTurns, 11, 'only 11 uncompacted closed turns (< 20 turn threshold)')
+  assert.ok(
+    wmDeltaTriggered.compactableTokens >= 60000,
+    `Expected compactableTokens >= 60000, got ${wmDeltaTriggered.compactableTokens}`
+  )
+  assert.equal(wmDeltaTriggered.triggered, true, 'must trigger once compactableTokens >= 60000 even with < 20 turns')
+  assert.equal(wmDeltaTriggered.reason, 'tokens')
+  assert.deepEqual(
+    { from: wmDeltaTriggered.suggestedSpan.from, to: wmDeltaTriggered.suggestedSpan.to },
+    { from: 'turn:7', to: 'turn:12' }
+  )
+  assert.ok(wmDeltaTriggered.hint.includes('建议已完成区间: turn:7..turn:12'))
+  assert.ok(wmDeltaTriggered.hint.includes('call_delta_12(read,'))
+
+  // Step 4: Compact turn:7..turn:12 -> compactableTokens drops back to 0 even though surfaceTokens is still >25k!
+  const deltaPlan = planSpanCompaction(session, tokenMeter, {
+    from: 'turn:7',
+    to: 'turn:12',
+    summary: 'Turns 7-12 telegraphic summary.',
+  }, 1)
+  commitSpanCompaction(session, tokenMeter, deltaPlan)
+
+  const wmAfterDeltaCompact = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(wmAfterDeltaCompact.compactableTokens, 0, 'compactableTokens must return to 0 after compacting turn:7..turn:12')
+  assert.equal(wmAfterDeltaCompact.triggered, false, 'watermark must clear immediately after compacting the delta pool')
+})
+
+test('system-prompt snapshots do not inflate watermark and prompt context reuses measurement per surface version', async () => {
+  const { sessions, tokenMeter, promptContexts } = await createTestHarness()
+  const session = sessions.prepare('test-watermark-system-prompt-snapshot', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 6; t++) {
+    addCompleteTurnWithTool(session, t, `call_snapshot_${t}`, 'read', `small tool output ${t}`)
+  }
+  const before = inspectSoftWatermark(session, tokenMeter)
+
+  session.append('user/message', {
+    id: 'persisted-system-prompt-snapshot',
+    role: 'user',
+    source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' },
+    content: [{ type: 'text', text: `persisted dynamic context ${'P'.repeat(120000)}` }],
+  }, { surfaceOp: 'append' })
+
+  const after = inspectSoftWatermark(session, tokenMeter)
+  assert.ok(after.surfaceTokens > before.surfaceTokens, 'the persisted snapshot must really be on the surface')
+  assert.equal(after.compactableTokens, before.compactableTokens, 'persisted system-prompt snapshots must not raise the compactable pool')
+  assert.equal(after.triggered, before.triggered)
+
+  const directoryCtx = promptContexts.get('context-compact:directory')
+  const agent = { id: 'agent-watermark-cache', session }
+  const originalMeasure = tokenMeter.measure.bind(tokenMeter)
+  let measureCalls = 0
+  tokenMeter.measure = (s) => {
+    measureCalls += 1
+    return originalMeasure(s)
+  }
+  try {
+    const first = directoryCtx.text({ agent })
+    const second = directoryCtx.text({ agent })
+    assert.equal(second, first)
+    assert.equal(measureCalls, 1, 'directory and watermark share one measurement until the surface changes')
+    session.append('user/message', {
+      id: 'surface-cache-buster',
+      role: 'user',
+      source: { kind: 'human' },
+      content: [{ type: 'text', text: 'new surface version' }],
+    }, { surfaceOp: 'append' })
+    directoryCtx.text({ agent })
+    assert.equal(measureCalls, 2, 'a new surface version must invalidate the measurement cache')
+  } finally {
+    tokenMeter.measure = originalMeasure
+  }
 })

@@ -14,6 +14,10 @@ export const DEFAULT_LARGE_BLOCK_TOKENS = 500
 export const DEFAULT_IMMEDIATE_RATIO = 0.70
 export const DEFAULT_RECALL_MAX_LINES = 120
 export const DEFAULT_MAX_FLUSH_RETRIES = 2
+export const DEFAULT_SOFT_WATERMARK_TOKENS = 60000
+export const DEFAULT_SOFT_WATERMARK_TURNS = 20
+export const DEFAULT_KEEP_RECENT_TURNS = 5
+export const DEFAULT_TOP_CANDIDATES = 3
 
 const SUMMARY_OPEN_TAG = '<compacted-summary>'
 const SUMMARY_CLOSE_TAG = '</compacted-summary>'
@@ -24,7 +28,8 @@ export const COMPACT_SYSTEM_RULE = [
   '- When you finish a phase of investigation or implementation and reach a conclusion, call `context_compact` in the same step to compress large tool outputs or earlier multi-turn spans from that phase.',
   '- Write concise engineering conclusions in `summary` and preserve exact anchors: file paths, line numbers, symbols, error codes, and key values.',
   '- Single-item (`results`) compaction can replace completed tool returns from the current turn or earlier turns (staged until turn end by default); range (`spans`) compaction cannot cover the current open turn.',
-  '- Compacted items remain visible during the current turn (staged until `agent/turn-stopping`, unless context occupancy > 70% or `conclude_turn: true` — 仅在同一条消息已写完最终回复时使用，用于省一次请求), and their original content is always losslessly recoverable via `context_recall` using the `[recall: @call:...]` or `[recall: @span:...]` tag.'
+  '- Compacted items remain visible during the current turn (staged until `agent/turn-stopping`, unless context occupancy > 70% or `conclude_turn: true` — 仅在同一条消息已写完最终回复时使用，用于省一次请求), and their original content is always losslessly recoverable via `context_recall` using the `[recall: @call:...]` or `[recall: @span:...]` tag.',
+  '- When a `[context-compact 水位提醒: ...]` hint appears, piggyback `context_compact` in the same step as your next tool call (especially before dispatching long background tasks where a >5 min wait expires prompt caches anyway) or final reply (`conclude_turn: true`), using directly the suggested `turn:A..turn:B` span and Top 3 `callId` candidates without calling `inspect: true` first, and keep each `summary` in <=120 tokens telegraphic style (`path:line + conclusion`) to minimize output token cost.'
 ].join('\n')
 
 // ---------------------------------------------------------------------------
@@ -328,6 +333,7 @@ export function buildLargeBlocksDirectory(session, tokenMeter, options = {}) {
     if (tokens <= threshold) continue
     const ev = session.events[seq]
     if (!ev) continue
+    if (ev.data?.source?.plugin === '@deepseek-ai/dsh-system-prompt') continue
     const nodeTurns = resolveSurfaceNodeTurns(session, seq, logInfo)
     if (logInfo.openTurn !== null && nodeTurns.maxTurn === logInfo.openTurn) continue
     if (ev.surfaceOp !== 'append') continue
@@ -1165,6 +1171,32 @@ export function isSpanAlreadyCompacted(session, sp) {
 }
 
 const stagedBySessionRegistry = new WeakMap()
+const sessionMeasurementCacheRegistry = new WeakMap()
+const watermarkLatchBySessionRegistry = new WeakMap()
+
+/** 获取当前会话最近一次 compaction/* 事件的 seq（无压缩事件时为 -1），用于标识当前压缩周期。 */
+function getLatestCompactionSeq(session) {
+  const events = session?.events
+  if (!Array.isArray(events)) return -1
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]
+    if (ev && typeof ev.type === 'string' && ev.type.startsWith('compaction/')) {
+      return ev.seq
+    }
+  }
+  return -1
+}
+
+/** 同一表面版本只测量一次；systemPrompt.context 的目录与水位提醒共享测量结果。 */
+function measureSessionCached(session, tokenMeter) {
+  const nodes = session?.surface?.nodes ?? []
+  const key = `${session?.events?.length ?? 0}:${nodes.length}:${nodes[nodes.length - 1] ?? ''}`
+  const cached = sessionMeasurementCacheRegistry.get(session)
+  if (cached && cached.key === key) return cached.measurement
+  const measurement = tokenMeter.measure(session)
+  sessionMeasurementCacheRegistry.set(session, { key, measurement })
+  return measurement
+}
 
 /**
  * Inspect a session's staged compaction queue (read-only snapshot for diagnostics and tests).
@@ -1181,7 +1213,248 @@ export function getStagedQueueSnapshot(session) {
   }
 }
 
-export function apply(ctx) {
+/**
+ * Compute incremental compactable pool watermark metrics (`compactableTokens`, `compactableTurns`,
+ * `uncompactedClosedTurns`, `suggestedSpan`, `topCandidates`, and formatted `hint`).
+ *
+ * Crucial design invariant:
+ * - Excludes already-compacted nodes (`@span` / `@call` where `surfaceOp !== 'append'`) AND excludes
+ *   active dialogue (`user/message`, `assistant/message`) in the most recent `keepRecentTurns` (default 5) turns.
+ * - Counts only uncompacted nodes inside the compactable closed turn span (`turn:A..turn:B`) plus any
+ *   uncompacted large single `tool/result >= 500t` outside the span.
+ * - Right after compaction, `compactableTokens` drops to 0 (or below threshold), preventing false positives
+ *   even when historical checkpoints + recent 5 turns occupy 70k+ tokens.
+ */
+export function inspectSoftWatermark(session, tokenMeter, options = {}) {
+  const enabled = options?.softWatermarkEnabled !== false && options?.enabled !== false
+  const softWatermarkTokens =
+    typeof options?.softWatermarkTokens === 'number' && options.softWatermarkTokens > 0
+      ? options.softWatermarkTokens
+      : DEFAULT_SOFT_WATERMARK_TOKENS
+  const softWatermarkTurns =
+    typeof options?.softWatermarkTurns === 'number' && options.softWatermarkTurns > 0
+      ? Math.floor(options.softWatermarkTurns)
+      : DEFAULT_SOFT_WATERMARK_TURNS
+  const keepRecentTurns =
+    typeof options?.keepRecentTurns === 'number' && options.keepRecentTurns >= 0
+      ? Math.floor(options.keepRecentTurns)
+      : DEFAULT_KEEP_RECENT_TURNS
+  const largeBlockTokens =
+    typeof options?.largeBlockTokens === 'number' && options.largeBlockTokens > 0
+      ? options.largeBlockTokens
+      : DEFAULT_LARGE_BLOCK_TOKENS
+  const topCandidatesLimit =
+    typeof options?.topCandidates === 'number' && options.topCandidates > 0
+      ? Math.floor(options.topCandidates)
+      : DEFAULT_TOP_CANDIDATES
+
+  const logInfo = inspectSessionLog(session)
+  const measurement = tokenMeter.measure(session)
+  const surfaceNodes = session?.surface?.nodes ?? []
+  const pricedBySeq = new Map()
+  for (const n of measurement.nodes) pricedBySeq.set(n.seq, n.tokens)
+
+  const staged = stagedBySessionRegistry.get(session)
+  const stagedShadowedSeqs = new Set()
+  const stagedCallIds = new Set()
+  let stagedMaxSpanTurn = 0
+  if (staged) {
+    for (const sp of staged.spans) {
+      if (Array.isArray(sp.shadowedSeqs)) {
+        for (const s of sp.shadowedSeqs) stagedShadowedSeqs.add(s)
+      }
+      const toSel = String(sp.resolvedTo ?? sp.to ?? '').trim()
+      const m = /^turn:\s*(\d+)$/i.exec(toSel)
+      if (m) stagedMaxSpanTurn = Math.max(stagedMaxSpanTurn, Number(m[1]))
+    }
+    for (const cid of staged.results.keys()) {
+      stagedCallIds.add(cid)
+    }
+  }
+
+  let lastSpanCompactedTurn = stagedMaxSpanTurn
+  let compactedBaselineTokens = 0
+  const uncompactedEntries = []
+
+  for (const seq of surfaceNodes) {
+    const ev = session.events[seq]
+    if (!ev) continue
+    // dsh-system-prompt 持久化的动态上下文快照不是可压缩工作证据，跳过以避免反向抬升水位。
+    if (ev.data?.source?.plugin === '@deepseek-ai/dsh-system-prompt') continue
+    const tokens = pricedBySeq.get(seq) ?? 0
+    const nt = resolveSurfaceNodeTurns(session, seq, logInfo)
+    const callId = ev.type === 'tool/result' ? (ev.data?.message?.source?.callId ?? '') : ''
+    const isSpanCheckpoint =
+      ev.type === 'user/message' && (ev.surfaceOp !== 'append' || ev.data?.source?.plugin === 'compact')
+    if (isSpanCheckpoint && nt.maxTurn > lastSpanCompactedTurn) {
+      lastSpanCompactedTurn = nt.maxTurn
+    }
+    const isAlreadyCompacted =
+      ev.surfaceOp !== 'append' ||
+      ev.data?.source?.plugin === 'compact' ||
+      stagedShadowedSeqs.has(seq) ||
+      (callId.length > 0 && stagedCallIds.has(callId))
+
+    if (isAlreadyCompacted) {
+      compactedBaselineTokens += tokens
+      continue
+    }
+
+    uncompactedEntries.push({ seq, ev, tokens, nt, callId })
+  }
+
+  const uncompactedClosedTurnSet = new Set()
+  for (const item of uncompactedEntries) {
+    const t = item.nt.minTurn
+    if (t > lastSpanCompactedTurn && t >= 1 && (logInfo.openTurn === null || t < logInfo.openTurn)) {
+      uncompactedClosedTurnSet.add(t)
+    }
+  }
+
+  const uncompactedClosedTurnNums = [...uncompactedClosedTurnSet].sort((a, b) => a - b)
+  const uncompactedClosedTurns = uncompactedClosedTurnNums.length
+  const splitIdx = Math.max(0, uncompactedClosedTurnNums.length - keepRecentTurns)
+  const compactableSpanTurnNums = uncompactedClosedTurnNums.slice(0, splitIdx)
+  const recentClosedTurnNums = uncompactedClosedTurnNums.slice(splitIdx)
+  const compactableSpanTurnSet = new Set(compactableSpanTurnNums)
+  const recentProtectedTurnSet = new Set(recentClosedTurnNums)
+  if (logInfo.openTurn !== null) recentProtectedTurnSet.add(logInfo.openTurn)
+
+  let spanCompactableTokens = 0
+  let outsideSpanLargeResultTokens = 0
+  let recentProtectedTokens = 0
+  const candidateResults = []
+
+  for (const item of uncompactedEntries) {
+    const { seq, ev, tokens, nt, callId } = item
+    const t = nt.minTurn
+    const isClosed = t >= 1 && (logInfo.openTurn === null || t < logInfo.openTurn)
+
+    if (compactableSpanTurnSet.has(t)) {
+      spanCompactableTokens += tokens
+    } else if (ev.type === 'tool/result' && tokens >= largeBlockTokens && callId && !logInfo.inFlightCalls.has(callId)) {
+      outsideSpanLargeResultTokens += tokens
+    } else if (recentProtectedTurnSet.has(t)) {
+      recentProtectedTokens += tokens
+    }
+
+    if (ev.type === 'tool/result' && isClosed && callId && !logInfo.inFlightCalls.has(callId) && tokens > 0) {
+      const toolName = logInfo.callMap.get(callId)?.name ?? 'tool'
+      candidateResults.push({
+        callId,
+        toolName,
+        turn: t,
+        tokens,
+        seq,
+        inCompactableSpan: compactableSpanTurnSet.has(t),
+        isLarge: tokens >= largeBlockTokens,
+      })
+    }
+  }
+
+  const compactableTokens = spanCompactableTokens + outsideSpanLargeResultTokens
+  const compactableTurns = compactableSpanTurnNums.length
+
+  const suggestedSpan =
+    compactableSpanTurnNums.length > 0
+      ? {
+          from: `turn:${compactableSpanTurnNums[0]}`,
+          to: `turn:${compactableSpanTurnNums[compactableSpanTurnNums.length - 1]}`,
+          fromTurn: compactableSpanTurnNums[0],
+          toTurn: compactableSpanTurnNums[compactableSpanTurnNums.length - 1],
+          turns: compactableTurns,
+          tokens: spanCompactableTokens,
+        }
+      : null
+
+  const largeCandidates = candidateResults.filter((c) => c.isLarge)
+  const poolForTop = largeCandidates.length > 0 ? largeCandidates : candidateResults
+  poolForTop.sort((a, b) => (b.tokens !== a.tokens ? b.tokens - a.tokens : a.seq - b.seq))
+  const topCandidates = poolForTop.slice(0, topCandidatesLimit).map(({ callId, toolName, turn, tokens, seq }) => ({
+    callId,
+    toolName,
+    turn,
+    tokens,
+    seq,
+  }))
+
+  const tokenTriggered = compactableTokens >= softWatermarkTokens
+  const turnTriggered =
+    compactableTurns >= 1 && (compactableTurns >= softWatermarkTurns || uncompactedClosedTurns >= softWatermarkTurns)
+  const triggered = Boolean(enabled && (tokenTriggered || turnTriggered))
+  const reason = !enabled
+    ? 'disabled'
+    : tokenTriggered && turnTriggered
+      ? 'both'
+      : tokenTriggered
+        ? 'tokens'
+        : turnTriggered
+          ? 'turns'
+          : 'none'
+
+  let hint = ''
+  if (triggered) {
+    const spanText = suggestedSpan ? `${suggestedSpan.from}..${suggestedSpan.to}` : '暂无'
+    const topText =
+      topCandidates.length > 0
+        ? topCandidates.map((c) => `${c.callId}(${c.toolName},${c.tokens}t)`).join(', ')
+        : '无(>=500t)'
+    hint = `[context-compact 水位提醒: 待压缩池已达软水位（共 ${uncompactedClosedTurns} 轮未压缩）。请在本步调用工具（特别是派发长后台任务前，防 5 分钟缓存过期全额重算）或回复（配 conclude_turn:true）时顺手调用 context_compact，无需先调 inspect:true；summary 请用 ≤120 tokens 电报体（路径:行号+结论）以压低输出成本。建议已完成区间: ${spanText}；最大单条结果: ${topText}]`
+  } else if (session && typeof session === 'object') {
+    watermarkLatchBySessionRegistry.delete(session)
+  }
+
+  return {
+    triggered,
+    reason,
+    surfaceTokens: measurement.surfaceTokens,
+    totalTokens: measurement.totalTokens,
+    compactableTokens,
+    spanCompactableTokens,
+    outsideSpanLargeResultTokens,
+    compactedBaselineTokens,
+    recentProtectedTokens,
+    uncompactedClosedTurns,
+    compactableTurns,
+    softWatermarkTokens,
+    softWatermarkTurns,
+    keepRecentTurns,
+    suggestedSpan,
+    topCandidates,
+    hint,
+  }
+}
+
+/**
+ * Build the single-line soft watermark auto-hint string when the incremental compactable pool
+ * reaches `softWatermarkTokens` or `softWatermarkTurns`; returns `''` otherwise.
+ * Latches the first triggered hint string per compaction cycle (keyed by latest `compaction/*` event seq)
+ * so repeated turns before a new compaction return the exact same string.
+ */
+export function buildSoftWatermarkHint(session, tokenMeter, options = {}) {
+  const status = inspectSoftWatermark(session, tokenMeter, options)
+  if (!status.triggered || !status.hint) {
+    if (session && typeof session === 'object') {
+      watermarkLatchBySessionRegistry.delete(session)
+    }
+    return ''
+  }
+  if (!session || typeof session !== 'object') {
+    return status.hint
+  }
+  const compactionSeq = getLatestCompactionSeq(session)
+  const latched = watermarkLatchBySessionRegistry.get(session)
+  if (latched && latched.compactionSeq === compactionSeq && typeof latched.hint === 'string' && latched.hint.length > 0) {
+    return latched.hint
+  }
+  watermarkLatchBySessionRegistry.set(session, {
+    compactionSeq,
+    hint: status.hint,
+  })
+  return status.hint
+}
+
+export function apply(ctx, config = {}) {
   const stagedBySession = stagedBySessionRegistry
 
   function getStagedQueue(session) {
@@ -1407,10 +1680,14 @@ export function apply(ctx) {
     name: 'context-compact:directory',
     order: 85,
     text: (context) => {
-      const session = context?.agent?.session
+      const session = context?.agent?.session ?? context?.session
       if (!session) return ''
       try {
-        return buildLargeBlocksDirectory(session, ctx.tokenMeter)
+        // 同一请求的大块目录与水位提醒共享一次 surface 测量，避免重复扫描整段会话。
+        const sharedMeter = { measure: (s) => measureSessionCached(s, ctx.tokenMeter) }
+        const dir = buildLargeBlocksDirectory(session, sharedMeter, config)
+        const hint = buildSoftWatermarkHint(session, sharedMeter, config)
+        return [dir, hint].filter(Boolean).join('\n')
       } catch {
         return ''
       }

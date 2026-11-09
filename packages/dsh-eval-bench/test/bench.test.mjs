@@ -173,7 +173,8 @@ test('7. Staged compaction queue commits cleanly on agent/turn-stopping via crea
 
 test('8. Relay-dispatch suite verifies mode parsing, 429 candidate chain fallback, and error classification', async () => {
   const relay = await evaluateRelayDispatchSuite()
-  assert.equal(relay.modeResolution.builtinModesCount, 5)
+  // 内置模式已扩展为 investigate/implement/verify/review/heavy/rp 共 6 个；同步修复后更新陈旧断言，不删除 rp 功能迎合旧测试。
+  assert.equal(relay.modeResolution.builtinModesCount, 6)
   assert.equal(relay.modeResolution.filledDangerAutoConfirmed, true)
   assert.deepEqual(relay.candidateFallback429.attemptedModels, [
     'cursor/claude-opus-5-5',
@@ -196,7 +197,7 @@ test('9. Relay-dispatch evaluateRelayPrepare matrix achieves 6/6 (100%) accuracy
 
 test('10. Tier-1 Empirical Ledger passes strict arithmetic invariants and sanitization checks (zero private paths)', () => {
   const rawLedgerText = readFileSync(EMPIRICAL_LEDGER_PATH, 'utf8')
-  assert.doesNotMatch(rawLedgerText, /Users[\\/]+mikon/i)
+  assert.doesNotMatch(rawLedgerText, /[A-Za-z]:[\\/]+Users[\\/]/i)
   assert.doesNotMatch(rawLedgerText, /AppData/i)
 
   const verified = verifyEmpiricalLedger(loadEmpiricalLedger())

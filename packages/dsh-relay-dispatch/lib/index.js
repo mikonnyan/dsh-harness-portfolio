@@ -7,15 +7,15 @@
 
 export const name = '@dsh-external/dsh-relay-dispatch'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { execFile } from 'node:child_process'
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 export const inject = ['tools']
 export const PREPARE_SYM = Symbol.for('relay-dispatch.prepare')
 export const API_HANDLER_SYM = Symbol.for('relay-dispatch.apiHandler')
-const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
-export const PARENT_LOG_PATH = process.env.DSH_RELAY_PARENT_LOG_PATH || join(DSH_HOME, 'relay-dispatch-parent.log')
+export const PARENT_LOG_PATH = join(homedir(), '.dsh', 'relay-dispatch-parent.log')
 
 const DEFAULTS = {
   sliceMs: 30000, // 单次 wait_run 切片上限（毫秒），便于及时感知取消与停滞
@@ -33,9 +33,12 @@ const DEFAULTS = {
   titlePollMaxAttempts: 40,
   wakeDelayMs: 300, // 后台 job 结算后检查主会话 idle 未消费通知并补唤醒的延时（毫秒）
   maxConsecutiveWakes: 15, // 插件侧连续自动唤醒主会话的安全上限
+  maxConcurrentTasks: 4, // v2 聚合派发的同时运行子任务上限
+  manifestDir: undefined, // v2 清单目录；缺省 ~/.dsh/relay-pipelines，测试可覆盖
+  llmTitle: false, // v2 默认只做确定性标题，不额外调用 LLM
   defaultProvider: 'copilot',
   defaultModel: 'claude-sonnet-5.5',
-  defaultAgentPreset: undefined, // 默认不设，沿用官方 preset；按需可配置为 'standard-lean'
+  defaultAgentPreset: undefined, // 默认不设，沿用官方 preset；重启测试 standard-lean 后可配置为 'standard-lean'
   defaultSessionMode: 'fresh',
 }
 
@@ -125,11 +128,11 @@ export function fullConclusion(snap) {
 }
 
 /** 同一判定生成 detail 与结构化交付元数据，保证 full_in_detail/truncated 与结构化字段一致。 */
-export function buildDelivery(status, text, budget = DETAIL_BUDGET_BYTES, fullTextAvailable = true) {
-  const s = String(text ?? '')
+export function buildDelivery(status, text, budget = DETAIL_BUDGET_BYTES, fullTextAvailable = true, machineHeader = '') {
+  const s = String(text ?? '').trimStart()
   const fullLength = Array.from(s).length
   const avail = Boolean(fullTextAvailable)
-  const st = `status: ${status}`
+  const st = machineHeader ? `${machineHeader}\nstatus: ${status}` : `status: ${status}`
   const full = `${st}\nfull_in_detail=1\n${s}`
   if (byteLen(full) <= budget) {
     return { detail: full, finalText: s, truncated: false, fullLength, fullTextAvailable: avail }
@@ -176,7 +179,7 @@ export function fillStartArgs(input, config = DEFAULTS, review = false) {
 
 
 // ───────── 派发模式（dispatch-modes.yaml 热读）─────────
-const MODES_PATH = process.env.DSH_DISPATCH_MODES_PATH || join(DSH_HOME, 'dispatch-modes.yaml')
+const MODES_PATH = join(homedir(), '.dsh', 'dispatch-modes.yaml')
 const TOOL_CAPS = 'mcp__harness_relay__list_capabilities'
 
 /** 极简 YAML 解析：两层映射 + "- " 列表 + "|" 多行文本 + 注释。格式不合法时抛错。 */
@@ -248,6 +251,7 @@ export const BUILTIN_MODES = {
   verify: { permission: 'read-only', models: ['copilot/claude-sonnet-5.5', 'cursor/grok-4.7-fast'], taskPrefix: PREFIX, deliverable: '交付格式：summary 先给结论；通过/不通过清单，证据路径只列关键 3~5 条。\n' },
   review: { permission: 'read-only', models: ['cursor/claude-opus-5-5', 'copilot/claude-opus-5.5'], taskPrefix: PREFIX, deliverable: '交付格式：summary 先给结论；问题按严重度列出，证据路径只列关键 3~5 条。\n' },
   heavy: { permission: 'danger-full-access', checkpoint: true, models: ['cursor/claude-opus-5-5', 'copilot/claude-opus-5.5'], taskPrefix: PREFIX, deliverable: DELIV },
+  rp: { permission: 'read-only', workspace: join(homedir(), 'xiaoshuo'), models: ['cursor/grok-4.7', 'strata/qwen3.8-flash-next-iq3_s'], taskPrefix: '', deliverable: '' },
 }
 
 /** 错误分类：仅明确的模型/渠道类错误返回 true（可切换候选）；其余（参数校验、工具隐藏、workspace、权限、未知）一律视为请求/环境类，立即报错。 */
@@ -616,6 +620,251 @@ export function hasPendingInbox(agent) {
   return false
 }
 
+// ───────── v2：tasks -> join -> gate 的同步预检与写冲突规划 ─────────
+export const V2_MACHINE_HEADER = 'relay_dispatch_v2: 1'
+const V2_WRITABLE_PRESETS = new Set(['workspace-write', 'danger-full-access'])
+const V2_TASK_SHORTCUTS = ['workspace', 'task', 'provider', 'model', 'writeScope']
+
+function isPlainObject(v) {
+  return Boolean(v && typeof v === 'object' && !Array.isArray(v))
+}
+
+/** 仅用于写范围比较：统一斜杠、去尾部斜杠，Windows/盘符路径忽略大小写。 */
+export function writePathKey(raw) {
+  let p = String(raw == null ? '' : raw).trim().replace(/[\\/]+/g, '/')
+  if (!p) return ''
+  const windowsPath = process.platform === 'win32' || /^[A-Za-z]:/.test(p) || p.startsWith('//')
+  if (p.length > 1) p = p.replace(/\/+$/g, '')
+  if (/^[A-Za-z]:$/.test(p)) p += '/'
+  return windowsPath ? p.toLowerCase() : p
+}
+
+/** 两个写路径是否相同或互为祖先；必须按完整路径段边界判断，避免 foo 命中 foobar。 */
+export function writePathsOverlap(a, b) {
+  const pa = writePathKey(a)
+  const pb = writePathKey(b)
+  if (!pa || !pb) return false
+  if (pa === pb) return true
+  const aa = pa.endsWith('/') ? pa : `${pa}/`
+  const bb = pb.endsWith('/') ? pb : `${pb}/`
+  return pa.startsWith(bb) || pb.startsWith(aa)
+}
+
+export function writeScopesOverlap(a, b) {
+  const left = Array.isArray(a) ? a : []
+  const right = Array.isArray(b) ? b : []
+  return left.some((x) => right.some((y) => writePathsOverlap(x, y)))
+}
+
+function validateGate(gate) {
+  if (gate == null) return null
+  if (!isPlainObject(gate)) throw new Error('gate 必须是对象')
+  if (typeof gate.userAsk !== 'string' || !gate.userAsk.trim()) throw new Error('gate.userAsk 必须是非空字符串')
+  if (typeof gate.criteria !== 'string' || !gate.criteria.trim()) throw new Error('gate.criteria 必须是非空字符串')
+  if (gate.mode != null && gate.mode !== 'verify') throw new Error("gate.mode 目前仅支持 'verify'")
+  if (gate.commands != null && (!Array.isArray(gate.commands) || gate.commands.some((x) => typeof x !== 'string' || !x.trim()))) {
+    throw new Error('gate.commands 必须是非空字符串组成的数组')
+  }
+  if (gate.onPartial != null && gate.onPartial !== 'skip' && gate.onPartial !== 'gate') {
+    throw new Error("gate.onPartial 仅支持 'skip' 或 'gate'")
+  }
+  return { ...gate, mode: 'verify', onPartial: gate.onPartial || 'skip', commands: gate.commands ? [...gate.commands] : [] }
+}
+
+/**
+ * 在不调用任何 relay 工具、也不注册后台 Job 的前提下展开并校验 v2 参数。
+ * 返回的 dependsOn 仅供 onWriteConflict:'serial' 调度；默认 error 会在首个冲突处直接失败。
+ */
+export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes: BUILTIN_MODES, aliases: {} }) {
+  if (!isPlainObject(args)) throw new Error('relay_dispatch 参数必须是对象')
+  const hasTasks = args.tasks != null
+  if (hasTasks && (!Array.isArray(args.tasks) || args.tasks.length === 0)) throw new Error('tasks 必须是非空数组')
+  if (args.startArgs != null && !isPlainObject(args.startArgs)) throw new Error('startArgs 必须是对象')
+  if (args.onWriteConflict != null && args.onWriteConflict !== 'error' && args.onWriteConflict !== 'serial') {
+    throw new Error("onWriteConflict 仅支持 'error' 或 'serial'")
+  }
+  const onWriteConflict = args.onWriteConflict || 'error'
+  const gate = validateGate(args.gate)
+  const items = hasTasks ? args.tasks : [null]
+  const tasks = items.map((item, index) => {
+    if (item != null && !isPlainObject(item)) throw new Error(`tasks[${index}] 必须是对象`)
+    if (item && item.startArgs != null && !isPlainObject(item.startArgs)) throw new Error(`tasks[${index}].startArgs 必须是对象`)
+    const merged = { ...(args.startArgs || {}), ...((item && item.startArgs) || {}) }
+    if (item) {
+      for (const key of V2_TASK_SHORTCUTS) {
+        if (item[key] !== undefined) merged[key] = item[key]
+      }
+    }
+    const modeName = (item && item.mode != null ? item.mode : args.mode) || undefined
+    const review = Boolean(item && item.review != null ? item.review : args.review)
+    const rawTask = merged.task
+    let baseArgs = merged
+    let candidates = []
+    let modePrefix = ''
+    if (modeName) {
+      const cfg = modesInfo.modes && modesInfo.modes[modeName]
+      if (!cfg) throw new Error(`tasks[${index}] 未知 mode: ${modeName}；可用：${Object.keys(modesInfo.modes || {}).join(', ')}`)
+      modePrefix = cfg.taskPrefix || ''
+      const applied = applyMode(cfg, merged, modesInfo.aliases || {})
+      baseArgs = applied.args
+      candidates = applied.candidates
+    }
+    const previewArgs = fillStartArgs(baseArgs, config, review)
+    if (typeof previewArgs.workspace !== 'string' || !previewArgs.workspace.trim()) {
+      throw new Error(`tasks[${index}] 缺少 workspace（该模式未配置默认 workspace）`)
+    }
+    if (typeof previewArgs.task !== 'string' || !previewArgs.task.trim()) {
+      throw new Error(`tasks[${index}] 缺少非空 task`)
+    }
+    if (previewArgs.writeScope != null && (!Array.isArray(previewArgs.writeScope) || previewArgs.writeScope.some((p) => typeof p !== 'string' || !p.trim()))) {
+      throw new Error(`tasks[${index}].writeScope 必须是非空路径字符串组成的数组`)
+    }
+    const writable = !review && V2_WRITABLE_PRESETS.has(previewArgs.permissionPreset)
+    const label = String((item && item.label) || cleanBodyTitle(rawTask, modePrefix) || `task-${index + 1}`)
+    return {
+      index,
+      label,
+      mode: modeName,
+      review,
+      rawTask,
+      modePrefix,
+      baseArgs,
+      previewArgs,
+      candidates,
+      workspace: previewArgs.workspace,
+      writeScope: writable ? (previewArgs.writeScope || [previewArgs.workspace]) : [],
+      writable,
+      dependsOn: new Set(),
+    }
+  })
+
+  const conflicts = []
+  for (let i = 0; i < tasks.length; i++) {
+    for (let j = i + 1; j < tasks.length; j++) {
+      const a = tasks[i]
+      const b = tasks[j]
+      if (!a.writable || !b.writable || !sameDir(a.workspace, b.workspace)) continue
+      if (!writeScopesOverlap(a.writeScope, b.writeScope)) continue
+      conflicts.push({ a: i, b: j })
+      if (onWriteConflict === 'error') {
+        throw new Error(
+          `写范围冲突：tasks[${i}](${a.label}) 与 tasks[${j}](${b.label}) 在同一 workspace 的 writeScope 重叠；` +
+          "请缩小 writeScope，或显式设置 onWriteConflict: 'serial'",
+        )
+      }
+      b.dependsOn.add(i)
+    }
+  }
+  return { hasTasks, tasks, gate, onWriteConflict, conflicts }
+}
+
+export const V2_CAPABILITIES_TTL_MS = 60000
+
+/** start_run 在写任务中结果不可知时不得换模型重试，避免同一任务被实际执行两次。 */
+export function isUnknownStartError(err) {
+  const s = String((err && err.message) || err || '')
+  return /start_run 超时|fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|network|connection (failed|refused|reset|closed)|timed? ?out|未返回 runId/i.test(s)
+}
+
+/** 启动前即应停止候选链重试的错误；写任务遇到结果不可知错误时同样必须停止，防止双写。 */
+export function isPreStartRejection(err, writable = false) {
+  const msg = String((err && err.message) || err || '')
+  return !isModelError(msg) || Boolean(writable && isUnknownStartError(err))
+}
+
+/** 插件卸载或 jobs 服务关闭只分离本地等待，不得误杀远端 run。 */
+export function isDisposeCancelReason(reason) {
+  return /disposed/i.test(String(reason || ''))
+}
+
+/** 按模型实际厂商归族，避免同厂商换模型后仍被当成异构审查。 */
+export function vendorOf(provider, model) {
+  const p = String(provider || '').toLowerCase()
+  const m = String(model || '').toLowerCase()
+  const s = `${p}/${m}`
+  if (/google|vertex|gemini/.test(s)) return 'google'
+  if (/kimi|moonshot/.test(s)) return 'kimi'
+  if (/anthropic|claude/.test(s)) return 'anthropic'
+  if (/xai|grok/.test(s)) return 'xai'
+  if (/openai|gpt|codex/.test(s)) return 'openai'
+  if (/deepseek/.test(s)) return 'deepseek'
+  if (/qwen|alibaba/.test(s)) return 'alibaba'
+  return p || m.split(/[-.]/)[0] || 'unknown'
+}
+
+/** 只信任守门员正文显式 verdict；会话 succeeded 本身不代表验收通过。 */
+export function parseGateVerdict(text) {
+  const match = /^\s*verdict:\s*(pass|fail|partial)/im.exec(String(text || ''))
+  return match ? match[1].toLowerCase() : 'unknown'
+}
+
+function execGit(workspace, args, env = {}, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const fullArgs = ['-c', 'core.quotepath=off', ...args]
+    execFile('git', fullArgs, {
+      cwd: workspace,
+      env: { ...process.env, ...env },
+      windowsHide: true,
+      timeout: timeoutMs,
+      maxBuffer: 16 * 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        const detail = String(stderr || '').trim() || String(error.message || error)
+        reject(new Error(`git ${args.join(' ')} 失败：${detail}`))
+      } else resolve(String(stdout).trimEnd())
+    })
+  })
+}
+
+/**
+ * 用临时 GIT_INDEX_FILE 对工作区（含未提交改动）执行 write-tree。
+ * 全程不写真实 index、不改工作树；非 Git 目录或快照失败时返回 available:false，不阻断派发。
+ */
+export async function captureGitTree(workspace, options = {}) {
+  const tempIndex = join(tmpdir(), `relay-dispatch-index-${process.pid}-${Date.now()}-${++seq}`)
+  try {
+    const root = (await execGit(workspace, ['rev-parse', '--show-toplevel'], {}, options.timeoutMs)).trim()
+    if (!root) return { available: false, reason: 'not_git' }
+    const realIndex = (await execGit(root, ['rev-parse', '--path-format=absolute', '--git-path', 'index'], {}, options.timeoutMs)).trim()
+    try { copyFileSync(realIndex, tempIndex) } catch (err) {
+      if (!err || err.code !== 'ENOENT') throw err
+    }
+    const env = { GIT_INDEX_FILE: tempIndex }
+    await execGit(root, ['add', '-A', '--'], env, options.timeoutMs)
+    const tree = (await execGit(root, ['write-tree'], env, options.timeoutMs)).trim()
+    if (!/^[0-9a-f]{40,64}$/i.test(tree)) throw new Error(`write-tree 返回非法 tree：${tree}`)
+    return { available: true, root, tree }
+  } catch (err) {
+    return { available: false, reason: String((err && err.message) || err).slice(0, 500) }
+  } finally {
+    try { unlinkSync(tempIndex) } catch {}
+  }
+}
+
+/** 比较两个 captureGitTree 快照并列出实际路径差分；tree 相同不调用 git diff。 */
+export async function diffGitTrees(workspace, before, after, options = {}) {
+  const a = before && before.tree
+  const b = after && after.tree
+  if (!a || !b || !before.available || !after.available) return { available: false, changed: false, files: [], nameStatus: '', numstat: '', statText: '' }
+  if (a === b) return { available: true, changed: false, files: [], nameStatus: '', numstat: '', statText: '', beforeTree: a, afterTree: b }
+  const root = after.root || before.root || workspace
+  const [nameStatus, numstat, statText] = await Promise.all([
+    execGit(root, ['diff', '--name-status', '--no-renames', a, b, '--'], {}, options.timeoutMs),
+    execGit(root, ['diff', '--numstat', '--no-renames', a, b, '--'], {}, options.timeoutMs),
+    execGit(root, ['diff', '--stat', '--no-renames', a, b, '--'], {}, options.timeoutMs),
+  ])
+  return {
+    available: true,
+    changed: true,
+    files: nameStatus.split(/\r?\n/).filter(Boolean).map((line) => line.replace(/^\S+\s+/, '')).filter(Boolean),
+    nameStatus,
+    numstat,
+    statText,
+    beforeTree: a,
+    afterTree: b,
+  }
+}
+
 export function apply(ctx, rawConfig) {
   const config = { ...DEFAULTS, ...(rawConfig || {}) }
   const tools = ctx.tools
@@ -628,6 +877,8 @@ export function apply(ctx, rawConfig) {
   const titleTasks = new Set()
   const wakeTimers = new Set()
   const wakeStates = new WeakMap()
+  const activePipelines = new Set()
+  let capabilitiesCache = { at: 0, ids: null }
 
   function getWakeState(agent) {
     const events = agent && agent.session && Array.isArray(agent.session.events) ? agent.session.events : null
@@ -661,19 +912,29 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * 后台 job 结算完成（finish）后延时约 300ms 检查主会话 owner：
-   * 若 dsh-tool-jobs 因 maxConsecutiveWakes=3 走 inject 静默入队而未唤醒 idle 的 owner，
-   * 在连续派发安全上限（默认 15 次）内主动触发一次唤醒。
+   * 后台 job 结算后的完成通知补唤醒。
+   *
+   * doneAt 时主会话可能正在运行一个更早开启的旧轮次：旧轮次随后输出的
+   * assistant/message 不代表它已经处理了本次 job 通知。因此在主会话真正 idle
+   * 之前按拍退避检查，并以 jobId + 新轮次起点共同判定通知是否已被响应。
    */
-  function scheduleOwnerWake(owner) {
+  function scheduleCompletionWake(owner, jobId) {
     if (disposed || !owner || typeof owner !== 'object') return
+    const doneAt = Date.now()
     const wakeDelayMs = config.wakeDelayMs ?? DEFAULTS.wakeDelayMs
+    const wakePollMs = Math.max(1, config.wakePollMs ?? 1500)
+    const wakeMaxChecks = Math.max(1, Math.floor(config.wakeMaxChecks ?? 20))
     const maxWakes = config.maxConsecutiveWakes ?? DEFAULTS.maxConsecutiveWakes
     if (!(maxWakes > 0)) return
     const st = getWakeState(owner)
-    const wasIdleAtSettle = owner.status === 'idle'
     let followedUp = false
     let injectedMsg = null
+    let deliveredMsg = null
+    let deliveredByThisWake = false
+    let sawBusy = false
+    let checks = 0
+    let timer = null
+    let finished = false
     const origFollowup = typeof owner.followup === 'function' ? owner.followup : null
     const origInject = typeof owner.inject === 'function' ? owner.inject : null
     let hooked = false
@@ -702,45 +963,213 @@ export function apply(ctx, rawConfig) {
       hooked = true
     } catch {}
     Promise.resolve().then(() => Promise.resolve().then(unhook))
+
+    const sessionForParent = (parentId) => {
+      if (owner && owner.id === parentId && owner.session) return owner.session
+      try {
+        const sessions = ctx && typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+        const agents = ctx && typeof ctx.get === 'function' ? ctx.get('agents') : undefined
+        return (sessions && typeof sessions.get === 'function' && sessions.get(parentId)) ||
+          (agents && typeof agents.get === 'function' && agents.get(parentId) && agents.get(parentId).session) ||
+          owner.session
+      } catch {
+        return owner.session
+      }
+    }
+    const eventTime = (e) => parseTimeMs(e && (e.time ?? e.time0 ?? (e.data && e.data.time)))
+
+    /**
+     * 只有 job 完成通知之后出现了有效响应，或 doneAt 后新开启的轮次已有响应，
+     * 才视为已处理。doneAt 前已经开启的旧轮次即使随后输出 assistant/message，
+     * 也绝不能吞掉本次完成通知。
+     */
+    const wasJobNoticeHandled = (parentId, jobId, doneAt) => {
+      const session = sessionForParent(parentId)
+      const events = session && Array.isArray(session.events) ? session.events : []
+      if (events.length === 0) return false
+      const turnStarts = new Map()
+      const newTurnAnchors = []
+      let noticeIdx = -1
+      for (let i = 0; i < events.length; i++) {
+        const e = events[i]
+        if (!e || typeof e !== 'object') continue
+        if (e.type === 'turn/start') {
+          const key = String(e.data?.turn ?? '')
+          const at = eventTime(e)
+          if (key) turnStarts.set(key, { index: i, at })
+          if (at !== undefined && at >= doneAt) newTurnAnchors.push(i)
+          continue
+        }
+        if (e.type !== 'user/message' || !jobId) continue
+        const content = e.data?.content ?? e.data?.message?.content ?? e.content
+        const text = textOf(content) || ''
+        if (text.includes(String(jobId))) noticeIdx = i
+      }
+      const anchors = noticeIdx >= 0 ? [noticeIdx, ...newTurnAnchors] : newTurnAnchors
+      for (const anchor of anchors) {
+        for (let j = anchor + 1; j < events.length; j++) {
+          const e = events[j]
+          if (!e || e.type !== 'assistant/message') continue
+          const at = eventTime(e)
+          if (at !== undefined && at < doneAt) continue
+          if (anchor === noticeIdx) {
+            const start = turnStarts.get(String(e.data?.turn ?? ''))
+            if (start && start.at !== undefined && start.at < doneAt) continue
+          }
+          return true
+        }
+      }
+      return false
+    }
+
+    const hasOpenTurn = () => {
+      const session = sessionForParent(owner.id)
+      const events = session && Array.isArray(session.events) ? session.events : []
+      let lastStart = -1
+      let lastEnd = -1
+      for (let i = 0; i < events.length; i++) {
+        if (events[i]?.type === 'turn/start') lastStart = i
+        else if (events[i]?.type === 'turn/end') lastEnd = i
+      }
+      return lastStart > lastEnd
+    }
+
     const cancelWake = () => {
+      if (finished) return
+      finished = true
       unhook()
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
+      timer = null
       wakeTimers.delete(cancelWake)
     }
-    const timer = setTimeout(() => {
-      wakeTimers.delete(cancelWake)
+    const removeFromInbox = (msg) => {
+      const inbox = owner.inbox
+      if (!inbox || !msg) return
+      for (const key of ['nextStep', 'nextTurn']) {
+        const list = inbox[key]
+        if (!Array.isArray(list)) continue
+        const idx = list.findIndex((m) => m === msg || (m && msg && m.id && m.id === msg.id))
+        if (idx < 0) continue
+        const pendingMsg = list[idx]
+        if (typeof inbox.remove === 'function' && pendingMsg && pendingMsg.id) inbox.remove(pendingMsg.id)
+        else list.splice(idx, 1)
+      }
+    }
+    const isPendingMessage = (msg) => {
+      const inbox = owner.inbox
+      if (!inbox || !msg) return false
+      for (const key of ['nextStep', 'nextTurn']) {
+        const list = inbox[key]
+        if (!Array.isArray(list)) continue
+        if (list.some((m) => m === msg || (m && msg && m.id && m.id === msg.id))) return true
+      }
+      return false
+    }
+    const queueCheck = (delay) => {
+      if (finished) return
+      if (checks >= wakeMaxChecks) {
+        cancelWake()
+        return
+      }
+      timer = setTimeout(runCheck, Math.max(0, delay))
+      if (timer && typeof timer.unref === 'function') timer.unref()
+    }
+    const runCheck = () => {
+      timer = null
+      if (finished) return
+      checks += 1
       unhook()
-      if (disposed || !owner || owner.status !== 'idle') return
+      if (disposed || !owner) {
+        cancelWake()
+        return
+      }
+      if (wasJobNoticeHandled(owner.id, jobId, doneAt)) {
+        cancelWake()
+        return
+      }
+      if (owner.status !== 'idle' || hasOpenTurn()) {
+        sawBusy = true
+        queueCheck(wakePollMs)
+        return
+      }
+
+      // 每个定时器只能处理自己这次结算的通知。前几个已由宿主 followup
+      // 唤醒的定时器不得借后来的 pending 再唤醒一次；自己的 inject 通知
+      // 若已被其他路径消费，也不得凭保存的消息副本重复补投。
+      if (!deliveredByThisWake && followedUp) {
+        cancelWake()
+        return
+      }
+      if (!deliveredByThisWake && injectedMsg !== null && owner.inbox && !isPendingMessage(injectedMsg)) {
+        cancelWake()
+        return
+      }
+
+      // 已补投过的 schedule 只能重试自己那条仍滞留信箱的通知。
+      // 若它已被消费，则立即收口；绝不能把后续 job 的 pending 通知抢来再投一次。
+      if (deliveredByThisWake) {
+        if (!deliveredMsg || !isPendingMessage(deliveredMsg)) {
+          cancelWake()
+          return
+        }
+        injectedMsg = deliveredMsg
+      }
+
       const curState = getWakeState(owner)
-      if (curState.count >= maxWakes) return
       const pending = hasPendingInbox(owner)
-      const needsWake = pending || (!followedUp && wasIdleAtSettle && injectedMsg !== null)
-      if (!needsWake) return
-      curState.count += 1
+      if (!pending && injectedMsg === null) {
+        cancelWake()
+        return
+      }
+      if (curState.count >= maxWakes) {
+        // 连续派发上限仍防止 idle 会话无限自唤醒；但本次若曾被旧轮次阻塞，
+        // 说明通知尚未得到任何处理机会，必须重置预算补发一次。
+        if (!sawBusy) {
+          cancelWake()
+          return
+        }
+        curState.count = 0
+      }
+
+      let delivered = false
       try {
-        if (pending && typeof owner.wakeDriver === 'function') {
-          owner.wakeDriver()
-          return
-        }
-        if (pending && owner.inbox && Array.isArray(owner.inbox.nextStep) && owner.inbox.nextStep.length > 0 && typeof owner.followup === 'function') {
-          const msg = owner.inbox.nextStep[0]
-          if (typeof owner.inbox.remove === 'function' && msg && msg.id) owner.inbox.remove(msg.id)
-          else owner.inbox.nextStep.shift()
-          owner.followup(msg)
-          return
-        }
         if (injectedMsg !== null && typeof owner.followup === 'function') {
-          owner.followup(injectedMsg)
-          return
-        }
-        if (typeof owner.wakeDriver === 'function') {
+          const msg = injectedMsg
+          removeFromInbox(msg)
+          curState.count += 1
+          owner.followup(msg)
+          deliveredMsg = msg
+          injectedMsg = null
+          followedUp = true
+          delivered = true
+        } else if (pending && typeof owner.wakeDriver === 'function') {
+          curState.count += 1
           owner.wakeDriver()
+          delivered = true
+        } else if (pending && owner.inbox && Array.isArray(owner.inbox.nextStep) && owner.inbox.nextStep.length > 0 && typeof owner.followup === 'function') {
+          const msg = owner.inbox.nextStep[0]
+          removeFromInbox(msg)
+          curState.count += 1
+          owner.followup(msg)
+          deliveredMsg = msg
+          followedUp = true
+          delivered = true
         }
       } catch {}
-    }, Math.max(0, wakeDelayMs))
-    if (timer && typeof timer.unref === 'function') timer.unref()
+
+      // 下一拍确认是否开启新轮次；仅当本 job 的通知仍滞留信箱时才重试，
+      // 避免连续完成时旧定时器消费并重复投递后一个 job 的通知。
+      if (delivered) {
+        deliveredByThisWake = true
+        queueCheck(wakePollMs)
+      } else cancelWake()
+    }
+    queueCheck(wakeDelayMs)
     wakeTimers.add(cancelWake)
   }
+
+  // 兼容插件内既有调用名；新调用应显式传入 jobId。
+  const scheduleOwnerWake = (owner, jobId) => scheduleCompletionWake(owner, jobId)
 
   const emitWarn = (msg) => {
     try {
@@ -784,6 +1213,10 @@ export function apply(ctx, rawConfig) {
       try { cancel() } catch {}
     }
     wakeTimers.clear()
+    for (const cancel of [...activePipelines]) {
+      try { cancel('relay_dispatch disposed') } catch {}
+    }
+    activePipelines.clear()
   })
 
   if (config.linkParentSession !== false) {
@@ -906,7 +1339,8 @@ export function apply(ctx, rawConfig) {
             if (!(session.events || []).some((e) => e && e.type === 'user/message')) continue
             if (!(session.events || []).some((e) => e && e.type === 'request/header')) continue
             if (cancelled || disposed) return
-            if (typeof titles.refresh === 'function') {
+            // v2 默认保留确定性 fallback 标题；仅显式开启时才额外消耗一次 LLM 标题刷新。
+            if (config.llmTitle === true && typeof titles.refresh === 'function') {
               await withLocalTimeout(titles.refresh(session), refreshTimeoutMs, 'sessionTitle.refresh timeout')
             }
             return
@@ -1014,6 +1448,387 @@ export function apply(ctx, rawConfig) {
     return parseResult(result)
   }
 
+  // ───────── v2：tasks -> join -> gate 单聚合 Job 流水线 ─────────
+  function pipelineManifestDir() {
+    return config.manifestDir || join(homedir(), '.dsh', 'relay-pipelines')
+  }
+
+  /** list_capabilities 60s 缓存：同一插件实例内重复派发不重复拉取。 */
+  async function getCapabilityIdsV2(exec) {
+    const now = Date.now()
+    if (capabilitiesCache.ids && now - capabilitiesCache.at < V2_CAPABILITIES_TTL_MS) return capabilitiesCache.ids
+    const ids = collectModelIds(await call(TOOL_CAPS, {}, exec && exec.agent, exec && exec.signal))
+    capabilitiesCache = { at: now, ids: ids || null }
+    return ids || null
+  }
+
+  function filterCandidatesV2(candidates, ids, notes) {
+    if (!candidates.length || !ids) return candidates
+    const kept = candidates.filter((c) => ids.has(`${c.provider}/${c.model}`))
+    for (const c of candidates) if (!kept.includes(c)) notes.push(`跳过 ${c.provider}/${c.model}：能力列表中不存在`)
+    return kept.length ? kept : candidates
+  }
+
+  async function startPipelineV2(args, exec, jobs) {
+    const agent = exec && exec.agent
+    const { modes, warning, aliases } = loadModes(config.modesPath || MODES_PATH)
+    // 同步预检：任何参数/写冲突错误都在此抛出，不调用 relay 工具、不注册 Job。
+    const plan = preflightDispatchV2(args, config, { modes, aliases: aliases || {} })
+    const notes = warning ? [warning] : []
+    const pipelineId = `p-${Date.now().toString(36)}-${++seq}`
+    const manifestPath = join(pipelineManifestDir(), `${pipelineId}.json`)
+    let capabilityIds = null
+    try { capabilityIds = await getCapabilityIdsV2(exec) } catch (e) { notes.push(`list_capabilities 失败，未过滤候选：${(e && e.message) || e}`) }
+    const items = plan.tasks.map((t) => ({
+      index: t.index, kind: 'task', label: t.label, status: 'pending',
+      workspace: t.workspace, writable: t.writable, dependsOn: [...t.dependsOn],
+      runId: undefined, sessionId: undefined, webUrl: undefined, model: undefined,
+      output: '', error: undefined, startUnknown: false, notes: [], git: undefined,
+    }))
+    let jobId
+    let finalRead = null
+    let pipelinePhase = 'running'
+    let pipelineResultHeader = V2_MACHINE_HEADER
+    let cancelPipeline = () => {}
+    const disposeCancel = (reason) => cancelPipeline(reason)
+    const manifest = () => ({
+      machineHeader: pipelineResultHeader,
+      phase: pipelinePhase,
+      pipelineId,
+      jobId,
+      updatedAt: new Date().toISOString(),
+      onWriteConflict: plan.onWriteConflict,
+      gateUserAsk: plan.gate ? plan.gate.userAsk : undefined,
+      notes,
+      items: items.map((i) => ({
+        index: i.index, kind: i.kind, label: i.label, status: i.status,
+        runId: i.runId, sessionId: i.sessionId, webUrl: i.webUrl, model: i.model,
+        startUnknown: i.startUnknown || undefined, error: i.error,
+        verdict: i.verdict, selfReview: i.selfReview || undefined,
+        dependsOn: i.dependsOn, git: i.git,
+      })),
+    })
+    const writeManifest = () => {
+      if (config.writeManifest === false) return
+      try {
+        mkdirSync(dirname(manifestPath), { recursive: true })
+        const tmp = `${manifestPath}.tmp`
+        writeFileSync(tmp, JSON.stringify(manifest(), null, 2))
+        renameSync(tmp, manifestPath)
+      } catch {}
+    }
+    const modelNote = () => `实际使用：${items.map((i) => i.model).filter(Boolean).join(', ') || '(待定)'}（pipeline ${pipelineId}）` + (notes.length ? '；' + notes.join('；') : '')
+
+    const getNow = typeof config.now === 'function' ? config.now : () => Date.now()
+    const maxWaitMs = (args.maxWaitMinutes || config.maxWaitMinutes) * 60000
+    // Stage 1 与 Stage 2 gate 共享同一个总 deadline，避免 gate 重新获得一整段等待预算。
+    const pipelineDeadline = getNow() + maxWaitMs
+    const waitRetrySleep = (ms, abort) => new Promise((resolve) => {
+      if (!(ms > 0) || abort.signal.aborted) { resolve(); return }
+      let timer
+      const onAbort = () => { clearTimeout(timer); resolve() }
+      abort.signal.addEventListener('abort', onAbort, { once: true })
+      timer = setTimeout(() => {
+        abort.signal.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+    })
+
+    async function waitRunV2(item, started, abort) {
+      let snap = started
+      let cancelRequestedAt = snap && snap.cancelRequested ? (parseTimeMs(snap.cancelRequestedAt ?? snap.canceledAt) ?? getNow()) : null
+      while (!abort.signal.aborted) {
+        const remaining = pipelineDeadline - getNow()
+        if (remaining <= 0) throw new Error('wait timeout')
+        const sliceTimeout = Math.max(1, Math.min(config.sliceMs, remaining))
+        let pollAttempt = 0
+        while (true) {
+          try {
+            snap = await call(TOOL_WAIT, { runId: item.runId, timeoutMs: sliceTimeout }, agent, abort.signal)
+            break
+          } catch (pollErr) {
+            if (abort.signal.aborted || !isTransientPollError(pollErr) || pollAttempt >= (config.waitMaxRetries ?? DEFAULTS.waitMaxRetries)) throw pollErr
+            pollAttempt++
+            await waitRetrySleep(config.waitRetryDelayMs ?? DEFAULTS.waitRetryDelayMs, abort)
+            if (abort.signal.aborted) throw pollErr
+          }
+        }
+        const cRes = isRunCancelled(snap, {
+          cancelRequestedAt,
+          now: getNow(),
+          cancelGraceMs: config.cancelGraceMs ?? DEFAULTS.cancelGraceMs,
+          sessionTerminated: isChildSessionTerminated(ctx, snap && snap.sessionId),
+        })
+        cancelRequestedAt = cRes.cancelRequestedAt
+        if (cRes.cancelled) return { snap, cancelled: true }
+        if (isTerminalSnap(snap)) return { snap, cancelled: false }
+      }
+      return { snap, cancelled: true }
+    }
+
+    async function runOne(t, item, abort) {
+      item.status = 'running'
+      writeManifest()
+      try {
+        if (disposed) throw new Error('relay_dispatch disposed')
+        const before = item.writable ? await captureGitTree(t.workspace) : { available: false }
+        const startTool = t.review ? TOOL_START_REVIEW : TOOL_START_RUN
+        const attempts = t.candidates.length ? filterCandidatesV2(t.candidates, capabilityIds, item.notes) : [null]
+        let started, used, lastErr
+        for (const c of attempts) {
+          const sa = c ? { ...t.baseArgs, provider: c.provider, model: c.model } : t.baseArgs
+          try {
+            started = await startLinked(startTool, fillStartArgs(sa, config, t.review), exec, t.rawTask, t.modePrefix)
+            // start_run 已返回但等待启动期间发生用户取消：立即取消刚拿到的远端 run，防孤儿写任务。
+            if (abort.signal.aborted) {
+              const orphanRunId = started && (started.runId || (started.run && started.run.runId))
+              if (orphanRunId && !disposed && !isDisposeCancelReason(abort.signal.reason)) {
+                await call(TOOL_CANCEL, { runId: orphanRunId }, agent, new AbortController().signal).catch(() => {})
+              }
+              throw new Error('启动完成后检测到已取消')
+            }
+            used = c ? `${c.provider}/${c.model}` : `${sa.provider || config.defaultProvider}/${sa.model || config.defaultModel}`
+            lastErr = undefined
+            break
+          } catch (err) {
+            const msg = String((err && err.message) || err)
+            lastErr = new Error(msg)
+            if (t.writable && isUnknownStartError(err)) {
+              // start_unknown：写任务可能已被对端接受，换模型重试会造成双写。
+              item.startUnknown = true
+              item.notes.push('start_unknown：写任务启动结果不可知，为防止双写不再换模型重试')
+              break
+            }
+            if (c && isPreStartRejection(err, t.writable)) break
+            if (c) item.notes.push(`跳过 ${c.provider}/${c.model}：启动失败 ${clip(msg, 200)}`)
+            if (abort.signal.aborted || disposed) break
+          }
+        }
+        if (lastErr) throw lastErr
+        const runId = started && (started.runId || (started.run && started.run.runId))
+        if (!runId) throw new Error(`start 未返回 runId：${clip(started, 600)}`)
+        item.runId = runId
+        item.sessionId = started.sessionId || (started.run && started.run.sessionId)
+        item.webUrl = started.webUrl
+        item.model = used
+        writeManifest()
+        const { snap, cancelled: runCancelled } = await waitRunV2(item, started, abort)
+        item.output = runCancelled ? buildCancelConclusion(snap, 'cancelled') : fullConclusion(snap)
+        item.status = runCancelled || (snap && snap.status === 'cancelled')
+          ? 'cancelled'
+          : (snap && snap.status === 'succeeded' ? 'succeeded' : 'failed')
+        if (item.writable) {
+          const after = await captureGitTree(t.workspace)
+          const diff = await diffGitTrees(t.workspace, before, after)
+          item.git = {
+            available: diff.available, changed: diff.changed, files: diff.files,
+            nameStatus: diff.nameStatus, numstat: diff.numstat, statText: diff.statText,
+            beforeTree: diff.beforeTree, afterTree: diff.afterTree,
+          }
+        }
+      } catch (err) {
+        item.status = abort.signal.aborted || disposed ? 'cancelled' : 'failed'
+        item.error = String((err && err.message) || err)
+        if (item.startUnknown) item.error = `start_unknown: ${item.error}`
+        if (!item.output) item.output = item.error
+      } finally {
+        writeManifest()
+      }
+    }
+
+    jobId = jobs.start({
+      kind: 'relay-dispatch',
+      label: `pipeline ${pipelineId}`,
+      owner: agent,
+      run: () => {
+        const abort = new AbortController()
+        let cancelled = false
+        cancelPipeline = (reason) => {
+          if (cancelled) return
+          cancelled = true
+          const detachOnly = disposed || isDisposeCancelReason(reason)
+          if (detachOnly) pipelinePhase = 'detached'
+          try { abort.abort(reason || 'cancelled') } catch {}
+          // DSH 关闭/插件热重载只分离本地等待，远端 run 必须继续存活；仅用户显式取消才 cancel_run。
+          if (!detachOnly) {
+            for (const item of items) {
+              if (item.status === 'running' && item.runId) {
+                call(TOOL_CANCEL, { runId: item.runId }, agent, new AbortController().signal).catch(() => {})
+              }
+            }
+          }
+          writeManifest()
+        }
+        activePipelines.add(disposeCancel)
+        const snapshotText = () => {
+          const lines = [V2_MACHINE_HEADER, `pipeline_id: ${pipelineId}`, 'state: running']
+          for (const item of items) {
+            lines.push(`#${item.index} ${item.label}: ${item.status}${item.runId ? ` runId=${item.runId}` : ''}${item.model ? ` model=${item.model}` : ''}`)
+          }
+          return lines.join('\n')
+        }
+        const finish = (r) => {
+          activePipelines.delete(disposeCancel)
+          if (pipelinePhase !== 'detached') pipelinePhase = 'completed'
+          finalRead = `${pipelineResultHeader}\n${r.output || ''}\n${modelNote()}`
+          writeManifest()
+          if (!cancelled) scheduleOwnerWake(agent, jobId)
+          return r
+        }
+        const done = (async () => {
+          const running = new Map()
+          const maxConc = Math.max(1, config.maxConcurrentTasks ?? DEFAULTS.maxConcurrentTasks)
+          const launch = (t) => {
+            const item = items[t.index]
+            const p = runOne(t, item, abort).finally(() => { running.delete(t.index) })
+            running.set(t.index, p)
+          }
+          while (!abort.signal.aborted && !disposed) {
+            let changed = false
+            for (const t of plan.tasks) {
+              const item = items[t.index]
+              if (item.status !== 'pending') continue
+              const deps = [...t.dependsOn]
+              if (deps.some((d) => ['failed', 'cancelled', 'skipped'].includes(items[d].status))) {
+                item.status = 'skipped'
+                item.output = '依赖任务未成功，已跳过'
+                changed = true
+                continue
+              }
+              if (deps.every((d) => items[d].status === 'succeeded') && running.size < maxConc) {
+                launch(t)
+                changed = true
+              }
+            }
+            writeManifest()
+            if (running.size > 0) { await Promise.race(running.values()); continue }
+            if (plan.tasks.every((t) => items[t.index].status !== 'pending')) break
+            if (!changed) break
+          }
+          if (running.size > 0) await Promise.allSettled([...running.values()])
+          for (const item of items) {
+            if (item.status === 'pending') { item.status = 'cancelled'; item.output = '已取消' }
+          }
+
+          let gateSelfReview = false
+          if (plan.gate) {
+            const gateItem = {
+              index: items.length, kind: 'gate', label: 'gate', status: 'pending',
+              workspace: plan.tasks[0] && plan.tasks[0].workspace, writable: false, dependsOn: [],
+              output: '', error: undefined, startUnknown: false, notes: [], git: undefined,
+              verdict: 'unknown', selfReview: 0,
+            }
+            items.push(gateItem)
+            const succeeded = plan.tasks.filter((t) => items[t.index].status === 'succeeded')
+            const partial = succeeded.length < plan.tasks.length
+            if (!succeeded.length) {
+              gateItem.status = 'skipped'
+              gateItem.output = '没有成功的子任务，gate 跳过'
+            } else if (partial && plan.gate.onPartial === 'skip') {
+              gateItem.status = 'skipped'
+              gateItem.output = '部分子任务未成功，onPartial=skip，gate 跳过'
+            } else if (abort.signal.aborted || disposed) {
+              gateItem.status = 'cancelled'
+              gateItem.output = '已取消'
+            } else {
+              const usedModels = new Set(succeeded.map((t) => items[t.index].model).filter(Boolean))
+              const usedVendors = new Set([...usedModels].map((id) => {
+                const slash = id.indexOf('/')
+                return vendorOf(slash >= 0 ? id.slice(0, slash) : '', slash >= 0 ? id.slice(slash + 1) : id)
+              }))
+              const verifyCfg = (modes && modes.verify) || BUILTIN_MODES.verify
+              const evidence = succeeded.map((t) => {
+                const it = items[t.index]
+                const git = it.git && it.git.available ? it.git : null
+                const gitText = [
+                  `变更文件：${(git && git.files && git.files.join(', ')) || '(无快照证据)'}`,
+                  `numstat:\n${(git && git.numstat) || '(无)'}`,
+                  `statText:\n${(git && git.statText) || '(无)'}`,
+                ].join('\n')
+                return `## ${it.label} (${it.model || '?'})\n${conclusion({ assistantText: it.output }, 1500)}\n${gitText}`
+              }).join('\n\n')
+              const gateTaskText = [
+                plan.gate.criteria,
+                `用户原始需求：${plan.gate.userAsk}`,
+                '输出要求：第一行必须且只能是 `verdict: pass`、`verdict: fail` 或 `verdict: partial` 之一；随后再列证据。会话自身成功不代表验收通过，必须依据标准与真实 Git 证据作判断。',
+                plan.gate.commands.length ? `请执行以下验证命令并报告结果：\n${plan.gate.commands.map((c) => `- ${c}`).join('\n')}` : '',
+                evidence,
+              ].filter(Boolean).join('\n\n')
+              const applied = applyMode(verifyCfg, { workspace: succeeded[0].workspace, task: gateTaskText }, aliases || {})
+              // 优先剔除同厂商模型；若无异构候选，也必须回退原链真正跑一次守门员，并明确标记自审。
+              const originalGateCandidates = filterCandidatesV2(applied.candidates, capabilityIds, [])
+              let gateCandidates = applied.candidates.filter((c) =>
+                !usedModels.has(`${c.provider}/${c.model}`) && !usedVendors.has(vendorOf(c.provider, c.model)))
+              gateCandidates = filterCandidatesV2(gateCandidates, capabilityIds, gateItem.notes)
+              if (!gateCandidates.length) {
+                gateSelfReview = true
+                gateItem.selfReview = 1
+                gateCandidates = originalGateCandidates
+                gateItem.notes.push('self_review=1：无异构厂商候选，已回退原 gate 候选链实际执行守门员；主会话仍须复核')
+              }
+              const gt = {
+                index: gateItem.index, label: 'gate', mode: 'verify', review: false,
+                rawTask: gateTaskText, modePrefix: '', baseArgs: applied.args,
+                candidates: gateCandidates, workspace: succeeded[0].workspace, writable: false,
+              }
+              await runOne(gt, gateItem, abort)
+              gateItem.verdict = parseGateVerdict(gateItem.output)
+              if (gateItem.verdict === 'unknown') gateItem.notes.push('守门员输出未包含可解析 verdict，验收状态记为 unknown')
+              writeManifest()
+            }
+            writeManifest()
+          }
+
+          const lines = [`pipeline_id: ${pipelineId}`]
+          if (plan.gate) lines.push(`gate_user_ask: ${plan.gate.userAsk}`)
+          for (const item of items) {
+            lines.push(`\n[${item.kind}#${item.index}] ${item.label} -> ${item.status}${item.model ? ` (${item.model})` : ''}${item.runId ? ` runId=${item.runId}` : ''}`)
+            if (item.startUnknown) lines.push('start_unknown=1')
+            if (item.git && item.git.available) lines.push(`changed_files: ${item.git.files.join(', ') || '(无)'}`)
+            if (item.notes.length) lines.push(item.notes.join('；'))
+            lines.push(conclusion({ assistantText: item.output || item.error || '(无)' }, config.maxResultChars))
+          }
+          const failedN = items.filter((i) => i.status === 'failed').length
+          const succN = items.filter((i) => i.status === 'succeeded').length
+          const isCancelled = cancelled || abort.signal.aborted
+          const taskItems = items.filter((i) => i.kind === 'task')
+          const allTasksSucceeded = taskItems.length > 0 && taskItems.every((i) => i.status === 'succeeded')
+          const anyTaskUnsuccessful = taskItems.some((i) => i.status !== 'succeeded')
+          const gateItem = items.find((i) => i.kind === 'gate')
+          const gateVerdict = (gateItem && gateItem.verdict) || 'unknown'
+          let result = 'UNVERIFIED'
+          if (!isCancelled) {
+            if (anyTaskUnsuccessful || gateVerdict === 'fail') result = 'FAIL'
+            else if (allTasksSucceeded && plan.gate && gateVerdict === 'pass' && !gateSelfReview) result = 'PASS'
+            else if (gateVerdict === 'pass' || gateVerdict === 'partial') result = 'PARTIAL'
+          }
+          const needsMainAttention = result === 'PASS' ? 'no' : 'yes'
+          pipelineResultHeader = `${V2_MACHINE_HEADER} | RESULT: ${result} | needs_main_attention: ${needsMainAttention} | self_review: ${gateSelfReview ? 1 : 0}`
+          // 机器头只由 buildDelivery/finalRead 添加一次，output 保持正文，避免 detail 重复两行 RESULT。
+          const output = lines.join('\n')
+          const deliveryStatus = isCancelled ? 'cancelled' : (failedN === 0 ? 'succeeded' : (succN > 0 ? 'partial' : 'failed'))
+          const deliv = buildDelivery(deliveryStatus, output, DETAIL_BUDGET_BYTES, true, pipelineResultHeader)
+          return { status: isCancelled ? 'killed' : (failedN ? 'failed' : 'completed'), ...deliv, output }
+        })().then(finish)
+        return {
+          cancel: (reason) => cancelPipeline(reason),
+          done,
+          // 运行中返回实时状态快照；终态返回机器头 + 完整结论（可重复读取）。
+          readOutput: () => (finalRead != null ? finalRead : snapshotText()),
+        }
+      },
+    })
+    return {
+      jobId,
+      pipelineId,
+      tasks: plan.tasks.length,
+      gate: Boolean(plan.gate),
+      note: `已创建 v2 流水线（${plan.tasks.length} 个任务${plan.gate ? ' + gate' : ''}，onWriteConflict=${plan.onWriteConflict}）。清单：${manifestPath}`,
+      manifestPath,
+      machineHeader: V2_MACHINE_HEADER,
+    }
+  }
+
   ctx.effect(() => tools.register({
     name: 'relay_dispatch',
     description:
@@ -1021,7 +1836,7 @@ export function apply(ctx, rawConfig) {
       '【startArgs 默认值】最少只需 workspace+task（workspace 须为 Harness 已注册工作区）。未传时自动补：provider/model=' + config.defaultProvider + '/' + config.defaultModel +
       '；sessionMode=fresh；authorizationBasis=explicit-user-request；reviewTargets 与 contextReadScope=[workspace]；permissionPreset 为 workspace-write/danger-full-access 且无 writeScope 时 writeScope=[workspace]；danger-full-access 时 confirmedDangerousPermission=true；' +
       'agentPreset 可透传' + (config.defaultAgentPreset ? '（默认 ' + config.defaultAgentPreset + '）' : '（默认不设，用官方 preset）') + '；显式传入的字段不被覆盖。' +
-      '【mode】可选：investigate/implement/verify/review/heavy（键取自 ~/.dsh/dispatch-modes.yaml，每次派发热读）；套用其 permission/workspace/agentPreset/reasoningEffort，并拼 taskPrefix+task+deliverable；未显式给 provider/model 时按 models 候选链依次尝试（跳过不存在的模型，start_run 报错换下一个）；返回里写明实际模型。最简用法：{mode, startArgs:{workspace, task}}。' +
+      '【mode】可选：investigate/implement/verify/review/heavy/rp（键取自 ~/.dsh/dispatch-modes.yaml，每次派发热读）；套用其 permission/workspace/agentPreset/reasoningEffort，并拼 taskPrefix+task+deliverable；未显式给 provider/model 时按 models 候选链依次尝试（跳过不存在的模型，start_run 报错换下一个）；返回里写明实际模型。最简用法：{mode, startArgs:{workspace, task}}。' +
       '派发后不要调用 wait_run 或 job_output 轮询；没有其他活就直接结束本轮。',
     parameters: {
       type: 'object',
@@ -1034,22 +1849,29 @@ export function apply(ctx, rawConfig) {
         mode: { type: 'string', description: '派发模式名（见 dispatch-modes.yaml）；不给则保持原行为' },
         review: { type: 'boolean', description: 'true 时改用 start_review（只读审查）' },
         maxWaitMinutes: { type: 'integer', description: '后台最长等待分钟数（缺省 240）' },
+        tasks: { type: 'array', description: 'v2：多任务流水线；每项 {startArgs?, mode?, review?, label?, workspace/task/provider/model/writeScope 快捷字段}；与顶层 startArgs 合并。单个聚合 Job，完成通知首行为 relay_dispatch_v2: 1', items: { type: 'object', additionalProperties: true } },
+        gate: { type: 'object', description: "v2：全部子任务 join 后的异构验证门；{userAsk, criteria, commands?, onPartial?: 'skip'|'gate'}；自动剔除已参与实现的模型，无可用异构模型时 self_review=1 兜底", additionalProperties: true },
+        onWriteConflict: { type: 'string', description: "v2：同 workspace 写范围重叠时 'error'（默认，同步预检直接报错）或 'serial'（自动串行）", enum: ['error', 'serial'] },
       },
-      required: ['startArgs'],
+      required: [],
       additionalProperties: false,
     },
     output: {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => [{
         type: 'text',
-        text: `已派发 runId=${value.runId}，后台等待中（jobId=${value.jobId}）。` +
-          (value.webUrl ? ` 会话：${value.webUrl}。` : '') +
-          ' ' + (value.note || '') + ' 结束时会收到通知，不要轮询。',
+        text: value.pipelineId
+          ? `已派发 v2 流水线 pipelineId=${value.pipelineId}（${value.tasks} 个任务${value.gate ? ' + gate' : ''}，jobId=${value.jobId}）。 ${value.note || ''} 结束时会收到通知，不要轮询。`
+          : `已派发 runId=${value.runId}，后台等待中（jobId=${value.jobId}）。` +
+            (value.webUrl ? ` 会话：${value.webUrl}。` : '') +
+            ' ' + (value.note || '') + ' 结束时会收到通知，不要轮询。',
       }],
     },
     async execute(args, exec) {
       const jobs = ctx.get('jobs')
       if (!jobs) throw new Error('background jobs unavailable')
+      if (args.tasks != null || args.gate != null) return startPipelineV2(args, exec, jobs)
+      if (!args.startArgs) throw new Error('缺少 startArgs；多任务/gate 流水线请使用 tasks[]')
       const startTool = args.review ? TOOL_START_REVIEW : TOOL_START_RUN
       const notes = []
       const rawTask = args.startArgs && args.startArgs.task
@@ -1106,7 +1928,13 @@ export function apply(ctx, rawConfig) {
             lastErr = new Error(msg); break // 工作区问题换模型无意义
           }
           lastErr = new Error(msg)
-          if (c && !isModelError(msg)) break // 请求/环境类错误：换模型无意义
+          const writableAttempt = !args.review && V2_WRITABLE_PRESETS.has((sa && sa.permissionPreset) || '')
+          if (writableAttempt && isUnknownStartError(err)) {
+            // 旧单任务路径同样禁止写任务 start_unknown 换模型重试，避免远端已接受后双写。
+            lastErr = new Error(`start_unknown：写任务启动结果不可知，为防止双写不再换模型重试：${msg}`)
+            break
+          }
+          if (c && isPreStartRejection(err, writableAttempt)) break // 请求/环境类或写任务结果不可知：换模型无意义/有双写风险
           if (c) notes.push(`跳过 ${c.provider}/${c.model}：启动失败 ${clip(msg, 200)}`)
           if (exec.signal && exec.signal.aborted) break
         }
@@ -1144,7 +1972,7 @@ export function apply(ctx, rawConfig) {
           let pending = ''
           const finish = (r) => {
             pending += (r.output || '') + '\n' + modelNote
-            if (!cancelled) scheduleOwnerWake(agent)
+            if (!cancelled) scheduleOwnerWake(agent, jobId)
             return r
           }
           const done = (async () => {
@@ -1273,8 +2101,7 @@ export function apply(ctx, rawConfig) {
                 if (stallMs > 0 && !stallNotified && stalledMs >= stallMs) {
                   stallNotified = true
                   const lastToolName = extractLastToolName(snap, childSession)
-                  const baseUrl = config.webBaseUrl || process.env.DSH_WEB_URL || 'http://127.0.0.1:3080'
-                  const effectiveWebUrl = (snap && snap.webUrl) || webUrl || (sid ? `${baseUrl.replace(/\/$/, '')}/?sessionId=${sid}` : undefined)
+                  const effectiveWebUrl = (snap && snap.webUrl) || webUrl || (sid ? `http://127.0.0.1:3080/?sessionId=${sid}` : undefined)
                   const noticeText = formatStallNotice({
                     runId,
                     webUrl: effectiveWebUrl,
@@ -1311,11 +2138,14 @@ export function apply(ctx, rawConfig) {
             }
           })().then(finish)
           return {
-            cancel: () => {
+            cancel: (reason) => {
               if (cancelled) return
               cancelled = true
-              abort.abort('cancelled')
-              call(TOOL_CANCEL, { runId }, agent, new AbortController().signal).catch(() => {})
+              abort.abort(reason || 'cancelled')
+              // jobs 服务关闭或插件卸载只中止本地等待，绝不误杀仍在执行的远端会话。
+              if (!(disposed || isDisposeCancelReason(reason))) {
+                call(TOOL_CANCEL, { runId }, agent, new AbortController().signal).catch(() => {})
+              }
             },
             done,
             // 只在结束后一次性给出精简结论；运行中不吐任何中间输出。

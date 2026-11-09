@@ -243,13 +243,42 @@ flowchart TD
 - **故障现象**：子会话挂载 `parentSession` 后，宿主不再对其执行首条消息自动摘要命名，或者直接截取首条消息前 40 个字符作为标题，导致侧栏里一排子会话全部叫 `通用禁令：不重启 DSH；不读 secrets...`，完全无法分辨各自的任务内容。
 - **修复方案**（见 `lib/index.js:259-268, 739-791`）：实现 `cleanBodyTitle(rawTask, prefix)` 与 `scheduleTitle()` 双阶段标题调度：
   1. **立即兜底命名**：自动剥离模式注入的 `taskPrefix`、`通用禁令：...` 行以及 Markdown 标题符号（`#`、`*`、数字序号），提取干净的任务首行核心短语（UTF-8 字素截断至 40 字节内），在会话对象就绪后第一时间调用 `sessionTitle.rename(session, fallback)`；
-  2. **异步 LLM 标题精炼**：待子会话产生首轮 `user/message` 与 `request/header` 事件后，调用一次带本地超时保护（`withLocalTimeout(..., 15000)`）的 `sessionTitle.refresh(session)`，并在插件 `dispose` 时自动取消所有未决轮询定时器，兼顾可读性与资源安全。
+  2. **可选 LLM 标题精炼**：默认只保留确定性 fallback，不额外消耗 LLM；仅显式配置 `llmTitle: true` 时，才在子会话产生首轮 `user/message` 与 `request/header` 事件后调用一次带本地超时保护（`withLocalTimeout(..., 15000)`）的 `sessionTitle.refresh(session)`，并在插件 `dispose` 时自动取消所有未决轮询定时器，兼顾可读性与资源安全。
 
 ---
 
-## 7. 工程验证与测试覆盖矩阵
+## 7. v2 聚合流水线：`tasks -> join -> gate`
 
-`packages/dsh-relay-dispatch/test/unit.mjs` 构建了不依赖外部网络、可直接对接 DSH 核心组件（`cordis`、`LocalJobRegistry`、`dsh-tool-jobs`）的 11 大测试套件：
+### 7.1 单次派发、同步预检与 `items[]` 状态机
+
+v2 将多个关联子任务合并为一次 `relay_dispatch({ tasks: [...], gate, onWriteConflict })` 调用，由**单个聚合 Job** 托管完整生命周期，避免主会话手工拆分派发、逐个等待再拼接结论：
+
+- **零副作用同步预检**：`preflightDispatchV2()` 先合并顶层 `startArgs` 与各任务的 `startArgs`／快捷字段，复用模式热读与参数补全，并校验 `gate`。同一工作区的可写任务按完整路径段边界比较 `writeScope`；默认 `onWriteConflict: 'error'` 在首个重叠处直接失败，此时尚未调用任何 Relay 工具，也未注册 Job。显式选择 `'serial'` 时才把冲突转换为 `dependsOn` 依赖并串行执行。
+- **单 Job 多项调度**：每个子任务对应 `items[]` 中的一项，状态在 `pending / running / succeeded / failed / cancelled / skipped` 间迁移；调度器遵守依赖关系与 `maxConcurrentTasks` 并发上限，依赖失败时跳过下游，不重复启动已完成项。
+- **真实变更证据**：可写任务执行前后分别调用 `captureGitTree()`。该函数复制真实 index（若存在）到临时文件，通过临时 `GIT_INDEX_FILE` 执行 `git add -A` 与 `git write-tree`，再用 `diffGitTrees()` 比较 tree 并列出实际路径差分（`name-status`/`numstat`/`stat`，随证据包交给守门员）；全程不污染真实 index 或工作树，临时索引在 `finally` 中删除，非 Git 目录降级为无快照证据。
+- **写模式防双写**：启动写任务时若出现网络中断、超时等结果不可知错误，标记 `start_unknown=1` 并停止候选链重试。此时对端可能已经接受任务，换模型再次 `start_run` 会造成同一任务双写；应根据清单和子会话先核查现状，而不是直接重派。
+
+### 7.2 join 后的异构验证门与诚实兜底
+
+全部子任务收口后，`gate: { userAsk, criteria, commands?, onPartial? }` 将成功项的结论、模型与 Git 差分组成证据包，并串联 `verify`：
+
+1. 没有成功项时直接跳过；部分成功时由 `onPartial: 'skip' | 'gate'` 决定是否继续。
+2. 从 gate 候选链中剔除已经参与实现的模型，再经能力列表过滤，避免验证者与实现者同源。
+3. 若没有剩余异构模型，不伪造一次跨模型审查，而是交付带 `self_review=1` 的自审证据包，明确提示主会话按 `criteria` 复核。
+
+### 7.3 可机读交付、运行中快照与关闭保护
+
+- 完成通知首行为确定性机器头 `relay_dispatch_v2: 1 | RESULT: PASS|PARTIAL|FAIL|UNVERIFIED | needs_main_attention: yes|no | self_review: 0|1`（仅全部 task 成功、`verdict=pass` 且非自审时为 `PASS/no`），随后给出 pipeline、各项状态、模型、`changed_files` 与 gate 结论；`buildDelivery()` 同时 trim 前导空白，保证机器头不会被空白挤离首行且只出现一次。
+- 运行中 `readOutput()` 返回当前 `items[]` 实时快照，终态则返回可重复读取的完整结论，不再把运行中读取实现成一次性消费空缓冲。
+- 清单以临时文件加重命名的方式原子写入 `~/.dsh/relay-pipelines/<pipelineId>.json`，持续记录各项状态、依赖、runId、模型、异常与 Git 证据。
+- 仅用户显式取消聚合 Job 时才对仍在运行且已有 runId 的子项发送 `cancel_run`，不影响其他项或宿主；DSH 关闭（`jobs service disposed`）与插件热重载（`relay_dispatch disposed`）只中止本地等待循环、清单记 `phase=detached`，远端 run 继续存活，旧单任务路径同样遵守，插件 `dispose` 仍会阻止后续启动。
+- v2 路径的 `list_capabilities` 在同一插件实例内缓存 60 秒；子会话标题默认只写确定性 fallback，只有显式开启 `llmTitle` 才额外调用 LLM `titles.refresh`；Stage 1 与 Stage 2 gate 共享同一个 `maxWaitMinutes` 总 deadline，避免 gate 重新获得一整段等待预算。
+
+---
+
+## 8. 工程验证与测试覆盖矩阵
+
+`packages/dsh-relay-dispatch/test/unit.mjs` 构建了不依赖外部网络、可直接对接 DSH 核心组件（`cordis`、`LocalJobRegistry`、`dsh-tool-jobs`）的完整测试套件：
 
 | 测试套件标识 | 覆盖的核心工程能力与边界条件 |
 | :--- | :--- |
@@ -263,3 +292,5 @@ flowchart TD
 | `notify ok` | 直接取消、`cancelRequested: true` 卡工具调用满 60s `cancelGraceMs` 强制收口、子会话 `turn/end` 零等待收口、15 分钟停滞提醒单周期去重与恢复后二次提醒 |
 | `parentfix ok` | `Symbol.for` + `generation` 多次挂载防 Wrapper 链式叠加、旧实例滞后 `dispose` 不拆新实例钩子、同进程无请求头 Relay 注入与结构化诊断日志校验 |
 | `polish ok` | 主会话 `busy` 状态下停滞提醒强制走 `followup` 绝不调用 `inject`、后台 `wait_run` 连续 3 次瞬时网络错误重试恢复与第 4 次超限退出 |
+| `wake ok` | 后台 Job 结算后的 owner 唤醒、连续唤醒上限与真实用户消息重置 |
+| `v2 ok` | 多任务依赖与并发、共享等待 deadline、写任务 `start_unknown` 防双写、真实 gate verdict、自审兜底、dispose 仅 detach、Git `numstat`/`stat` 证据与机读 `RESULT` 头 |

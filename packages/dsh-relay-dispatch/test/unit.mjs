@@ -23,7 +23,7 @@ console.log('fill ok')
 // ───────── 派发模式测试 ─────────
 import { parseModesYaml, loadModes, applyMode, collectModelIds, apply } from '../lib/index.js'
 import { writeFileSync, mkdtempSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const dir = mkdtempSync(join(tmpdir(), 'modes-'))
@@ -556,7 +556,8 @@ import { classifyApiRequest, isRelayPrepare } from '../lib/index.js'
 
   // 3) 标题调度：refresh 本地超时保护 + dispose 时立即取消停止
   {
-    const h = setupHarness({ titlePollFirstMs: 10, titlePollIntervalMs: 10, titleRefreshTimeoutMs: 30 })
+    // 本组专门验证显式启用 LLM 标题刷新后的超时与取消；v2 默认行为另设测试覆盖。
+    const h = setupHarness({ titlePollFirstMs: 10, titlePollIntervalMs: 10, titleRefreshTimeoutMs: 30, llmTitle: true })
     // 3a) titles.refresh 挂起时由本地超时自动结束，且先完成 fallback 命名
     h.setRefreshImpl(() => new Promise(() => {}))
     h.setToolHandler(async (c) => {
@@ -1143,4 +1144,343 @@ import { hasPendingInbox } from '../lib/index.js'
   assert.equal(consumed.length, 6, '用户新消息后连续唤醒计数重置，应恢复自动唤醒')
   assert(consumed[5].text.includes('完成#7'))
 }
+
+  // 场景 B：任务完成时主会话仍在 doneAt 前开启的旧轮次中；旧轮次随后输出assistant/message 并延时 3 秒结束，
+  // 既不能误判通知已处理，也不能在忙碌时补发 followup，必须等旧轮次闭合后补唤醒。
+  {
+    const busyNotices = []
+    const busyTools = new Map()
+    const busyCtx = new Context()
+    const busyInbox = {
+      nextStep: [],
+      nextTurn: [],
+      get hasPending() { return this.nextStep.length > 0 || this.nextTurn.length > 0 },
+    }
+    const busyEvents = [
+      { type: 'turn/start', time: Date.now() - 1000, data: { turn: 1 } },
+    ]
+    const busyAgent = {
+      id: 'sess-wake-busy-old-turn',
+      status: 'busy',
+      ctx: busyCtx,
+      inbox: busyInbox,
+      session: { header: { id: 'sess-wake-busy-old-turn' }, events: busyEvents },
+      inject(msg) {
+        // 模拟忙碌时 dsh-tool-jobs 只把通知放入 nextStep，不开启新轮次。
+        this.inbox.nextStep.push(msg)
+      },
+      followup(msg) {
+        busyNotices.push(msg.content[0].text)
+        // 模拟真实 followup：通知在新轮次中被消费并产生助手响应。
+        const at = Date.now()
+        this.session.events.push(
+          { type: 'turn/start', time: at, data: { turn: 2 } },
+          { type: 'user/message', time: at + 1, data: { content: msg.content, source: msg.source } },
+          { type: 'assistant/message', time: at + 2, data: { turn: 2, message: { content: [{ type: 'text', text: '已处理完成通知' }] } } },
+          { type: 'turn/end', time: at + 3, data: { turn: 2 } },
+        )
+      },
+    }
+    busyCtx.provide('agents', { get: (id) => (id === busyAgent.id ? busyAgent : undefined) }, true)
+    busyCtx.provide('systemPrompt', { section: () => {} }, true)
+    busyCtx.provide('tools', {
+      register: (t) => { busyTools.set(t.name, t); return () => busyTools.delete(t.name) },
+      execute: async (c) => {
+        if (c.name.endsWith('start_run')) return { isError: false, value: { runId: 'run-busy-old-turn' } }
+        if (c.name.endsWith('wait_run')) {
+          return { isError: false, value: { runId: 'run-busy-old-turn', status: 'succeeded', assistantText: '忙时完成的子任务' } }
+        }
+        return { isError: false, value: {} }
+      },
+    }, true)
+    new LocalJobRegistry(busyCtx, { maxConcurrentJobsPerOwner: 10 })
+    applyToolJobs(busyCtx, {})
+    apply(busyCtx, {
+      modesPath: yp,
+      linkParentSession: false,
+      refreshTitle: false,
+      wakeDelayMs: 20,
+      wakePollMs: 40,
+      wakeMaxChecks: 120,
+      maxConsecutiveWakes: 5,
+    })
+    const busyDispatch = busyTools.get('relay_dispatch')
+    const busyResult = await busyDispatch.execute({ startArgs: { workspace: 'W', task: '忙时完成' } }, { agent: busyAgent })
+    for (let i = 0; i < 100; i++) {
+      const snap = busyCtx.jobs.get(busyResult.jobId, busyAgent)
+      if (snap.status === 'completed' && busyInbox.nextStep.length === 1) break
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.equal(busyCtx.jobs.get(busyResult.jobId, busyAgent).status, 'completed')
+    assert.equal(busyInbox.nextStep.length, 1, '忙碌时完成通知应先由 inject 入队')
+    assert.equal(busyNotices.length, 0, '旧轮次运行中不得补发 followup')
+
+    // 该响应发生在 doneAt 之后，但仍属于 doneAt 前开启的 Turn 1，不能算作处理了本 job 通知。
+    busyEvents.push({
+      type: 'assistant/message',
+      time: Date.now(),
+      data: { turn: 1, message: { content: [{ type: 'text', text: '旧轮次自己的回复' }] } },
+    })
+    const oldTurnTimer = setTimeout(() => {
+      busyEvents.push({ type: 'turn/end', time: Date.now(), data: { turn: 1 } })
+      busyAgent.status = 'idle'
+    }, 3000)
+    await new Promise((r) => setTimeout(r, 250))
+    assert.equal(busyNotices.length, 0, '旧轮次的后续 assistant/message 不得误导为通知已处理')
+
+    for (let i = 0; i < 100 && busyNotices.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    clearTimeout(oldTurnTimer)
+    assert.equal(busyNotices.length, 1, '旧轮次结束并回到 idle 后必须补唤醒一次')
+    assert(busyNotices[0].includes(busyResult.jobId), '补发通知必须携带对应 jobId')
+    assert.equal(busyInbox.hasPending, false, '补唤醒后不得残留重复的 nextStep 通知')
+    await new Promise((r) => setTimeout(r, 120))
+    assert.equal(busyNotices.length, 1, '确认新轮次已响应后不得重复补唤醒')
+  }
 console.log('wake ok')
+
+// ───────── v2：同步预检 / Git 快照 / 聚合流水线 / gate / 取消与清单 ─────────
+import {
+  V2_MACHINE_HEADER,
+  preflightDispatchV2,
+  writePathsOverlap,
+  isUnknownStartError,
+  captureGitTree,
+  diffGitTrees,
+} from '../lib/index.js'
+import { execFileSync } from 'node:child_process'
+{
+  assert(writePathsOverlap('C:\\ws\\foo', 'c:/ws/FOO/bar'))
+  assert(!writePathsOverlap('C:\\ws\\foo', 'C:\\ws\\foobar'))
+  assert(isUnknownStartError(new Error('fetch failed ECONNRESET')))
+  assert(!isUnknownStartError(new Error('HTTP 429 rate limit')))
+  assert.equal(buildDelivery('succeeded', ' \n\t结论').finalText, '结论')
+
+  const conflictArgs = {
+    tasks: [
+      { label: 'a', startArgs: { workspace: 'C:\\ws\\p', task: 'a', permissionPreset: 'workspace-write', writeScope: ['C:\\ws\\p\\src'] } },
+      { label: 'b', startArgs: { workspace: 'C:\\ws\\p', task: 'b', permissionPreset: 'workspace-write', writeScope: ['C:\\ws\\p\\src\\x'] } },
+    ],
+  }
+  assert.throws(() => preflightDispatchV2(conflictArgs), /写范围冲突/)
+  const serial = preflightDispatchV2({ ...conflictArgs, onWriteConflict: 'serial' })
+  assert.deepEqual([...serial.tasks[1].dependsOn], [0])
+  assert.throws(() => preflightDispatchV2({ tasks: [] }), /非空数组/)
+  assert.throws(() => preflightDispatchV2({ gate: { userAsk: '', criteria: 'x' } }), /userAsk/)
+
+  // 临时索引快照包含未提交改动，但不污染真实 index / 工作树。
+  const repo = mkdtempSync(join(tmpdir(), 'relay-v2-git-'))
+  execFileSync('git', ['init', '-q'], { cwd: repo })
+  writeFileSync(join(repo, 'a.txt'), 'one')
+  const before = await captureGitTree(repo)
+  assert(before.available && /^[0-9a-f]{40}$/.test(before.tree))
+  assert(execFileSync('git', ['status', '--short'], { cwd: repo, encoding: 'utf8' }).includes('?? a.txt'))
+  writeFileSync(join(repo, 'a.txt'), 'two')
+  const after = await captureGitTree(repo)
+  const gd = await diffGitTrees(repo, before, after)
+  assert(gd.available && gd.changed && gd.files.includes('a.txt'))
+  assert.notEqual(before.tree, after.tree)
+  assert(execFileSync('git', ['status', '--short'], { cwd: repo, encoding: 'utf8' }).includes('?? a.txt'))
+  const nonGit = await captureGitTree(dir)
+  assert.equal(nonGit.available, false)
+
+  function makeV2Env(handler, cfg = {}) {
+    let tool
+    const calls = []
+    const jobs = []
+    const disposers = []
+    const ctx = {
+      effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d); return d },
+      get(k) {
+        if (k === 'jobs') return {
+          start(spec) {
+            const rec = { id: `job-v2-${jobs.length + 1}`, spec }
+            rec.hooks = spec.run()
+            rec.done = rec.hooks.done.then((o) => { rec.outcome = o; return o })
+            jobs.push(rec)
+            return rec.id
+          },
+        }
+        return undefined
+      },
+      tools: {
+        register(t) { tool = t; return () => {} },
+        execute: async (c) => { calls.push(c); return handler(c) },
+      },
+    }
+    apply(ctx, {
+      modesPath: yp,
+      linkParentSession: false,
+      refreshTitle: false,
+      manifestDir: dir,
+      sliceMs: 5,
+      waitRetryDelayMs: 1,
+      ...cfg,
+    })
+    return {
+      calls,
+      jobs,
+      run: (args) => tool.execute(args, {}),
+      dispose: () => { while (disposers.length) disposers.pop()() },
+    }
+  }
+  const capsV2 = { providers: [{ provider: 'a', models: ['m1'] }, { provider: 'b', models: ['m2'] }, { provider: 'c', models: ['m3'] }] }
+  const startsOf = (env) => env.calls.filter((c) => c.name.endsWith('start_run'))
+
+  // 参数/写冲突在同步预检失败：零 relay 调用、零 Job。
+  {
+    const env = makeV2Env(() => okRes({}))
+    await assert.rejects(() => env.run(conflictArgs), /写范围冲突/)
+    assert.equal(env.calls.length, 0)
+    assert.equal(env.jobs.length, 0)
+    env.dispose()
+  }
+
+  // tasks -> join -> 异构 gate：单聚合 Job、60s 能力缓存、机器头、清单与终态可重复读取。
+  {
+    writeFileSync(yp, 'verify:\n  permission: read-only\n  taskPrefix:\n  deliverable:\n  models:\n    - a/m1\n    - c/m3\n')
+    let n = 0
+    const env = makeV2Env(async (c) => {
+      if (c.name.endsWith('list_capabilities')) return okRes(capsV2)
+      if (c.name.endsWith('start_run')) { n++; return okRes({ runId: `r${n}`, sessionId: `s${n}` }) }
+      if (c.name.endsWith('wait_run')) {
+        const runId = c.arguments.runId
+        return okRes({
+          runId,
+          sessionId: `s${runId.slice(1)}`,
+          status: 'succeeded',
+          assistantText: runId === 'r3' ? 'verdict: pass\ndone-r3' : `done-${runId}`,
+        })
+      }
+      return okRes({})
+    })
+    const res = await env.run({
+      tasks: [
+        { label: 'A', provider: 'a', model: 'm1', startArgs: { workspace: 'W', task: '任务A', permissionPreset: 'read-only' } },
+        { label: 'B', provider: 'b', model: 'm2', startArgs: { workspace: 'W', task: '任务B', permissionPreset: 'read-only' } },
+      ],
+      gate: { userAsk: '原始需求', criteria: '验收标准', commands: ['node test.js'], onPartial: 'gate' },
+    })
+    const out = await env.jobs[0].done
+    assert.equal(env.jobs.length, 1)
+    assert.equal(startsOf(env).length, 3)
+    assert.equal(env.calls.filter((c) => c.name.endsWith('list_capabilities')).length, 1)
+    const gs = startsOf(env)[2].arguments
+    assert.equal(gs.provider, 'c'); assert.equal(gs.model, 'm3')
+    assert(gs.task.includes('原始需求') && gs.task.includes('验收标准') && gs.task.includes('node test.js'))
+    assert.equal(out.status, 'completed')
+    assert(out.detail.startsWith(`${V2_MACHINE_HEADER} | RESULT: PASS | needs_main_attention: no | self_review: 0\nstatus: succeeded`))
+    assert(out.detail.includes('[task#0] A -> succeeded') && out.detail.includes('[gate#2] gate -> succeeded'))
+    const final1 = env.jobs[0].hooks.readOutput()
+    assert(final1.startsWith(V2_MACHINE_HEADER) && final1.includes('done-r3'))
+    assert.equal(env.jobs[0].hooks.readOutput(), final1)
+    const mf = JSON.parse(readFileSync(res.manifestPath, 'utf8'))
+    assert.equal(mf.pipelineId, res.pipelineId)
+    assert.equal(mf.items.length, 3)
+    assert.equal(mf.items[2].kind, 'gate'); assert.equal(mf.items[2].model, 'c/m3')
+    assert.equal(mf.items[2].verdict, 'pass'); assert.equal(mf.phase, 'completed')
+    env.dispose()
+  }
+
+  // 无剩余异构厂商时也必须真正执行一次守门员；自审 verdict: fail 不得被包装成验收通过。
+  {
+    writeFileSync(yp, 'verify:\n  permission: read-only\n  models:\n    - a/m1\n')
+    let selfStarts = 0
+    const env = makeV2Env(async (c) => {
+      if (c.name.endsWith('list_capabilities')) return okRes(capsV2)
+      if (c.name.endsWith('start_run')) {
+        selfStarts += 1
+        return okRes({ runId: `r-self-${selfStarts}`, sessionId: `s-self-${selfStarts}` })
+      }
+      if (c.name.endsWith('wait_run')) {
+        const isGate = c.arguments.runId === 'r-self-2'
+        return okRes({
+          runId: c.arguments.runId,
+          status: 'succeeded',
+          assistantText: isGate ? 'verdict: fail\n自审发现验收未通过' : '实现结论',
+        })
+      }
+      return okRes({})
+    })
+    const res = await env.run({ tasks: [{ provider: 'a', model: 'm1', startArgs: { workspace: 'W', task: 'T', permissionPreset: 'read-only' } }], gate: { userAsk: 'U', criteria: 'C' } })
+    const out = await env.jobs[0].done
+    assert.equal(startsOf(env).length, 2, '自审回退也必须启动真实守门员会话')
+    assert(out.detail.startsWith(`${V2_MACHINE_HEADER} | RESULT: FAIL | needs_main_attention: yes | self_review: 1\nstatus: succeeded`))
+    assert(out.detail.includes('self_review=1'))
+    const mf = JSON.parse(readFileSync(res.manifestPath, 'utf8'))
+    assert.equal(mf.items[1].status, 'succeeded')
+    assert.equal(mf.items[1].model, 'a/m1')
+    assert.equal(mf.items[1].verdict, 'fail')
+    assert.equal(mf.items[1].selfReview, 1)
+    env.dispose()
+  }
+
+  // 写任务 start_unknown：不得换候选模型重试造成双写。
+  {
+    writeFileSync(yp, Y1)
+    const env = makeV2Env(async (c) => {
+      if (c.name.endsWith('list_capabilities')) return okRes(caps)
+      if (c.name.endsWith('start_run')) return { isError: true, error: { message: 'fetch failed ECONNRESET' } }
+      return okRes({})
+    })
+    const res = await env.run({ tasks: [{ mode: 'x', startArgs: { workspace: 'W', task: '写任务' } }] })
+    const out = await env.jobs[0].done
+    assert.equal(startsOf(env).length, 1)
+    assert.equal(out.status, 'failed')
+    assert(out.detail.includes('start_unknown=1') && out.detail.includes('start_unknown'))
+    const mf = JSON.parse(readFileSync(res.manifestPath, 'utf8'))
+    assert.equal(mf.items[0].startUnknown, true)
+    env.dispose()
+  }
+
+  // 运行中 readOutput 是实时快照；取消只向已运行项发 cancel_run，pending 项不启动。
+  {
+    const env = makeV2Env(async (c) => {
+      if (c.name.endsWith('list_capabilities')) return okRes(capsV2)
+      if (c.name.endsWith('start_run')) return okRes({ runId: 'r-hang', sessionId: 's-hang' })
+      if (c.name.endsWith('wait_run')) { await new Promise((r) => setTimeout(r, 5)); return okRes({ runId: 'r-hang', status: 'running' }) }
+      return okRes({})
+    }, { maxConcurrentTasks: 1 })
+    await env.run({ tasks: [
+      { label: 'running', startArgs: { workspace: 'W', task: '1', permissionPreset: 'read-only' } },
+      { label: 'pending', startArgs: { workspace: 'W', task: '2', permissionPreset: 'read-only' } },
+    ] })
+    await new Promise((r) => setTimeout(r, 20))
+    const live = env.jobs[0].hooks.readOutput()
+    assert(live.includes('state: running') && live.includes('#0 running: running') && live.includes('#1 pending: pending'))
+    env.jobs[0].hooks.cancel('test-cancel')
+    const out = await env.jobs[0].done
+    assert.equal(out.status, 'killed')
+    assert.equal(startsOf(env).length, 1)
+    const cancels = env.calls.filter((c) => c.name.endsWith('cancel_run'))
+    assert.equal(cancels.length, 1); assert.equal(cancels[0].arguments.runId, 'r-hang')
+    assert(env.jobs[0].hooks.readOutput().startsWith(V2_MACHINE_HEADER))
+    env.dispose()
+  }
+
+  // 插件 dispose 主动收口聚合 Job，之后不再启动新子任务。
+  {
+    const env = makeV2Env(async (c) => {
+      if (c.name.endsWith('list_capabilities')) return okRes(capsV2)
+      if (c.name.endsWith('start_run')) return okRes({ runId: 'r-dispose', sessionId: 's-dispose' })
+      if (c.name.endsWith('wait_run')) { await new Promise((r) => setTimeout(r, 5)); return okRes({ runId: 'r-dispose', status: 'running' }) }
+      return okRes({})
+    }, { maxConcurrentTasks: 1 })
+    const res = await env.run({ tasks: [
+      { startArgs: { workspace: 'W', task: '1', permissionPreset: 'read-only' } },
+      { startArgs: { workspace: 'W', task: '2', permissionPreset: 'read-only' } },
+    ] })
+    await new Promise((r) => setTimeout(r, 15))
+    env.dispose()
+    const out = await env.jobs[0].done
+    assert.equal(out.status, 'killed')
+    assert.equal(startsOf(env).length, 1)
+    assert.equal(env.calls.filter((c) => c.name.endsWith('cancel_run')).length, 0, 'dispose 只分离本地等待，不得误杀远端 run')
+    const mf = JSON.parse(readFileSync(res.manifestPath, 'utf8'))
+    assert.equal(mf.phase, 'detached')
+  }
+
+  writeFileSync(yp, Y1)
+}
+console.log('v2 ok')

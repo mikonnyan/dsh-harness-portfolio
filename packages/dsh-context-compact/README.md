@@ -28,9 +28,11 @@ Traditional LLM agent context management relies on destructive "rolling summarie
   - Relative `turnsBack:N` endpoints are normalized to canonical `turn:M` selectors at staging time.
   - If a turn is aborted (`signal.aborted`), the staged queue survives `turn/end` and automatically commits at the next turn's `agent/turn-stopping`.
   - Transient flush failures re-queue up to `DEFAULT_MAX_FLUSH_RETRIES = 2` times before recording to `dropped`, re-planning against the latest surface and silently skipping targets already compacted.
-- **KV-Cache Friendly Prompt Injection**:
+- **KV-Cache Friendly Prompt Injection & Zero-Round-Trip Soft Watermark Auto-Hint**:
   - Injects static compaction guidance via `ctx.systemPrompt.section` (zero prefix KV-cache invalidation).
   - Injects a single-line directory of historical large blocks (`>500` tokens) via `ctx.systemPrompt.context`, updating only across turn boundaries when historical large blocks change.
+  - **Incremental Compactable-Pool Soft Watermark (`inspectSoftWatermark` / `buildSoftWatermarkHint`)**: Evaluates the newly accumulated **compactable pool (`compactableTokens`)**—excluding already-compacted checkpoints (`@span` / `@call`) and excluding active dialogue in the most recent `keepRecentTurns` (default `5`) turns—plus `uncompactedClosedTurns` (default threshold `20` turns) and `softWatermarkTokens` (default `60000` tokens).
+  - **Zero Extra Round-Trip & Prompt-Cache TTL Economics**: When triggered, emits the single-line hint through `systemPrompt.context` and latches the first triggered hint string per compaction cycle (keyed by the latest `compaction/*` event `seq`, without real-time changing floating-point `k` token counts) so repeated turns before a new compaction return the exact same string and never cause the host to append duplicate persisted `user/message` snapshots. Messages persisted by `@deepseek-ai/dsh-system-prompt` are excluded from the compactable pool. The hint pre-computes the ready-to-use `turn:A..turn:B` span and Top 3 `callId` candidates, so no separate `inspect: true` round-trip is needed. The large-block directory and watermark share one measurement per surface version, invalidated on surface changes. When dispatching long background tasks (>5 minute provider prompt-cache TTL), piggyback `context_compact` in the same step using `<=120` token telegraphic summaries (`path:line + conclusion`).
 
 ---
 
@@ -62,8 +64,8 @@ Traditional LLM agent context management relies on destructive "rolling summarie
 # Syntax check
 node --check lib/index.js
 
-# Run unit & integration test suite (7 tests covering single results, spans, nested recall, conclude_turn guards, abort retention, retry limits, and overlap deduplication)
-node --test test/compact.test.mjs
+# Run unit & integration test suite (10 tests covering single results, spans, nested recall, conclude_turn guards, abort retention, retry limits, overlap deduplication, soft watermark auto-hint, incremental compactableTokens anti-false-positive verification, persisted system-prompt snapshot exclusion, and per-surface measurement caching)
+node --test test/unit.mjs
 ```
 
 Set `DSH_ROOT` if your `@deepseek-ai/dsh` installation is in a non-default location:

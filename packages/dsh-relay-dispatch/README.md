@@ -26,6 +26,13 @@
 - **无侵入注入 `parentSession`**：在官方 `start_run` 未暴露 `parentSession` 参数的前提下，通过 `Symbol.for('relay-dispatch.prepare')` + `generation` 代数锁幂等包装 `sessions.prepare` 与 `/api` 路由处理器。结合串行化 `startChain` 槽窗口、HTTP 请求头指纹识别（`classifyApiRequest` 区分浏览器手动新建与 Relay 调用）及事后 `sessionId` 一致性校验，确保父子关系 100% 准确挂载且支持无限次插件热重载。
 - **React Fiber + CSS `order` 零闪烁侧栏树（`lib/client.js`）**：前端插件从 DOM 节点的 `__reactFiber$` 向上回溯提取会话 `node.id`，在不移动任何 React 托管 DOM 节点的前提下，使用 Flex 容器与 `style.order` 完成父子会话重排、多级缩进、展开/折叠状态持久化（`localStorage`）以及选中子会话自动展开祖先，彻底规避 React reconciliation 冲突与 HoverCard 动态插入 `role="status"` 子节点引发的 MutationObserver 重排死循环。
 
+### 5. v2 聚合流水线：`tasks -> join -> gate`
+- **一次调用、单个聚合 Job**：`relay_dispatch({ tasks: [...], gate })` 在后台调度全部子任务并维护 `items[]` 状态机；支持并发上限与同工作区写范围冲突预检。默认冲突直接失败且零 Relay 调用、零 Job，显式 `onWriteConflict: 'serial'` 时自动生成依赖并串行执行。
+- **异构验证门**：全部子任务 join 后按 `{ userAsk, criteria, commands?, onPartial? }` 启动 `verify`，证据包附真实 Git `numstat`/`statText`，守门员首行必须输出 `verdict: pass | fail | partial`（按 `/^\s*verdict:\s*(pass|fail|partial)/im` 解析，解析不到记 `unknown`，会话自身 `succeeded` 不等于验收通过）；按厂商剔除已参与实现的模型，无剩余异构厂商时回退原 gate 候选链**真实跑完一次守门员**并标记 `self_review=1`，绝不空跑假装通过。
+- **真实变更证据**：写任务使用临时 `GIT_INDEX_FILE` 执行 `add -A` 与 `write-tree`，比较任务前后 tree 得出实际文件差分，不污染真实 index 或工作树；非 Git 目录自动降级为无快照证据。
+- **可机读、可恢复交付**：完成通知首行为 `relay_dispatch_v2: 1 | RESULT: PASS|PARTIAL|FAIL|UNVERIFIED | needs_main_attention: yes|no | self_review: 0|1`（仅全部 task 成功、`verdict=pass` 且 `self_review=0` 时为 `PASS/no`，其余都需主会话复核）；运行中 `readOutput` 返回实时状态快照，终态可重复读取完整结论。清单原子写入 `~/.dsh/relay-pipelines/<pipelineId>.json`，记录 `phase`、各项状态、模型、runId、`verdict`、依赖与 Git 证据。
+- **防双写与隔离取消**：写任务启动结果不可知时标记 `start_unknown=1`，旧单任务与 v2 路径都禁止换模型重试；Stage 1 与 Stage 2 gate 共享同一个总等待 deadline。仅用户显式取消才向仍在运行的子项发送 `cancel_run`；DSH 关闭（`jobs service disposed`）或插件热重载（`relay_dispatch disposed`）只中止本地等待、清单记 `phase=detached`，绝不误杀远端 run。`list_capabilities` 在同一实例内缓存 60 秒，标题默认仅使用确定性 fallback，仅显式 `llmTitle: true` 才额外消耗 LLM 刷新。
+
 ---
 
 ## 目录结构
