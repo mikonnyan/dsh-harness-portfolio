@@ -984,8 +984,25 @@ export function expandTargets(input, modesInfo = {}) {
   return args
 }
 
+/** v3 sessions keep a live `events` array; DSH 0.2.2-rc.2 Session v4 only has `snapshotEvents()`. */
+export function sessionEventsOf(session) {
+  if (!session || typeof session !== 'object') return null
+  if (Array.isArray(session.events)) return session.events
+  if (typeof session.snapshotEvents === 'function') {
+    const snap = session.snapshotEvents()
+    return Array.isArray(snap) ? snap : null
+  }
+  return null
+}
+
+function toolResultCallId(event) {
+  const data = event?.data || {}
+  const message = data.message || {}
+  return data.callId || data.id || message.callId || message.source?.callId || message.toolCallId || message.id || null
+}
+
 export function concludeRequested(exec) {
-  const events = exec?.agent?.session?.events
+  const events = sessionEventsOf(exec?.agent?.session)
   if (!Array.isArray(events) || exec?.signal?.aborted) return { ok: false, reason: exec?.signal?.aborted ? 'C6 已取消' : 'C3 无会话事件' }
   let message
   for (let i = events.length - 1; i >= 0; i--) {
@@ -1009,15 +1026,17 @@ export async function finishConclude(exec, notes = [], options = {}) {
   const state = concludeRequested(exec)
   if (!state.ok) return state.reason
   const names = state.content.filter((b) => b?.type === 'tool-call').map((b) => b.name)
-  const compact = state.events.filter((e) => e?.type === 'tool/call' && e.data?.name === 'context_compact').map((e) => e.data?.callId || e.data?.id).filter(Boolean)
-  if (names.includes('context_compact') || compact.length) {
+  const compactIds = (events) => events.filter((e) => e?.type === 'tool/call' && e.data?.name === 'context_compact').map((e) => e.data?.callId || e.data?.id).filter(Boolean)
+  if (names.includes('context_compact') || compactIds(state.events).length) {
     const deadline = Date.now() + (options.timeoutMs ?? 50)
     let result
     while (Date.now() <= deadline) {
-      result = [...state.events].reverse().find((e) => {
+      const events = sessionEventsOf(exec?.agent?.session) || state.events
+      const compact = compactIds(events)
+      result = [...events].reverse().find((e) => {
         if (e?.type !== 'tool/result') return false
         if (e.data?.name === 'context_compact') return true
-        const callId = e.data?.callId || e.data?.id || e.data?.message?.callId || e.data?.message?.id
+        const callId = toolResultCallId(e)
         return Boolean(callId && compact.includes(callId))
       })
       if (result) break
@@ -1060,7 +1079,7 @@ export function inferScopes(text, checks = [], ctx = {}) {
     if (/\.[A-Za-z0-9]+$/.test(value)) root = dirname(value)
     readRoots.push(root)
   }
-  for (const source of sources) for (const match of String(source || '').matchAll(/(?:\$env:USERPROFILE|%USERPROFILE%|~)[\\/][^\s'"`，。、；：]+|@[\w-]+\/[^\s'"`，。、；：]+|[A-Za-z]:[\\/][^\s'"`]*|(?:^|[\s=(])\/(?:Users|home)\/[^\s'"`，。、；：]+/g)) add(match[0].replace(/^[\s=(]/, ''))
+  for (const source of sources) for (const match of String(source || '').matchAll(/(?:\$env:USERPROFILE|%USERPROFILE%|~)[\\/][^\s'"`，。、；：]+|@[\w-]+\/[^\s'"`，。、；：]+|(?<![A-Za-z])[A-Za-z]:(?:\\|\/(?!\/))[^\s'"`]*|(?:^|[\s=(])\/(?:Users|home)\/[^\s'"`，。、；：]+/g)) add(match[0].replace(/^[\s=(]/, ''))
   const hosts = new Set(), loopbackPorts = new Set()
   for (const source of sources) {
     const text = String(source || '')

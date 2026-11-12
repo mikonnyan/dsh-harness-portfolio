@@ -71,8 +71,8 @@ test('protected ports and host process operations deny without approval', () => 
 })
 
 test('approved loopback gateways and pinned node smoke pass; other ports and arbitrary scripts deny', async () => {
-  assert.deepEqual(DEFAULT_LOOPBACK_PORTS, [3080, 4098, 4141, 8318])
-  for (const port of [4098, 4141, 8318]) assert.equal(isAllowedLoopbackUrl(`http://127.0.0.1:${port}/v1/chat/completions`), true)
+  assert.deepEqual(DEFAULT_LOOPBACK_PORTS, [3080, 4098, 4141, 4142, 8318])
+  for (const port of [4098, 4141, 4142, 8318]) assert.equal(isAllowedLoopbackUrl(`http://127.0.0.1:${port}/v1/chat/completions`), true)
   for (const url of ['http://127.0.0.1:4099/v1', 'http://example.com:4098/v1', 'https://127.0.0.1:4141/v1']) assert.equal(isAllowedLoopbackUrl(url), false)
   const { copyFileSync } = await import('node:fs')
   const smoke = join(work, 'live-gateway-smoke.mjs')
@@ -120,7 +120,7 @@ test('worker scoped check, bench and metadata commands are allowed', () => {
   assert.equal(permissionDecision('pwsh', { command: 'Get-Item C:\\outside', workdir: work }, session(), { now: NOW + 1 }).kind, 'deny')
 })
 test('only literal read-only loopback probes and approved remote tests pass', () => {
-  for (const command of ['Get-NetTCPConnection -LocalPort 8318', 'Get-NetTCPConnection -LocalPort 4098', 'Test-NetConnection 127.0.0.1 -Port 4141']) assert.equal(permissionDecision('pwsh', { command, workdir: work }, session(), { now: NOW + 1 }).kind, 'allow', command)
+  for (const command of ['Get-NetTCPConnection -LocalPort 8318', 'Get-NetTCPConnection -LocalPort 4098', 'Get-NetTCPConnection -LocalPort 4142', 'Test-NetConnection 127.0.0.1 -Port 4141']) assert.equal(permissionDecision('pwsh', { command, workdir: work }, session(), { now: NOW + 1 }).kind, 'allow', command)
   for (const command of ['Get-NetTCPConnection -LocalPort 3080', 'Test-NetConnection example.com -Port 8318', 'ssh 100.64.0.2 "pytest"', 'ssh 100.64.0.2 "python3 -m unittest"', 'ssh 100.64.0.2 "curl -s http://127.0.0.1:8188/api"', 'ssh 100.64.0.2 "curl -s http://127.0.0.1:11434/api/tags"']) {
     const actual = permissionDecision('pwsh', { command, workdir: work }, session(), { now: NOW + 1 }).kind
     assert.equal(actual, command.includes('3080') || command.includes('example.com') ? 'deny' : 'allow', command)

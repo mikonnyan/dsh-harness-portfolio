@@ -6,7 +6,7 @@ export const OUT_OF_SCOPE = 'DSH_E_OUT_OF_SCOPE'
 export { SELF_FIX, SHELL_BUDGET } from './orchestrator-guard.js'
 export const HIGH_RISK = 'DSH_HIGH_RISK_APPROVAL_REQUIRED'
 // These are HTTP endpoints, not permission to manage their host processes or reconfigure ports.
-export const DEFAULT_LOOPBACK_PORTS = Object.freeze([3080, 4098, 4141, 8318])
+export const DEFAULT_LOOPBACK_PORTS = Object.freeze([3080, 4098, 4141, 4142, 8318])
 const NODE_SMOKE_SCRIPTS = new Set(['live-gateway-smoke.mjs'])
 const APPROVED_NODE_SMOKE_SHA256 = new Set(['c41df4ec48b14d006321cd7681ffd0dde0780d14fff358382b2639ffdf0bec3c'])
 const ESCALATION_KEYS = ['sandbox_permissions', 'amend', 'extend', 'escalate']
@@ -145,7 +145,8 @@ export function tokenizeLiteral(command) {
 export function isAllowedLoopbackUrl(value) {
   try {
     const url = new URL(String(value))
-    return url.protocol === 'http:' && ['127.0.0.1', 'localhost', '::1'].includes(url.hostname) && DEFAULT_LOOPBACK_PORTS.includes(Number(url.port || 80))
+    const host = url.hostname.replace(/^\[|\]$/g, '')
+    return url.protocol === 'http:' && ['127.0.0.1', 'localhost', '::1'].includes(host) && DEFAULT_LOOPBACK_PORTS.includes(Number(url.port || 80))
   } catch { return false }
 }
 
@@ -172,6 +173,96 @@ function pathArgs(executable, argv) {
   }
   return targets
 }
+function loopbackHttpPort(value) {
+  try { return Number(new URL(String(value)).port || 80) } catch { return NaN }
+}
+function urlsAreReadOnlyLoopback(urls) {
+  return urls.length > 0 && urls.every((value) => isAllowedLoopbackUrl(value) && loopbackHttpPort(value) !== 3080)
+}
+function readOnlyCurlArgs(argv) {
+  const urls = []
+  const boolFlags = new Set(['s', 'S', 'k', 'i', 'f', 'g'])
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === '--') return null
+    if (arg.startsWith('--')) {
+      const body = arg.slice(2)
+      const eq = body.indexOf('=')
+      const name = (eq === -1 ? body : body.slice(0, eq)).toLowerCase()
+      const inline = eq === -1 ? null : body.slice(eq + 1)
+      if (['silent', 'show-error', 'insecure', 'include', 'fail', 'globoff'].includes(name)) {
+        if (inline != null) return null
+        continue
+      }
+      if (['max-time', 'connect-timeout', 'retry', 'retry-delay'].includes(name)) {
+        const value = inline ?? argv[++i]
+        if (!/^\d+(?:\.\d+)?$/.test(String(value ?? ''))) return null
+        continue
+      }
+      if (name === 'request') {
+        if (String(inline ?? argv[++i] ?? '').toUpperCase() !== 'GET') return null
+        continue
+      }
+      if (name === 'url') {
+        const value = inline ?? argv[++i]
+        if (!value) return null
+        urls.push(value)
+        continue
+      }
+      return null
+    }
+    if (arg.startsWith('-')) {
+      const cluster = arg.slice(1)
+      if (cluster === 'X') {
+        if (String(argv[++i] ?? '').toUpperCase() !== 'GET') return null
+        continue
+      }
+      if (cluster === 'm' || /^m\d+(?:\.\d+)?$/.test(cluster)) {
+        if (cluster === 'm' && !/^\d+(?:\.\d+)?$/.test(String(argv[++i] ?? ''))) return null
+        continue
+      }
+      if (cluster && [...cluster].every((ch) => boolFlags.has(ch))) continue
+      return null
+    }
+    urls.push(arg)
+  }
+  return urlsAreReadOnlyLoopback(urls) ? true : null
+}
+function readOnlyPowerShellHttp(argv) {
+  const urls = []
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (/^https?:\/\//i.test(arg)) { urls.push(arg); continue }
+    if (arg.toLowerCase() === 'get') continue
+    const flag = /^-([A-Za-z]+)(?::([\s\S]*))?$/.exec(arg)
+    if (!flag) return null
+    const name = flag[1].toLowerCase()
+    const inline = flag[2]
+    const take = () => inline != null ? inline : argv[++i]
+    if (name === 'uri') {
+      const value = take()
+      if (value == null || value === '') return null
+      urls.push(value)
+      continue
+    }
+    if (name === 'method') {
+      if (String(take() ?? '').toUpperCase() !== 'GET') return null
+      continue
+    }
+    if (name === 'timeoutsec') {
+      if (!/^\d+$/.test(String(take() ?? ''))) return null
+      continue
+    }
+    if (name === 'usebasicparsing' && inline == null) continue
+    return null
+  }
+  return urlsAreReadOnlyLoopback(urls) ? true : null
+}
+function isReadOnlyLoopbackGet(executable, argv) {
+  if (executable === 'curl') return readOnlyCurlArgs(argv) != null
+  if (['invoke-restmethod', 'irm', 'invoke-webrequest', 'iwr'].includes(executable)) return readOnlyPowerShellHttp(argv) != null
+  return false
+}
 export function normalizeCommand(command, cwd) {
   const tokens = tokenizeLiteral(String(command || '').trim())
   if (!tokens) return { risk: 'UNKNOWN', executable: null, argv: [], cwd }
@@ -181,6 +272,7 @@ export function normalizeCommand(command, cwd) {
   const normalized = { executable: aliases[executable] || executable, argv, cwd }
   const forbidden = protectedCommand([normalized.executable, ...argv])
   if (forbidden) return { ...normalized, risk: 'OUT_OF_SCOPE', ...forbidden }
+  if (isReadOnlyLoopbackGet(normalized.executable, argv)) return { ...normalized, risk: 'PORT_PROBE' }
   const withoutWindowsPaths = command.replace(/[A-Za-z]:[\\/][^\s'"]*/g, '<path>')
   if (DYNAMIC.test(withoutWindowsPaths) || /[*?]/.test(command) && ['remove-item', 'stop-process'].includes(normalized.executable)) return { ...normalized, risk: 'UNKNOWN' }
   if (HIGH_RISK_COMMANDS.test(normalized.executable)) return { ...normalized, risk: 'HIGH_RISK' }
@@ -269,7 +361,7 @@ export function permissionDecision(toolName, args = {}, session, options = {}) {
     }
     if (command.risk === 'PORT_PROBE') {
       const text = [command.executable, ...command.argv].join(' ')
-      if (/(?:^|\D)3080(?:\D|$)/.test(text) || !/(?:^|\D)(?:8318|4098|4141)(?:\D|$)/.test(text)) return localDeny('port_probe_not_allowed', manifest, { operation: 'shell' })
+      if (/(?:^|\D)3080(?:\D|$)/.test(text) || !/(?:^|\D)(?:8318|4098|4141|4142)(?:\D|$)/.test(text)) return localDeny('port_probe_not_allowed', manifest, { operation: 'shell' })
       if (command.executable === 'test-netconnection' && !/^(?:127\.0\.0\.1|localhost)$/.test(command.argv[0] || '')) return localDeny('port_probe_not_allowed', manifest, { operation: 'shell' })
     }
     if (command.risk === 'SSH_TEST') {

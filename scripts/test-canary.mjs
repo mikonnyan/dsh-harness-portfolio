@@ -4,10 +4,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+function npmInvocation() {
+  const cli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (fs.existsSync(cli)) return { command: process.execPath, prefix: [cli], shell: false };
+  return { command: process.platform === 'win32' ? 'npm.cmd' : 'npm', prefix: [], shell: process.platform === 'win32' };
+}
+const npm = npmInvocation();
+
 function detect() {
   const candidates = [];
   if (process.env.DSH_CHECKOUT) candidates.push(process.env.DSH_CHECKOUT);
-  const global = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['root', '-g'], { encoding: 'utf8' });
+  const global = spawnSync(npm.command, [...npm.prefix, 'root', '-g'], { encoding: 'utf8', shell: npm.shell });
   if (global.status === 0) candidates.push(path.join(global.stdout.trim(), '@deepseek-ai', 'dsh'));
   if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, 'npm', 'node_modules', '@deepseek-ai', 'dsh'));
   candidates.push('/usr/local/lib/node_modules/@deepseek-ai/dsh', '/usr/lib/node_modules/@deepseek-ai/dsh', path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', '@deepseek-ai', 'dsh'));
@@ -24,5 +31,6 @@ if (process.argv.includes('--setup-profile')) {
   else fs.writeFileSync(file, JSON.stringify({ name: 'dsh-profile-test-canary', private: true, dependencies: {}, bundles: {} }, null, 2) + '\n');
   console.log(`Canary profile ready: ${dir}`);
 }
-const result = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['test'], { stdio: 'inherit', cwd: path.dirname(new URL(import.meta.url).pathname.replace(/^\/(?:[A-Za-z]:)/, m => m.slice(1))).replace(/\/scripts$/, ''), env: { ...process.env, DSH_CHECKOUT: checkout, DSH_PROFILE: 'test-canary' } });
+const result = spawnSync(npm.command, [...npm.prefix, 'test'], { stdio: 'inherit', shell: npm.shell, cwd: path.dirname(new URL(import.meta.url).pathname.replace(/^\/(?:[A-Za-z]:)/, m => m.slice(1))).replace(/\/scripts$/, ''), env: { ...process.env, DSH_CHECKOUT: checkout, DSH_PROFILE: 'test-canary' } });
+if (result.error) console.error(result.error.message);
 process.exit(result.status ?? 1);

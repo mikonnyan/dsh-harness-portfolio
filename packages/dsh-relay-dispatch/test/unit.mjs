@@ -2110,6 +2110,15 @@ console.log('v2 ok')
   const hostScope = inferScopes('ssh 100.64.0.2 "pytest" && curl http://127.0.0.1:8318/health')
   assert.deepEqual(hostScope.hosts, ['100.64.0.2'])
   assert.deepEqual(hostScope.loopbackPorts, [8318])
+  assert.deepEqual(hostScope.readRoots, [])
+  const urlScope = inferScopes('check http://127.0.0.1:8318/status')
+  assert.deepEqual(urlScope.readRoots, [])
+  assert.deepEqual(urlScope.loopbackPorts, [8318])
+  for (const sample of ['https://127.0.0.1:4141/health', 'ws://127.0.0.1:4098/socket', 'wss://localhost:4142/socket', 'file://127.0.0.1/share']) {
+    assert.deepEqual(inferScopes(sample).readRoots, [], sample)
+  }
+  const windowsScope = inferScopes('读取 C:\\work\\agent\\lib\\index.js')
+  assert(windowsScope.readRoots.some((p) => p.replace(/\\/g, '/').toLowerCase().endsWith('/work/agent/lib')))
   assert.throws(() => preflightDispatchV2({ startArgs: { workspace: 'C:\\work', task: 'ssh 10.0.0.2 "pytest"', permissionPreset: 'workspace-write' } }, undefined, { hosts: {} }), (e) => e.code === 'DSH_E_SCOPE_HOST_UNDECLARED')
   assert.throws(() => preflightDispatchV2({ startArgs: { workspace: 'C:\\work', task: 'ssh 100.64.0.2 "pytest"', permissionPreset: 'read-only' } }, undefined, { hosts: { mac: '100.64.0.2' } }), (e) => e.code === 'DSH_E_SCOPE_PRESET_INSUFFICIENT')
   assert.throws(() => preflightDispatchV2({ startArgs: { workspace: 'C:\\work', task: '复制到 C:\\outside\\file.js', permissionPreset: 'workspace-write', writeScope: ['C:\\work'] } }), (e) => e.code === 'DSH_E_SCOPE_WRITE_UNDECLARED')
@@ -2151,7 +2160,7 @@ console.log('v2 ok')
 
 // ───────── turn optimization：targets 展开 / 预检一次报全 / 双成功同步栅栏 ─────────
 {
-  const { expandTargets, concludeRequested, finishConclude, BUILTIN_MODES } = await import('../lib/index.js')
+  const { expandTargets, concludeRequested, finishConclude, sessionEventsOf, BUILTIN_MODES } = await import('../lib/index.js')
   const T = { names: ['x'], source: '@dev/dsh-{name}', mirrors: ['@plugins/dsh-{name}', '@pf/dsh-{name}'], files: ['lib/index.js'], test: 'npm --prefix @dev/dsh-{name} test', reload: 'dsh-{name}' }
   const expanded = expandTargets({ startArgs: { workspace: '@dev', task: 'edit' }, targets: ['x'] }, { targets: T })
   assert.equal(expanded.startArgs.syncTargets.length, 2)
@@ -2225,6 +2234,30 @@ console.log('v2 ok')
   const nestedFailed = nestedEvents.with(2, { type: 'tool/result', seq: 3, data: { callId: 'nested-cc', message: { status: 'error', content: [{ type: 'text', text: 'Error: no' }] } } })
   assert.match(await finishConclude({ ...nestedExec, agent: { ...nestedExec.agent, session: { events: nestedFailed } } }), /context_compact 执行失败/)
   assert.equal(concluded, 3)
+
+  const plainSession = { snapshotEvents() { return [{ type: 'assistant/message', turn: 1, step: 1, seq: 1, content: [{ type: 'text', text: 'plain v4' }] }] } }
+  assert.equal(Object.hasOwn(plainSession, 'events'), false)
+  const plainExec = { agent: { phase: { turn: 1, step: 1 }, session: plainSession }, signal: new AbortController().signal, concludeTurn: () => concluded++ }
+  assert.equal(concludeRequested(plainExec).ok, true)
+  assert.equal(await finishConclude(plainExec), '')
+  assert.equal(concluded, 4)
+  const v4Log = [
+    { type: 'assistant/message', turn: 1, step: 1, seq: 1, content: [{ type: 'text', text: 'done v4' }, { type: 'tool-call', name: 'context_compact' }] },
+    { type: 'tool/call', seq: 2, data: { name: 'context_compact', callId: 'v4-cc' } },
+  ]
+  let v4Reads = 0
+  const v4Session = { snapshotEvents() { v4Reads++; return v4Log.slice() } }
+  assert.equal(Object.hasOwn(v4Session, 'events'), false)
+  assert.equal(sessionEventsOf(v4Session)[1].data.callId, 'v4-cc')
+  const v4Exec = { agent: { phase: { turn: 1, step: 1 }, session: v4Session }, signal: new AbortController().signal, concludeTurn: () => concluded++ }
+  assert.equal(concludeRequested(v4Exec).ok, true)
+  v4Reads = 0
+  const pendingV4 = finishConclude(v4Exec, [], { timeoutMs: 200, intervalMs: 1 })
+  await new Promise((r) => setTimeout(r, 15))
+  v4Log.push({ type: 'tool/result', seq: 3, data: { message: { source: { kind: 'tool', callId: 'v4-cc' }, toolCallId: 'v4-cc', content: [{ type: 'text', text: 'committed' }] } } })
+  assert.equal(await pendingV4, '')
+  assert.equal(concluded, 5)
+  assert.ok(v4Reads >= 2, `snapshotEvents reads ${v4Reads}`)
   console.log('turnopt ok')
 }
 }

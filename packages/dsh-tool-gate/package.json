@@ -23,7 +23,7 @@
     "cordis": ">=4.0.0-rc <5"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test test/*.test.mjs test/unit.mjs",
     "check": "node --check lib/index.js && node --check lib/compact-schema.js"
   },
   "dsh": {
