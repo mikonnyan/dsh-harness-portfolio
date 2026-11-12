@@ -31,6 +31,8 @@ Thumbs.db
 .idea/
 .vscode/
 
+dist/
+
 # Build & coverage artifacts
 coverage/
 .nyc_output/

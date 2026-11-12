@@ -10,6 +10,9 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export const name = '@dsh-external/dsh-context-compact'
+// Cordis 4 resolves every inject key as required (array, or a name → config map).
+// `{ required, optional }` would wait on services named "required" and "optional".
+// `compaction` stays off this list and is read below without that requirement.
 export const inject = ['tools', 'tokenMeter', 'sessions', 'systemPrompt']
 
 export const DEFAULT_MIN_SAVINGS_TOKENS = 300
@@ -2767,20 +2770,52 @@ export function auditNativeCompactionPresets(root = join(homedir(), '.dsh', '.ag
 }
 
 /**
+ * Read `ctx.compaction` without Cordis's inject gate.
+ * A plugin fiber's context proxy throws `cannot get property "compaction" without inject`
+ * for `ctx.compaction` (and optional chaining does not catch that). `ctx.get` is the
+ * reflect lookup that does not require the name to be declared. Both paths are guarded
+ * so a strict context returns undefined instead of aborting apply().
+ */
+export function readNativeCompaction(ctx) {
+  if (ctx == null) return undefined
+  try {
+    const getter = ctx.get
+    if (typeof getter === 'function') {
+      const viaGet = getter.call(ctx, 'compaction')
+      if (viaGet != null) return viaGet
+    }
+  } catch {}
+  try {
+    return ctx.compaction
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Coordinate with DSH's optional native auto-compaction without editing its
  * files or configuration. Only an `auto: true` value owned by this apply call
  * is changed; dispose restores the value captured at takeover time.
  */
 export function takeoverNativeCompaction(ctx, enabled = true) {
-  const native = ctx?.compaction
+  let native
+  try {
+    native = readNativeCompaction(ctx)
+  } catch {
+    native = undefined
+  }
   if (enabled === false || !native || native.auto !== true) return () => {}
   const previousAuto = native.auto
-  native.auto = false
+  try {
+    native.auto = false
+  } catch {
+    return () => {}
+  }
   let disposed = false
   return () => {
     if (disposed) return
     disposed = true
-    native.auto = previousAuto
+    try { native.auto = previousAuto } catch {}
   }
 }
 
@@ -2789,7 +2824,24 @@ export function apply(ctx, config = {}) {
   const overflowRetries = new WeakMap()
   const overflowStepKeys = new WeakMap()
   const overflowSessionAgents = new WeakMap()
-  const restoreNativeCompaction = takeoverNativeCompaction(ctx, config.takeoverNativeCompaction !== false)
+  let restoreNativeCompaction = () => {}
+  try {
+    restoreNativeCompaction = takeoverNativeCompaction(ctx, config.takeoverNativeCompaction !== false)
+  } catch {
+    restoreNativeCompaction = () => {}
+  }
+  // Cordis optional dependency: this child stays pending until `compaction` exists,
+  // and only then is `ctx.compaction` legal. Skip it when this context already
+  // resolved the service, so dispose restores `auto` exactly once.
+  try {
+    if (config.takeoverNativeCompaction !== false && readNativeCompaction(ctx) == null && typeof ctx.inject === 'function') {
+      ctx.inject(['compaction'], (scoped) => {
+        let restore = () => {}
+        try { restore = takeoverNativeCompaction(scoped, true) } catch { restore = () => {} }
+        try { scoped.on('dispose', restore) } catch {}
+      })
+    }
+  } catch {}
   ctx.on('dispose', restoreNativeCompaction)
   try {
     const unsafe = auditNativeCompactionPresets()

@@ -151,6 +151,30 @@ flowchart TB
 
 ---
 
+## Quick Install (1-Command)
+
+**Option A — clone and install** (Node.js 18+; defaults to the `web` profile and all three plugins):
+
+```bash
+git clone https://github.com/mikonnyan/dsh-harness-portfolio.git && cd dsh-harness-portfolio && node scripts/install.mjs
+```
+
+Use `--mode link` for development, `--profile NAME`, `--plugins a,b`, `--dry-run`, or `--uninstall` as needed. Existing manifests are backed up before updates.
+
+**Option B — install the pre-packed plugins from [GitHub Release v1.1.0](https://github.com/mikonnyan/dsh-harness-portfolio/releases/tag/v1.1.0)** into your current npm project:
+
+```bash
+npm install https://github.com/mikonnyan/dsh-harness-portfolio/releases/download/v1.1.0/dsh-tool-gate-0.1.0.tgz https://github.com/mikonnyan/dsh-harness-portfolio/releases/download/v1.1.0/dsh-context-compact-0.0.1.tgz https://github.com/mikonnyan/dsh-harness-portfolio/releases/download/v1.1.0/dsh-relay-dispatch-0.1.0.tgz
+```
+
+## Testing Against Latest DSH
+
+```bash
+npm run test:canary
+```
+
+The runner auto-detects `@deepseek-ai/dsh` (or set `DSH_CHECKOUT`) and runs the full contract suite. Add `-- --setup-profile` once to create the isolated `test-canary` profile without changing `web`.
+
 ## Quick Start & Verification / 快速验证
 
 本仓库 4 个子包测试采用 Node.js 原生测试运行器与 Mock/真实 v4 契约，**核心测试与基准无需外部网络或 API Key**，可一键串行运行全仓单元与集成测试套件：

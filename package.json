@@ -20,7 +20,10 @@
     "test:eval-bench": "npm --prefix packages/dsh-eval-bench test",
     "test": "npm run test:tool-gate && npm run test:relay-dispatch && npm run test:context-compact && npm run test:eval-bench",
     "check": "npm --prefix packages/dsh-tool-gate run check && npm --prefix packages/dsh-relay-dispatch run check && npm --prefix packages/dsh-eval-bench run check",
-    "bench": "node packages/dsh-eval-bench/bin/bench.mjs"
+    "bench": "node packages/dsh-eval-bench/bin/bench.mjs",
+    "install:plugins": "node scripts/install.mjs",
+    "test:canary": "node scripts/test-canary.mjs",
+    "release:pack": "node scripts/pack-release.mjs"
   },
   "engines": {
     "node": ">=20.0.0"
