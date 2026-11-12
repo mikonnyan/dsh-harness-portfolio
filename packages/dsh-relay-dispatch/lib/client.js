@@ -7,6 +7,7 @@ window.__ModuleLoader__.load({
 		const inject = ["slots", "sessions"];
 		const LS = "dsh-relay-dispatch:sidebar-tree";
 		const CSS = ".rdt-hidden{display:none!important}.rdt-tree-group{display:flex!important;flex-direction:column!important}.rdt-arrow{display:inline-block;width:14px;margin-right:2px;cursor:pointer;flex:none;text-align:center;font-size:10px;transition:transform .15s;opacity:.7;user-select:none}.rdt-arrow.open{transform:rotate(90deg)}.rdt-count{flex:none;font-size:11px;opacity:.6;margin-left:4px;pointer-events:none}[role=\"treeitem\"][data-rdt-depth=\"1\"]{padding-left:22px!important}[role=\"treeitem\"][data-rdt-depth=\"2\"]{padding-left:36px!important}[role=\"treeitem\"][data-rdt-depth=\"3\"]{padding-left:50px!important}[role=\"treeitem\"][data-rdt-depth=\"4\"]{padding-left:64px!important}";
+		const eventsOf = (s) => (s && (typeof s.snapshotEvents === "function" ? s.snapshotEvents() : s.events)) || [];
 		function billingBuckets(u) {
 			if (!u) return null;
 			const num = (v) => typeof v === "number" && Number.isFinite(v) ? Math.max(0, v) : 0;
@@ -79,7 +80,8 @@ window.__ModuleLoader__.load({
 							const id = idOf(el);
 							if (id) rowOf.set(id, el);
 						}
-						const parentOf = (id) => { const p = byId[id] && byId[id].parentId; return p && p !== id && byId[p] && byId[p].origin !== "subagent" ? p : undefined; };
+						const sameGroup = (a, b) => { const ea = rowOf.get(a), eb = rowOf.get(b); return Boolean(ea && eb && U(ea).parentElement && U(ea).parentElement === U(eb).parentElement); };
+						const parentOf = (id) => { const p = byId[id] && byId[id].parentId; return p && p !== id && byId[p] && byId[p].origin !== "subagent" && sameGroup(p, id) ? p : undefined; };
 						const kids = new Map();
 						const groups = new Set();
 						for (const [id, el] of rowOf) {
@@ -326,7 +328,7 @@ window.__ModuleLoader__.load({
 						const binding = typeof sessionsSvc.binding === "function" ? sessionsSvc.binding(sessionId) : null;
 						session = (binding && binding.session) || (typeof sessionsSvc.sessionOf === "function" ? sessionsSvc.sessionOf(sessionId) : null);
 					} catch {}
-					const events = session && Array.isArray(session.events) ? session.events : [];
+					const events = eventsOf(session);
 					for (let i = events.length - 1; i >= 0; i--) {
 						const e = events[i], data = e && e.data;
 						const u = e && e.type === "assistant/chunk" && data && data.chunk && data.chunk.type === "usage"
@@ -543,6 +545,7 @@ window.__ModuleLoader__.load({
 		exports.inject = inject;
 		// 纯计费函数供无 DOM 单测复用；不参与插件注入协议。
 		exports.billingInternals = { billingBuckets, billingTotal, billingUsd, formatTokensCompact };
+		exports.sidebarInternals = { eventsOf };
 		return module.exports;
 	}
 });

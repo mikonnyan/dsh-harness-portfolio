@@ -648,6 +648,24 @@ import { classifyApiRequest, isRelayPrepare } from '../lib/index.js'
     await new Promise((r) => setTimeout(r, 40))
     assert.equal(h.renamed.length, 0, 'dispose 后标题调度应已取消，不再调用 rename')
     assert.equal(h.refreshed.length, 0, 'dispose 后标题调度应已取消，不再调用 refresh')
+
+    // 3c) Session v4 没有 .events：标题就绪检查必须读 snapshotEvents()
+    const v4 = setupHarness({ titlePollFirstMs: 10, titlePollIntervalMs: 10, titleRefreshTimeoutMs: 40, llmTitle: true })
+    v4.setToolHandler(async (c) => {
+      if (c.name.endsWith('start_run')) {
+        v4.sessionsSvc.prepare('sess-title-v4', { meta: { cwd: 'W' } })
+        const sessionObj = { id: 'sess-title-v4', snapshotEvents() { return [{ type: 'user/message' }, { type: 'request/header' }] } }
+        assert.equal(Object.hasOwn(sessionObj, 'events'), false)
+        v4.prepared.get('sess-title-v4').sessionObj = sessionObj
+        return { isError: false, value: { runId: 'r-tv4', sessionId: 'sess-title-v4' } }
+      }
+      return { isError: false, value: {} }
+    })
+    await v4.run({ startArgs: { workspace: 'W', task: '通用禁令：不重启 DSH\n\n# v4 标题' } }, 'parent-v4')
+    await new Promise((r) => setTimeout(r, 80))
+    assert.deepEqual(v4.renamed, [['sess-title-v4', 'v4 标题']])
+    assert.deepEqual(v4.refreshed, ['sess-title-v4'])
+    v4.disposeAll()
   }
 }
 console.log('robust ok')
@@ -1290,6 +1308,66 @@ import { hasPendingInbox } from '../lib/index.js'
     await new Promise((r) => setTimeout(r, 120))
     assert.equal(busyNotices.length, 1, '确认新轮次已响应后不得重复补唤醒')
   }
+
+  // 场景 C：Session v4 只有 snapshotEvents()。用户消息仍应重置连续唤醒计数。
+  {
+    const consumed = []
+    const regTools = new Map()
+    const v4Ctx = new Context()
+    const inbox = {
+      nextStep: [],
+      nextTurn: [],
+      get hasPending() { return this.nextStep.length > 0 || this.nextTurn.length > 0 },
+    }
+    const log = []
+    const v4Agent = {
+      id: 'sess-wake-v4',
+      status: 'idle',
+      ctx: v4Ctx,
+      inbox,
+      session: { header: { id: 'sess-wake-v4' }, snapshotEvents() { return log.slice() } },
+      wakeDriver() {
+        const batch = [...this.inbox.nextStep.splice(0), ...this.inbox.nextTurn.splice(0, 1)]
+        for (const m of batch) consumed.push({ via: 'wakeDriver', text: m.content[0].text })
+      },
+      followup(msg) {
+        this.inbox.nextTurn.push(msg)
+        this.wakeDriver()
+      },
+      inject(msg) { this.inbox.nextStep.push(msg) },
+    }
+    assert.equal(Object.hasOwn(v4Agent.session, 'events'), false)
+    let runSeq = 0
+    v4Ctx.provide('agents', { get: (id) => (id === v4Agent.id ? v4Agent : undefined) }, true)
+    v4Ctx.provide('systemPrompt', { section: () => {} }, true)
+    v4Ctx.provide('tools', {
+      register: (t) => { regTools.set(t.name, t); return () => regTools.delete(t.name) },
+      execute: async (c) => {
+        if (c.name.endsWith('start_run')) return { isError: false, value: { runId: `run-v4-${++runSeq}` } }
+        if (c.name.endsWith('wait_run')) return { isError: false, value: { runId: `run-v4-${runSeq}`, status: 'succeeded', assistantText: `v4#${runSeq}` } }
+        return { isError: false, value: {} }
+      },
+    }, true)
+    new LocalJobRegistry(v4Ctx, { maxConcurrentJobsPerOwner: 10 })
+    applyToolJobs(v4Ctx, {})
+    apply(v4Ctx, { modesPath: yp, linkParentSession: false, refreshTitle: false, wakeDelayMs: 20, maxConsecutiveWakes: 5 })
+    const dispatchTool = regTools.get('relay_dispatch')
+    for (let i = 1; i <= 5; i++) {
+      await dispatchTool.execute({ startArgs: { workspace: 'W', task: `V${i}` } }, { agent: v4Agent })
+      for (let w = 0; w < 20 && consumed.length < i; w++) await new Promise((r) => setTimeout(r, 10))
+      assert.equal(consumed.length, i, `v4 第 ${i} 次连续派发应被唤醒`)
+    }
+    await dispatchTool.execute({ startArgs: { workspace: 'W', task: 'V6' } }, { agent: v4Agent })
+    await new Promise((r) => setTimeout(r, 60))
+    assert.equal(consumed.length, 5, '超过 maxConsecutiveWakes 后不应继续自动唤醒')
+    assert.equal(inbox.nextStep.length, 1)
+    inbox.nextStep.length = 0
+    log.push({ type: 'user/message', data: { source: { kind: 'user' } } })
+    await dispatchTool.execute({ startArgs: { workspace: 'W', task: 'V7' } }, { agent: v4Agent })
+    for (let w = 0; w < 20 && consumed.length < 6; w++) await new Promise((r) => setTimeout(r, 10))
+    assert.equal(consumed.length, 6, 'snapshotEvents 中的用户消息应重置连续唤醒计数')
+    assert(consumed[5].text.includes('v4#7'))
+  }
 console.log('wake ok')
 
 // ───────── v2：同步预检 / Git 快照 / 聚合流水线 / gate / 取消与清单 ─────────
@@ -1353,6 +1431,16 @@ import { execFileSync } from 'node:child_process'
   const unquotedPrefixDir = join(dir, 'unquoted-prefix'); mkdirSync(unquotedPrefixDir)
   for (const prefixDir of [quotedPrefixDir, unquotedPrefixDir]) writeFileSync(join(prefixDir, 'package.json'), JSON.stringify({ scripts: { test: `node -e "console.log('tests 1')"` } }))
   assert((await runMechanicalChecks([{ cmd: `npm --prefix "${quotedPrefixDir}" test`, minTests: 1 }, { cmd: `npm --prefix '${quotedPrefixDir}' test`, minTests: 1 }, { cmd: `npm --prefix ${unquotedPrefixDir} test`, minTests: 1 }], { mechCommands: ['npm --prefix'] })).pass)
+  writeFileSync(join(dir, 'mech-nested.test.mjs'), "import test from 'node:test'; test('ok', () => {})\n")
+  const savedTestContext = process.env.NODE_TEST_CONTEXT
+  process.env.NODE_TEST_CONTEXT = 'child-v8'
+  try {
+    const nested = await runMechanicalChecks([{ cmd: `node --test ${join(dir, 'mech-nested.test.mjs')}`, minTests: 1 }], { workspace: dir, mechCommands: ['node --test'] })
+    assert(nested.pass, nested.results.map((r) => r.detail).join('\n'))
+  } finally {
+    if (savedTestContext == null) delete process.env.NODE_TEST_CONTEXT
+    else process.env.NODE_TEST_CONTEXT = savedTestContext
+  }
 
   // 临时索引快照包含未提交改动，但不污染真实 index / 工作树。
   const repo = mkdtempSync(join(tmpdir(), 'relay-v2-git-'))
@@ -2260,4 +2348,79 @@ console.log('v2 ok')
   assert.ok(v4Reads >= 2, `snapshotEvents reads ${v4Reads}`)
   console.log('turnopt ok')
 }
+}
+
+// ───────── Session v4 事件读取 / 侧栏跨组可见性 ─────────
+{
+  const { sessionEvents, getLatestSessionEventTime, extractLastToolName, inferScopes, isChildSessionTerminated } = await import('../lib/index.js')
+  const log = [
+    { type: 'turn/start', time: 10 },
+    { type: 'user/message', time: 11, data: { source: { kind: 'user' } } },
+    { type: 'request/header', time: 12 },
+    { type: 'tool/call', time: 13, data: { name: 'pwsh' } },
+    { type: 'turn/end', time: 14 },
+  ]
+  let reads = 0
+  const v4 = { snapshotEvents() { reads++; return log.slice() } }
+  assert.equal(Object.hasOwn(v4, 'events'), false)
+  assert.equal(sessionEvents(v4).at(-1).type, 'turn/end')
+  assert.equal(sessionEvents({ events: log }).length, log.length)
+  assert.deepEqual(sessionEvents(null), [])
+  assert.equal(getLatestSessionEventTime(v4), 14)
+  assert.equal(extractLastToolName({}, v4), 'pwsh')
+  assert.equal(extractLastToolName({ events: [{ type: 'tool/call', data: { name: 'snap-only' } }] }, null), 'snap-only')
+  const urlScope = inferScopes('check http://127.0.0.1:8318/status')
+  assert.deepEqual(urlScope.readRoots, [])
+  assert.equal(urlScope.readRoots.some((p) => String(p).includes('p:/')), false)
+  assert.deepEqual(urlScope.loopbackPorts, [8318])
+  const ctx = { get(k) { if (k === 'sessions') return { get() { return v4 } }; return undefined } }
+  assert.equal(isChildSessionTerminated(ctx, 'child-v4'), true)
+
+  const { readFileSync } = await import('node:fs')
+  const vm = await import('node:vm')
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const sameStart = source.indexOf('const sameGroup = (a, b) =>')
+  const parentStart = source.indexOf('const parentOf = (id) =>')
+  assert(sameStart > 0 && parentStart > sameStart)
+  const sameStmt = source.slice(sameStart, source.indexOf('\n', sameStart))
+  const parentStmt = source.slice(parentStart, source.indexOf('\n', parentStart)).trim()
+  assert(sameStmt.includes('U(ea).parentElement === U(eb).parentElement'))
+  assert(parentStmt.includes('sameGroup(p, id)'))
+  const parentOf = new Function('rowOf', 'U', 'byId', `${sameStmt}\n${parentStmt}\nreturn parentOf;`)
+  const U = (el) => el
+  const groupA = { id: 'A' }
+  const groupB = { id: 'B' }
+  const rowOf = new Map([
+    ['parent', { parentElement: groupA }],
+    ['same', { parentElement: groupA }],
+    ['cross', { parentElement: groupB }],
+  ])
+  const byId = {
+    parent: { origin: 'user' },
+    same: { parentId: 'parent' },
+    cross: { parentId: 'parent' },
+  }
+  const parent = parentOf(rowOf, U, byId)
+  assert.equal(parent('same'), 'parent')
+  assert.equal(parent('cross'), undefined)
+  const kids = new Map()
+  for (const id of ['same', 'cross']) {
+    const p = parent(id)
+    if (p) (kids.get(p) || kids.set(p, []).get(p)).push(id)
+  }
+  const open = new Set()
+  const hiddenBy = (id) => { for (let p = parent(id); p; p = parent(p)) if (kids.has(p) && !open.has(p)) return true; return false }
+  assert.equal(hiddenBy('same'), true)
+  assert.equal(hiddenBy('cross'), false)
+
+  let clientExports
+  const sandbox = { window: { __ModuleLoader__: { load: ({ factory }) => { clientExports = factory(() => { throw new Error('require') }) } } } }
+  vm.runInNewContext(source, sandbox)
+  const { eventsOf } = clientExports.sidebarInternals
+  const usage = { inputTokens: 3, cacheReadTokens: 1, outputTokens: 1 }
+  assert.equal(eventsOf({ snapshotEvents() { return [{ type: 'assistant/message', data: { usage } }] } })[0].data.usage, usage)
+  assert.equal(eventsOf({ events: [{ type: 'user/message' }] })[0].type, 'user/message')
+  assert.deepEqual(eventsOf(null), [])
+  assert.equal(reads >= 1, true)
+  console.log('sessionEvents sidebar ok')
 }

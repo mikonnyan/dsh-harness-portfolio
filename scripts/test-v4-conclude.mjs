@@ -35,6 +35,7 @@ for (const name of ['tool_unlock', 'context_compact', 'relay_dispatch']) {
 const session = sessions.create('v4-conclude', { meta: { cwd: 'C:/work/workspace' } })
 assert.equal(Array.isArray(session.events), false)
 assert.equal(typeof session.snapshotEvents, 'function')
+assert.equal(relay.sessionEvents(session).length >= 0, true)
 assert.equal(relay.sessionEventsOf(session).length >= 0, true)
 
 session.append('assistant/message', {
@@ -86,4 +87,12 @@ session.append('tool/result', {
 assert.equal(await waiting, '')
 assert.equal(concluded, 2)
 assert.equal(session.snapshotEvents().some((event) => event.type === 'tool/result' && event.data?.message?.source?.callId === 'v4-cc'), true)
+session.append('user/message', { content: [{ type: 'text', text: 'parent check' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+session.append('request/header', { header: { id: session.header.id } })
+const seen = relay.sessionEvents(session)
+assert.equal(Array.isArray(session.events), false)
+assert.equal(seen.some((event) => event.type === 'user/message'), true)
+assert.equal(seen.some((event) => event.type === 'request/header'), true)
+const latest = relay.getLatestSessionEventTime(session)
+assert.equal(latest === undefined || typeof latest === 'number', true)
 console.log('v4-conclude ok')

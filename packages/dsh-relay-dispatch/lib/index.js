@@ -585,8 +585,8 @@ export function isChildSessionTerminated(ctx, sessionId) {
     if (childAgent && childAgent.status === 'idle') return true
     const sessions = ctx.get('sessions')
     const childSession = (sessions && typeof sessions.get === 'function' && sessions.get(sessionId)) || (childAgent && childAgent.session)
-    const events = childSession && Array.isArray(childSession.events) ? childSession.events : undefined
-    if (events && events.length) {
+    const events = sessionEvents(childSession)
+    if (events.length) {
       let lastStartIdx = -1
       let lastEndIdx = -1
       for (let i = 0; i < events.length; i++) {
@@ -643,9 +643,10 @@ export function buildCancelConclusion(snap, reason) {
 
 /** 从子会话事件列表或 relay 快照中提取最后一个工具调用名（若能拿到）。 */
 export function extractLastToolName(snap, session) {
-  const events = (session && Array.isArray(session.events) && session.events) ||
-    (snap && Array.isArray(snap.events) && snap.events) ||
-    null
+  const hasSessionLog = session && (typeof session.snapshotEvents === 'function' || Array.isArray(session.events))
+  const events = hasSessionLog
+    ? sessionEvents(session)
+    : ((snap && Array.isArray(snap.events) && snap.events) || null)
   if (events) {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i]
@@ -682,9 +683,10 @@ export function extractLastToolName(snap, session) {
 
 /** 获取子会话最后一个事件的时间戳（毫秒）。 */
 export function getLatestSessionEventTime(session) {
-  if (!session || !Array.isArray(session.events) || !session.events.length) return undefined
-  for (let i = session.events.length - 1; i >= 0; i--) {
-    const e = session.events[i]
+  const events = sessionEvents(session)
+  if (!events.length) return undefined
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]
     const t = parseTimeMs(e && (e.time ?? e.time0 ?? (e.data && e.data.time)))
     if (t !== undefined) return t
   }
@@ -985,14 +987,26 @@ export function expandTargets(input, modesInfo = {}) {
 }
 
 /** v3 sessions keep a live `events` array; DSH 0.2.2-rc.2 Session v4 only has `snapshotEvents()`. */
+export function sessionEvents(s) {
+  if (!s) return []
+  if (typeof s.snapshotEvents === 'function') {
+    try {
+      const ev = s.snapshotEvents()
+      if (Array.isArray(ev)) return ev
+    } catch {}
+  }
+  return Array.isArray(s.events) ? s.events : []
+}
+
 export function sessionEventsOf(session) {
   if (!session || typeof session !== 'object') return null
-  if (Array.isArray(session.events)) return session.events
-  if (typeof session.snapshotEvents === 'function') {
-    const snap = session.snapshotEvents()
-    return Array.isArray(snap) ? snap : null
-  }
-  return null
+  if (typeof session.snapshotEvents !== 'function' && !Array.isArray(session.events)) return null
+  return sessionEvents(session)
+}
+
+function sessionEventCount(session) {
+  if (!session || (typeof session.snapshotEvents !== 'function' && !Array.isArray(session.events))) return null
+  return sessionEvents(session).length
 }
 
 function toolResultCallId(event) {
@@ -1704,7 +1718,13 @@ function execCheck(command, cwd, timeoutMs = 120000) {
       : useCmd
         ? ['/d', '/s', '/c', [rawExecutable, ...args].map((arg) => `"${String(arg).replace(/"/g, '""')}"`).join(' ')]
         : args
-    execFile(executable, finalArgs, { cwd, windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({ code: error?.code ?? 0, output: `${stdout || ''}${stderr || ''}` }))
+    // A gate often runs inside `node --test`. Inheriting NODE_TEST_CONTEXT makes the
+    // child `node --test` treat itself as recursive and skip the file, so minTests sees no count.
+    const env = { ...process.env }
+    for (const key of Object.keys(env)) {
+      if (key === 'NODE_CHANNEL_FD' || key === 'NODE_CHANNEL_SERIALIZATION_MODE' || key.startsWith('NODE_TEST_')) delete env[key]
+    }
+    execFile(executable, finalArgs, { cwd, env, windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({ code: error?.code ?? 0, output: `${stdout || ''}${stderr || ''}` }))
   })
 }
 export async function runMechanicalChecks(checks, ctx = {}) {
@@ -1783,7 +1803,7 @@ export function apply(ctx, rawConfig) {
   let capabilitiesCache = { at: 0, ids: null }
 
   function getWakeState(agent) {
-    const events = agent && agent.session && Array.isArray(agent.session.events) ? agent.session.events : null
+    const events = agent && agent.session ? sessionEvents(agent.session) : null
     let st = wakeStates.get(agent)
     if (!st) {
       st = { count: 0, lastCheckedLen: events ? events.length : 0 }
@@ -1887,7 +1907,7 @@ export function apply(ctx, rawConfig) {
      */
     const wasJobNoticeHandled = (parentId, jobId, doneAt) => {
       const session = sessionForParent(parentId)
-      const events = session && Array.isArray(session.events) ? session.events : []
+      const events = sessionEvents(session)
       if (events.length === 0) return false
       const turnStarts = new Map()
       const newTurnAnchors = []
@@ -1926,7 +1946,7 @@ export function apply(ctx, rawConfig) {
 
     const hasOpenTurn = () => {
       const session = sessionForParent(owner.id)
-      const events = session && Array.isArray(session.events) ? session.events : []
+      const events = sessionEvents(session)
       let lastStart = -1
       let lastEnd = -1
       for (let i = 0; i < events.length; i++) {
@@ -2269,8 +2289,9 @@ export function apply(ctx, rawConfig) {
             if (!seeded && fallback && typeof titles.rename === 'function') {
               try { titles.rename(session, fallback); seeded = true } catch {}
             }
-            if (!(session.events || []).some((e) => e && e.type === 'user/message')) continue
-            if (!(session.events || []).some((e) => e && e.type === 'request/header')) continue
+            const titleEvents = sessionEvents(session)
+            if (!titleEvents.some((e) => e && e.type === 'user/message')) continue
+            if (!titleEvents.some((e) => e && e.type === 'request/header')) continue
             if (cancelled || disposed) return
             // v2 默认保留确定性 fallback 标题；仅显式开启时才额外消耗一次 LLM 标题刷新。
             if (config.llmTitle === true && typeof titles.refresh === 'function') {
@@ -3246,8 +3267,9 @@ export function apply(ctx, rawConfig) {
             let lastProgressMs = lastSnapProgMs ?? lastSessProgMs ?? parseTimeMs(snap && snap.startedAt) ?? getNow()
             let lastSeq = snap && typeof snap.lastEventSeq === 'number' ? snap.lastEventSeq : undefined
             let lastTextLen = snap && typeof snap.assistantText === 'string' ? snap.assistantText.length : 0
-            let hadSession = Boolean(initChild.session && Array.isArray(initChild.session.events))
-            let lastEvCount = hadSession ? initChild.session.events.length : 0
+            const initEvCount = sessionEventCount(initChild.session)
+            let hadSession = initEvCount != null
+            let lastEvCount = initEvCount ?? 0
             let stallNotified = false
             const maxPollRetries = config.waitMaxRetries ?? DEFAULTS.waitMaxRetries
             const pollRetryDelayMs = config.waitRetryDelayMs ?? DEFAULTS.waitRetryDelayMs
@@ -3316,8 +3338,9 @@ export function apply(ctx, rawConfig) {
                 const sessProgMs = getLatestSessionEventTime(childSession)
                 const curSeq = snap && typeof snap.lastEventSeq === 'number' ? snap.lastEventSeq : undefined
                 const curTextLen = snap && typeof snap.assistantText === 'string' ? snap.assistantText.length : 0
-                const hasCurSess = Boolean(childSession && Array.isArray(childSession.events))
-                const curEvCount = hasCurSess ? childSession.events.length : 0
+                const curEvCountOrNull = sessionEventCount(childSession)
+                const hasCurSess = curEvCountOrNull != null
+                const curEvCount = curEvCountOrNull ?? 0
                 const seqAdvanced = curSeq !== undefined && lastSeq !== undefined && curSeq > lastSeq
                 const textAdvanced = curTextLen > lastTextLen
                 const evAdvanced = hadSession && hasCurSess && curEvCount > lastEvCount
