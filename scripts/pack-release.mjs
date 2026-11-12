@@ -15,12 +15,12 @@ for (const name of fs.readdirSync(path.join(root, 'packages'))) {
   const manifest = path.join(dir, 'package.json');
   if (!fs.existsSync(manifest)) continue;
   const pkg = JSON.parse(fs.readFileSync(manifest, 'utf8'));
-  const result = spawnSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['pack', dir, '--pack-destination', output, '--json'], { cwd: root, encoding: 'utf8' });
-  if (result.status !== 0) { console.error(result.stderr); process.exit(result.status ?? 1); }
-  const info = JSON.parse(result.stdout)[0];
-  const source = path.join(output, info.filename);
+  const result = spawnSync('npm', ['pack', dir, '--pack-destination', output], { cwd: root, stdio: 'inherit', shell: true });
+  if (result.status !== 0) { process.exit(result.status ?? 1); }
+  const defaultTgz = `${pkg.name.replace(/^@/, '').replace(/\//g, '-')}-${pkg.version}.tgz`;
+  const source = path.join(output, defaultTgz);
   const target = path.join(output, `${name}-${pkg.version}.tgz`);
-  if (source !== target) fs.renameSync(source, target);
+  if (fs.existsSync(source) && source !== target) fs.renameSync(source, target);
   artifacts.push(target);
   console.log(`Packed ${path.basename(target)}`);
 }
