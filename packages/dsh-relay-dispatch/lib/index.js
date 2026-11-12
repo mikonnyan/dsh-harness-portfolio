@@ -1786,6 +1786,168 @@ export function syncTargetsNow(targets, pipelineId) {
   return { pass: !mismatches.length, copied: copied.length, mismatches }
 }
 
+const COLLAPSED_SESSION_LIMIT = 5
+const workspaceAttachInflight = new Map()
+const INJECTED_CHILD_ID = /(?:^|\s)id=(session-[A-Za-z0-9_-]+)\b/
+const INJECTED_CHILD_PARENT = /\bparentSession=(session-[A-Za-z0-9_-]+)\b/
+
+function registryOf(ctx) {
+  if (!ctx || typeof ctx !== 'object') return undefined
+  if (typeof ctx.get === 'function') {
+    try {
+      const got = ctx.get('workspaceRegistry')
+      if (got) return got
+    } catch {}
+  }
+  return ctx.workspaceRegistry
+}
+
+function asList(value) {
+  if (Array.isArray(value)) return value
+  if (value && typeof value[Symbol.iterator] === 'function') {
+    try { return [...value] } catch { return [] }
+  }
+  return []
+}
+
+function workspaceSessionIds(workspace) {
+  if (!workspace || typeof workspace !== 'object') return []
+  const raw = workspace.sessionIds ?? workspace.record?.sessionIds
+  return asList(raw)
+}
+
+function cwdOfSession(session) {
+  if (!session || typeof session !== 'object') return undefined
+  return session.header?.cwd || session.meta?.cwd || session.cwd || session.session?.header?.cwd
+}
+
+function parentOfSession(session) {
+  if (!session || typeof session !== 'object') return undefined
+  const parent = session.header?.parentSession || session.meta?.parentSession || session.parentSession
+  return parent != null && parent !== '' ? parent : undefined
+}
+
+function idOfSession(session) {
+  if (!session || typeof session !== 'object') return undefined
+  return session.id || session.header?.id
+}
+
+/** 诊断日志里最近若干条成功注入 parentSession 的子会话。 */
+export function parseInjectedChildLines(text, limit = 50) {
+  const rows = []
+  for (const line of String(text || '').split(/\r?\n/)) {
+    if (!line.includes('result=inject')) continue
+    const id = line.match(INJECTED_CHILD_ID)
+    const parent = line.match(INJECTED_CHILD_PARENT)
+    if (!id || !parent) continue
+    rows.push({ childId: id[1], parentSessionId: parent[1] })
+  }
+  const cap = limit > 0 ? limit : 50
+  return rows.length > cap ? rows.slice(-cap) : rows
+}
+
+/**
+ * 把派发出来的子会话挂进父会话所在工作区的 sessionIds。
+ * 侧边栏只认 workspace.sessionIds，不认 session.cwd；漏挂就会掉进 Ungrouped。
+ * attachSession 会把子会话插到最前。父会话若因此被挤出折叠后的前 5 行，再挪回子会话前面。
+ * 失败只吞掉，派发本身不能因此中断。同一子会话的并发调用合并成一次。
+ */
+export function attachChildToWorkspace(ctx, childSessionId, parentSessionId, cwd) {
+  if (!childSessionId) return Promise.resolve()
+  const key = String(childSessionId)
+  const existing = workspaceAttachInflight.get(key)
+  if (existing) return existing
+  const run = attachChildToWorkspaceNow(ctx, childSessionId, parentSessionId, cwd).catch(() => {}).finally(() => {
+    if (workspaceAttachInflight.get(key) === run) workspaceAttachInflight.delete(key)
+  })
+  workspaceAttachInflight.set(key, run)
+  return run
+}
+
+async function attachChildToWorkspaceNow(ctx, childSessionId, parentSessionId, cwd) {
+  try {
+    const reg = registryOf(ctx)
+    if (!reg || typeof reg.list !== 'function') return
+    let listed = []
+    try { listed = asList(reg.list()) } catch { listed = [] }
+    let workspace
+    if (parentSessionId && cwd) {
+      workspace = listed.find((ws) => ws && workspaceSessionIds(ws).includes(parentSessionId) && sameDir(ws.path, cwd))
+    }
+    if (!workspace && cwd && typeof reg.resolveByPath === 'function') {
+      try { workspace = await reg.resolveByPath(cwd) } catch {}
+    }
+    if (!workspace && cwd) {
+      workspace = listed.find((ws) => ws && sameDir(ws.path, cwd))
+    }
+    if (!workspace || typeof workspace.attachSession !== 'function') return
+    try { await workspace.attachSession(childSessionId) } catch {}
+    if (!parentSessionId || typeof workspace.insertSessionBefore !== 'function') return
+    try {
+      const visible = (ids) => {
+        const childIdx = ids.indexOf(childSessionId)
+        const parentIdx = ids.indexOf(parentSessionId)
+        return childIdx >= 0 && parentIdx >= 0 && childIdx < COLLAPSED_SESSION_LIMIT && parentIdx < COLLAPSED_SESSION_LIMIT
+      }
+      let ids = workspaceSessionIds(workspace)
+      if (!ids.includes(parentSessionId) || visible(ids)) return
+      if (ids.indexOf(childSessionId) !== 0) {
+        const anchor = ids.find((id) => id !== childSessionId)
+        await workspace.insertSessionBefore(childSessionId, anchor)
+        ids = workspaceSessionIds(workspace)
+      }
+      if (ids.includes(parentSessionId) && ids.includes(childSessionId) && ids.indexOf(parentSessionId) !== 0) {
+        await workspace.insertSessionBefore(parentSessionId, childSessionId)
+      }
+    } catch {}
+  } catch {}
+}
+
+/**
+ * 插件加载时把已经派发出去、但还没进 workspace.sessionIds 的子会话补挂上。
+ * 来源是当前 sessions 列表，外加诊断日志里最近 50 条 inject 记录。
+ */
+export async function reconcileStrayChildSessions(ctx, config = {}) {
+  try {
+    const reg = registryOf(ctx)
+    if (!reg || typeof reg.list !== 'function') return
+    const sessions = ctx && typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+    const wanted = new Map()
+    if (sessions && typeof sessions.list === 'function') {
+      let live = []
+      try { live = asList(sessions.list()) } catch { live = [] }
+      for (const session of live) {
+        const id = idOfSession(session)
+        const parent = parentOfSession(session)
+        const cwd = cwdOfSession(session)
+        if (!id || !parent || !cwd) continue
+        wanted.set(id, { parentSessionId: parent, cwd })
+      }
+    }
+    const logPath = config.parentLogPath === undefined ? PARENT_LOG_PATH : config.parentLogPath
+    if (logPath) {
+      let text = ''
+      try { if (existsSync(logPath)) text = readFileSync(logPath, 'utf8') } catch {}
+      for (const row of parseInjectedChildLines(text, 50)) {
+        let cwd = wanted.get(row.childId)?.cwd
+        if (!cwd && sessions && typeof sessions.get === 'function') {
+          try { cwd = cwdOfSession(sessions.get(row.childId)) } catch {}
+        }
+        if (!cwd) continue
+        wanted.set(row.childId, { parentSessionId: row.parentSessionId, cwd })
+      }
+    }
+    let listed = []
+    try { listed = asList(reg.list()) } catch { listed = [] }
+    for (const [childId, info] of wanted) {
+      const home = listed.find((ws) => ws && sameDir(ws.path, info.cwd))
+      if (!home) continue
+      if (workspaceSessionIds(home).includes(childId)) continue
+      await attachChildToWorkspace(ctx, childId, info.parentSessionId, info.cwd)
+    }
+  } catch {}
+}
+
 export function apply(ctx, rawConfig) {
   const config = { ...DEFAULTS, ...(rawConfig || {}) }
   const tools = ctx.tools
@@ -2203,6 +2365,7 @@ export function apply(ctx, rawConfig) {
               s.sessionId = id
               injectedParent = s.parent
               opts = { ...cleanOpts, meta: cleanMeta }
+              void attachChildToWorkspace(ctx, id, s.parent, cleanMeta.cwd || s.cwd)
             }
             logParent(
               `prepare gen=${myGen} id=${id || '?'} slot=${verdict.slotStatus} cwdMatch=${verdict.cwdMatch} ` +
@@ -2411,6 +2574,8 @@ export function apply(ctx, rawConfig) {
           } else {
             scheduleTitle(my.sessionId, rawTask, prefix)
           }
+          await attachChildToWorkspace(ctx, my.sessionId, my.parent, my.cwd)
+          if (retSid && retSid !== my.sessionId) await attachChildToWorkspace(ctx, retSid, my.parent, my.cwd)
         }
         return started
       } finally {
@@ -3429,4 +3594,9 @@ export function apply(ctx, rawConfig) {
       return { jobId, runId, model: used, note: modelNote, ...(webUrl ? { webUrl } : {}), ...(args.conclude === true ? { concludeReason: await finishConclude(exec, notes, config.concludeFence) } : {}) }
     },
   }))
+
+  queueMicrotask(() => {
+    if (disposed) return
+    reconcileStrayChildSessions(ctx, config).catch(() => {})
+  })
 }

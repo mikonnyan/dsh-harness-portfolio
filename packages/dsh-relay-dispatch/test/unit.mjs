@@ -386,7 +386,7 @@ const { Context } = await import(pathToFileURL(`${dshNodeModules}/cordis/lib/ind
 console.log('p2 ok')
 
 // ───────── 稳健性测试：parentSession 防错挂 / 并发 / 超时释放 / 标题调度可取消与超时 ─────────
-import { classifyApiRequest, isRelayPrepare } from '../lib/index.js'
+import { classifyApiRequest, isRelayPrepare, attachChildToWorkspace, reconcileStrayChildSessions, parseInjectedChildLines } from '../lib/index.js'
 {
   // 1) classifyApiRequest & isRelayPrepare 单元判定
   assert.equal(classifyApiRequest({ 'user-agent': 'node', 'content-type': 'application/json; charset=utf-8' }), 'relay')
@@ -417,7 +417,7 @@ import { classifyApiRequest, isRelayPrepare } from '../lib/index.js'
 
   // 2) start_run 期间用户同工作区手动新建会话防抢槽 + 真实 relay 正常挂载 + 事后 sessionId 校验告警
   const parentLogFile = join(dir, 'relay-dispatch-parent.log')
-  function setupHarness(cfgOverrides = {}) {
+  function setupHarness(cfgOverrides = {}, extra = {}) {
     let tool
     const disposers = []
     const prepared = new Map()
@@ -455,6 +455,7 @@ import { classifyApiRequest, isRelayPrepare } from '../lib/index.js'
         if (k === 'sessionTitle') return sessionTitleSvc
         if (k === 'webServer') return { prefixes: new Map([['/api', apiRoute]]) }
         if (k === 'jobs') return { start: () => 'job-test' }
+        if (k === 'workspaceRegistry') return extra.workspaceRegistry
         return undefined
       },
       tools: {
@@ -604,6 +605,146 @@ import { classifyApiRequest, isRelayPrepare } from '../lib/index.js'
     const pHung = h.run({ startArgs: { workspace: 'W', task: 't' } }, 'parent-disp')
     setTimeout(() => h.disposeAll(), 20)
     await assert.rejects(() => pHung, /disposed/)
+  }
+
+  // 2f) relay_dispatch 创建子会话时自动 attach 到父会话所在 workspace，并保持在折叠后的前 5 行
+  {
+    function makeWorkspace(path, seed) {
+      const ids = [...seed]
+      const attached = []
+      const workspace = {
+        path,
+        get sessionIds() { return ids },
+        async attachSession(id) {
+          attached.push(id)
+          if (!ids.includes(id)) ids.unshift(id)
+        },
+        async insertSessionBefore(sessionId, beforeSessionId) {
+          if (!ids.includes(sessionId)) throw new Error(`not accounted ${sessionId}`)
+          if (beforeSessionId != null && !ids.includes(beforeSessionId)) throw new Error(`anchor missing ${beforeSessionId}`)
+          if (beforeSessionId === sessionId) return
+          const without = ids.filter((id) => id !== sessionId)
+          const at = beforeSessionId == null ? without.length : without.indexOf(beforeSessionId)
+          const next = [...without.slice(0, at), sessionId, ...without.slice(at)]
+          ids.splice(0, ids.length, ...next)
+        },
+      }
+      return { workspace, ids, attached }
+    }
+    const buried = makeWorkspace('C:\\Users\\mikon\\Desktop\\asd', ['s1', 's2', 's3', 's4', 's5', 's6', 'parent-ws'])
+    const h = setupHarness({ refreshTitle: false, parentLogPath: join(dir, 'attach-workspace.log') }, {
+      workspaceRegistry: {
+        list: () => [buried.workspace],
+        async resolveByPath(p) {
+          return String(p).replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase() === 'c:/users/mikon/desktop/asd' ? buried.workspace : undefined
+        },
+      },
+    })
+    h.setToolHandler(async (c) => {
+      if (c.name.endsWith('start_run')) {
+        h.sessionsSvc.prepare('session-child-attach', { meta: { cwd: 'C:/Users/mikon/Desktop/asd/' } })
+        h.sessionsSvc.prepare('session-user-browser', { initiator: 'user', meta: { cwd: 'C:\\Users\\mikon\\Desktop\\asd' } })
+        return { isError: false, value: { runId: 'r-attach', sessionId: 'session-child-attach' } }
+      }
+      return { isError: false, value: {} }
+    })
+    const res = await h.run({ startArgs: { workspace: 'C:\\Users\\mikon\\Desktop\\asd', task: 'attach me' } }, 'parent-ws')
+    assert.equal(res.runId, 'r-attach')
+    assert.equal(h.prepared.get('session-child-attach').meta.parentSession, 'parent-ws')
+    assert.equal(buried.attached.filter((id) => id === 'session-child-attach').length, 1, '子会话应自动 attach 一次')
+    assert.equal(buried.attached.includes('session-user-browser'), false, '手动创建不应 attach')
+    assert.ok(buried.ids.indexOf('session-child-attach') >= 0 && buried.ids.indexOf('session-child-attach') < 5)
+    assert.ok(buried.ids.indexOf('parent-ws') >= 0 && buried.ids.indexOf('parent-ws') < 5, '父会话不能被挤出折叠后的前 5 行')
+    assert.equal(buried.ids[0], 'parent-ws')
+    assert.equal(buried.ids[1], 'session-child-attach')
+    h.disposeAll()
+
+    const boom = makeWorkspace('C:\\ws\\boom', ['parent-boom'])
+    boom.workspace.attachSession = async () => { boom.attached.push('threw'); throw new Error('attach failed') }
+    const hBoom = setupHarness({ refreshTitle: false, parentLogPath: join(dir, 'attach-boom.log') }, {
+      workspaceRegistry: { list: () => [boom.workspace] },
+    })
+    hBoom.setToolHandler(async (c) => {
+      if (c.name.endsWith('start_run')) {
+        hBoom.sessionsSvc.prepare('session-child-boom', { meta: { cwd: 'C:\\ws\\boom' } })
+        return { isError: false, value: { runId: 'r-boom', sessionId: 'session-child-boom' } }
+      }
+      return { isError: false, value: {} }
+    })
+    const boomRes = await hBoom.run({ startArgs: { workspace: 'C:\\ws\\boom', task: 'still dispatch' } }, 'parent-boom')
+    assert.equal(boomRes.runId, 'r-boom', 'attach 失败不能让派发失败')
+    assert.equal(hBoom.warnings.length, 0)
+    hBoom.disposeAll()
+  }
+
+  // 2g) 启动补挂：cwd 命中工作区但尚未进 sessionIds 的子会话（含日志里最近 50 条）
+  {
+    const lines = []
+    for (let i = 0; i < 55; i++) lines.push(`[t] prepare id=session-extra-${i} slot=active cwdMatch=true result=inject reason=matched parentSession=session-parent-limit`)
+    lines.push('[t] prepare id=session-57a9d5fb-c63c-4cb1-811c-4d6615930f51 slot=active cwdMatch=true result=inject reason=matched parentSession=session-parent-limit')
+    assert.equal(parseInjectedChildLines(lines.join('\n'), 50)[0].childId, 'session-extra-6')
+    assert.equal(parseInjectedChildLines(lines.join('\n'), 50).at(-1).childId, 'session-57a9d5fb-c63c-4cb1-811c-4d6615930f51')
+    const ids = ['session-parent-limit', 'session-already']
+    const attached = []
+    const ws = {
+      path: 'C:\\Users\\mikon\\Desktop\\asd',
+      get sessionIds() { return ids },
+      async attachSession(id) {
+        attached.push(id)
+        if (!ids.includes(id)) ids.unshift(id)
+      },
+      async insertSessionBefore(sessionId, beforeSessionId) {
+        const without = ids.filter((id) => id !== sessionId)
+        const at = beforeSessionId == null ? without.length : without.indexOf(beforeSessionId)
+        ids.splice(0, ids.length, ...without.slice(0, at), sessionId, ...without.slice(at))
+      },
+    }
+    const store = new Map([
+      ['session-already', { id: 'session-already', header: { id: 'session-already', cwd: 'C:\\Users\\mikon\\Desktop\\asd', parentSession: 'session-parent-limit' } }],
+      ['session-live-stray', { id: 'session-live-stray', header: { id: 'session-live-stray', cwd: 'C:/Users/mikon/Desktop/asd', parentSession: 'session-parent-limit' } }],
+    ])
+    for (let i = 0; i < 55; i++) {
+      const id = `session-extra-${i}`
+      store.set(id, { id, header: { id, cwd: 'C:\\Users\\mikon\\Desktop\\asd', parentSession: 'session-parent-limit' } })
+    }
+    store.set('session-57a9d5fb-c63c-4cb1-811c-4d6615930f51', {
+      id: 'session-57a9d5fb-c63c-4cb1-811c-4d6615930f51',
+      header: { id: 'session-57a9d5fb-c63c-4cb1-811c-4d6615930f51', cwd: 'C:\\Users\\mikon\\Desktop\\asd', parentSession: 'session-parent-limit' },
+    })
+    const logFile = join(dir, 'stray-children.log')
+    writeFileSync(logFile, lines.join('\n'))
+    const ctx = {
+      get(k) {
+        if (k === 'workspaceRegistry') return { list: () => [ws] }
+        if (k === 'sessions') return {
+          list: () => [store.get('session-already'), store.get('session-live-stray')],
+          get: (id) => store.get(id),
+        }
+        return undefined
+      },
+    }
+    await reconcileStrayChildSessions(ctx, { parentLogPath: logFile })
+    assert.equal(attached.includes('session-already'), false, '已在 sessionIds 里的不再 attach')
+    assert.equal(attached.includes('session-live-stray'), true)
+    assert.equal(attached.includes('session-extra-5'), false, '只补挂日志最近 50 条')
+    assert.equal(attached.includes('session-extra-6'), true)
+    assert.equal(attached.includes('session-extra-54'), true)
+    assert.equal(attached.includes('session-57a9d5fb-c63c-4cb1-811c-4d6615930f51'), true)
+    assert.ok(ids.includes('session-57a9d5fb-c63c-4cb1-811c-4d6615930f51'))
+    assert.ok(ids.indexOf('session-parent-limit') < 5)
+    assert.ok(ids.indexOf('session-extra-54') < 5)
+    assert.ok(ids.includes('session-live-stray'))
+    const direct = []
+    const directWs = {
+      path: 'C:\\other',
+      sessionIds: ['session-parent-direct'],
+      async attachSession(id) { direct.push(id); this.sessionIds = [id, ...this.sessionIds.filter((x) => x !== id)] },
+    }
+    await attachChildToWorkspace({
+      get: (k) => k === 'workspaceRegistry' ? { list: () => [directWs], async resolveByPath() { return undefined } } : undefined,
+    }, 'session-direct-child', 'session-parent-direct', 'C:\\other')
+    assert.deepEqual(direct, ['session-direct-child'])
+    assert.equal(directWs.sessionIds[0], 'session-direct-child')
   }
 
   // 3) 标题调度：refresh 本地超时保护 + dispose 时立即取消停止
