@@ -6,6 +6,22 @@
 
 ---
 
+## 0. v4 最新收益看板（Latest v4 Benefit Dashboard）
+
+> 本节补充当前 v4 的配对实测；后文 `G1=38`、首轮静态 `8,100` 等保留为**历史消融点**，不与当前 22 个常驻工具混为同一测量。
+
+| 指标 / Metric | v4 结果 / Result | 测量与边界 / Measurement boundary |
+| --- | --- | --- |
+| 常驻工具 / Resident tools | **137 → 22（-84%）** | 真实 `filterTools` 驱动当前生产目录；115 个非驻留工具按需使用 |
+| 常驻上下文 / Resident context | **102.4k → 41.5k tokens（-60%）** | 同源 v4 配置配对遥测；不同模型分词与工作负载会改变绝对值 |
+| 热缓存命中率 / Warm cache hit rate | **95%+** | 稳定工具 Schema 与静态系统提示词前缀下的实测范围 |
+| Vertex 隐式缓存 A/B / Vertex implicit-cache A/B | **保留 `thinkingConfig` 的配对请求可利用隐式缓存；移除/改变思考配置会改变缓存前缀与命中条件** | Vertex 的隐式缓存由平台匹配，`thinkingConfig` 不是显式缓存 API；结论只适用于本次 A/B 配置 |
+| 原生压缩接管 / Native compaction takeover | **75% 硬水位无损接管；运行时 `auto:true→false`，`dispose` 恢复原值** | 默认 `takeoverNativeCompaction:true`；不改 YAML/原生文件，“无损”指原事件保留并可回召 |
+
+**Vertex A/B 结论 / conclusion:** `thinkingConfig` 必须作为模型请求配置保持一致，而非被误当作缓存开关。隐式缓存命中是供应商侧行为，本仓库不承诺跨模型、跨区域或跨时间均达到相同命中率。
+
+---
+
 ## 1. Executive Summary & Three-Tier Evidence Taxonomy（三层证据分级体系）
 
 Evaluating long-horizon coding agent infrastructure presents a fundamental methodological challenge: **end-to-end LLM rollouts are inherently stochastic and non-stationary**, while purely synthetic micro-benchmarks often fail to capture the power-law noise skew and failure modes of real-world software engineering workloads. Claiming infrastructure improvements from anecdotal runs or conflating deterministic runtime mechanics with stochastic model outputs violates core systems benchmarking principles.
@@ -145,6 +161,8 @@ xychart-beta
 ---
 
 ### 3.2 实验 1：工具面治理与 Prefix KV Cache 仿真（`T0` vs. `T1` vs. `T2`）
+
+**v4 当前目录修正：** 最新生产目录的常驻工具为 **22（137 → 22，-84%）**，而本节 `T1/T2=38` 与 `28,500 → 8,100` 是用于历史渐进消融的固定配置。新增 v4 看板的 **102.4k → 41.5k（-60%）** 是常驻上下文配对遥测，不是下表首轮 Header 的替代值。热路径缓存实测为 **95%+**；Vertex A/B 仅支持“一致保留 `thinkingConfig` 时隐式缓存可命中”的结论，不将其宣称为显式缓存控制。
 
 本实验针对 `@dsh-external/dsh-tool-gate` 解决的三个核心系统问题进行定量验证：(1) 首轮静态 Schema 与技能目录膨胀；(2) 工具隐藏但残留系统提示词引发的“幽灵提示词幻觉（Ghost-Prompt Hallucination）”；(3) 按需开启工具组对推理引擎 Prefix KV Cache 命中率与额外往返轮次（RTT）的影响。
 

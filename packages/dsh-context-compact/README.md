@@ -1,79 +1,97 @@
 # @dsh-external/dsh-context-compact
 
-Event-stream surgical context compaction (`context_compact`) and lossless provenance recall (`context_recall`) for **DeepSeek Harness (DSH)**.
+**面向 DeepSeek Harness 的事件流级精确压缩、无损回召与原生自动压缩免配置接管。**
 
-## Overview
+**Surgical event-stream compaction, lossless recall, and zero-config native auto-compaction takeover for DeepSeek Harness.**
 
-Traditional LLM agent context management relies on destructive "rolling summaries" that summarize the entire conversation when the context window fills up—erasing exact file paths, line numbers, symbol names, and error codes that a coding agent needs moments later.
+## 中文
 
-`@dsh-external/dsh-context-compact` exploits DSH's separation between the **immutable append-only event log (`session.events` / `.jsonl.zstd`)** and the **active prompt projection (`session.surface.nodes`)**. It equips the agent with two surgical tools:
+### 为什么需要它
 
-1. **`context_compact`**: Dual-granularity surgical replacement on `session.surface.nodes`:
-   - **Single tool-result pruning (`results: [{ callId, summary }]`)**: Replaces individual bulky `tool/result` nodes (from the current turn or historical turns) with a concise engineering conclusion and a `[recall: @call:<callId>]` anchor via `compaction/prune` + `tool/result (surfaceOp: replace)`.
-   - **Multi-turn contiguous span checkpointing (`spans: [{ from, to, summary }]`)**: Condenses closed historical turns (`turn:N`, `turnsBack:N`, or `<callId>`) into a single checkpoint message with a `[recall: @span:S<min>-<max>]` anchor via atomic 4-event commits (`compaction/start` → `compaction/summary` → `user/message (surfaceOp: replace)` → `compaction/end`).
-2. **`context_recall`**: Read-only, concurrency-safe (`isConcurrencySafe: () => true`) lossless retrieval from the underlying event log:
-   - Recursively expands `sourceEventSeqs` provenance DAGs down to original `surfaceOp === 'append'` leaf events—even across multiple nested compactions.
-   - Supports regex/substring filtering (`query` + `context_lines`) and 120-line paginated slicing (`line_range`) with continuation cursors.
+传统滚动摘要会丢失文件路径、行号、符号和错误码。本插件只改写发送给模型的 `session.surface.nodes` 投影，底层追加式事件账本保持完整；需要时可通过 `context_recall` 沿 `sourceEventSeqs` 溯源图找回原文。
 
----
+- `context_compact`：按单个工具结果（`@call`）或已闭合轮次区间（`@span`）压缩；支持暂存后轮末提交、`conclude_turn`、软水位提示及 75% 硬水位零 LLM 接管。
+- `context_recall`：支持嵌套压缩、正则/子串检索、上下文行与最多 120 行游标分页。
+- 安全边界：校验工具调用/结果配对；不修改或删除原生压缩文件；异常与卸载恢复路径可重复执行。
 
-## Key Features & Safety Invariants
+### 安装与即插即用
 
-- **Staged-by-Default Execution**: Compactions called mid-turn are staged in a per-session `WeakMap` queue so the original uncompacted text remains visible to the model for the rest of the current turn, then automatically flushed on `agent/turn-stopping`.
-- **Immediate Commit & Turn Conclusion**:
-  - Automatically switches from staged to immediate commit when context occupancy exceeds `70%` (`DEFAULT_IMMEDIATE_RATIO = 0.70`) or when `conclude_turn: true` is passed.
-  - **`conclude_turn` Guard (`checkConcludeTurnEligibility`)**: Safely calls `exec.concludeTurn()` to save an extra LLM round-trip **only** when the current open step's `assistant/message` already contains non-empty user-visible reply text and no other tool calls exist in the same step. Otherwise, it commits the compaction immediately without prematurely ending the turn.
-- **Tool-Pairing Balance Verification**: Enforces `toolPairingBalancedBefore(session, startSeq)` and `toolPairingBalancedAfter(session, endSeq)` so a span replacement never splits an `assistant/message (tool-call)` from its corresponding `tool/result`.
-- **Abort & Transient-Failure Resilience**:
-  - Relative `turnsBack:N` endpoints are normalized to canonical `turn:M` selectors at staging time.
-  - If a turn is aborted (`signal.aborted`), the staged queue survives `turn/end` and automatically commits at the next turn's `agent/turn-stopping`.
-  - Transient flush failures re-queue up to `DEFAULT_MAX_FLUSH_RETRIES = 2` times before recording to `dropped`, re-planning against the latest surface and silently skipping targets already compacted.
-- **KV-Cache Friendly Prompt Injection & Zero-Round-Trip Soft Watermark Auto-Hint**:
-  - Injects static compaction guidance via `ctx.systemPrompt.section` (zero prefix KV-cache invalidation).
-  - Injects a single-line directory of historical large blocks (`>500` tokens) via `ctx.systemPrompt.context`, updating only across turn boundaries when historical large blocks change.
-  - **Incremental Compactable-Pool Soft Watermark (`inspectSoftWatermark` / `buildSoftWatermarkHint`)**: Evaluates the newly accumulated **compactable pool (`compactableTokens`)**—excluding already-compacted checkpoints (`@span` / `@call`) and excluding active dialogue in the most recent `keepRecentTurns` (default `5`) turns—plus `uncompactedClosedTurns` (default threshold `20` turns) and `softWatermarkTokens` (default `60000` tokens).
-  - **Zero Extra Round-Trip & Prompt-Cache TTL Economics**: When triggered, emits the single-line hint through `systemPrompt.context` and latches the first triggered hint string per compaction cycle (keyed by the latest `compaction/*` event `seq`, without real-time changing floating-point `k` token counts) so repeated turns before a new compaction return the exact same string and never cause the host to append duplicate persisted `user/message` snapshots. Messages persisted by `@deepseek-ai/dsh-system-prompt` are excluded from the compactable pool. The hint pre-computes the ready-to-use `turn:A..turn:B` span and Top 3 `callId` candidates, so no separate `inspect: true` round-trip is needed. The large-block directory and watermark share one measurement per surface version, invalidated on surface changes. When dispatching long background tasks (>5 minute provider prompt-cache TTL), piggyback `context_compact` in the same step using `<=120` token telegraphic summaries (`path:line + conclusion`).
+将本包作为标准 DSH 插件安装并按宿主插件市场指引启用。支持当前声明的 DSH 版本及 Cordis 4 运行时；无需额外运行时依赖。
 
----
+`takeoverNativeCompaction` **默认为 `true`**：插件加载时，如果 `ctx.compaction` 存在且其实例 `auto === true`，仅在内存中将它设为 `false`，避免原生自动压缩与本插件同时争抢上下文。无需手改 YAML。
 
-## Tool Reference
+插件 `dispose` 时将该实例的 `auto` 精确恢复为接管前的值；重复恢复是幂等的。设置为 `false`、没有原生实例、或原生原本未开启自动压缩时均不改动。
 
-### `context_compact`
+```yaml
+# 仅在希望保留原生 auto 行为时显式关闭接管
+takeoverNativeCompaction: false
+```
 
-| Parameter | Type | Description |
-|---|---|---|
-| `results` | `Array<{ callId: string, summary: string }>` | Single tool-result compactions (completed calls in current or earlier turns). |
-| `spans` | `Array<{ from: string, to: string, summary: string }>` | Contiguous historical turn spans (`turn:N`, `turnsBack:N`, or `<callId>`). Cannot cover the current open turn. |
-| `conclude_turn` | `boolean` | Commit immediately and call `exec.concludeTurn()` if the current assistant message already has final reply text. |
-| `inspect` | `boolean` | Output a detailed breakdown of surface nodes `>= 500` tokens with `seq`, `turn`, `callId`, and token counts. |
+卸下插件后，注册的工具和提示词由宿主生命周期清理，原生 `auto` 同步恢复，不留下文件改写。
 
-### `context_recall`
+### 常用工具
 
-| Parameter | Type | Description |
-|---|---|---|
-| `target` | `string` (required) | `@call:<callId>`, `@span:S<start>-<end>`, `@turn:<N>`, or raw event `seq`. |
-| `query` | `string` | Optional case-insensitive regex or substring filter. |
-| `context_lines` | `integer` | Number of surrounding lines to include around each `query` match (default `3`). |
-| `line_range` | `[number, number]` | Optional 1-based inclusive `[startLine, endLine]` range (max `120` lines per page). |
+| 工具 | 用途 |
+| --- | --- |
+| `context_compact({ results, spans })` | 压缩指定工具结果或已闭合区间；摘要须保留结论和精确锚点 |
+| `context_compact({ inspect: true })` | 检查大型表面节点，不执行压缩 |
+| `context_compact({ conclude_turn: true })` | 满足回复已完成等安全条件时立即提交并结轮 |
+| `context_recall({ target, query, line_range })` | 无损读取原始事件或全局检索 |
 
----
+硬水位默认 `0.75`，目标水位默认 `0.55`；自动归档使用确定性摘要，原文仍可回召。这里的“无损”指原始事件未被破坏且可检索，不代表摘要本身包含全部原文。
 
-## Verification & Testing
+### 验证与许可证
 
 ```bash
-# Syntax check
+npm test
 node --check lib/index.js
-
-# Run unit & integration test suite (10 tests covering single results, spans, nested recall, conclude_turn guards, abort retention, retry limits, overlap deduplication, soft watermark auto-hint, incremental compactableTokens anti-false-positive verification, persisted system-prompt snapshot exclusion, and per-surface measurement caching)
-node --test test/unit.mjs
 ```
 
-Set `DSH_ROOT` if your `@deepseek-ai/dsh` installation is in a non-default location:
+BSD-3-Clause © mikonnyan。源码与发布说明见包元数据中的 GitHub 仓库。
+
+---
+
+## English
+
+### Why this plugin
+
+Rolling summaries can erase paths, line numbers, symbols, and error codes. This plugin changes only the model-facing `session.surface.nodes` projection while preserving the append-only event ledger. `context_recall` traverses the `sourceEventSeqs` provenance graph whenever exact source text is needed.
+
+- **`context_compact`** targets individual tool results (`@call`) or closed spans (`@span`), with staged turn-end commits, `conclude_turn`, soft-watermark hints, and deterministic zero-LLM takeover at the 75% hard watermark.
+- **`context_recall`** handles nested compaction, regex/substring search, context lines, and cursor pagination of up to 120 lines.
+- **Safety invariants** protect tool-call/result pairing and leave native compaction files untouched; cleanup is idempotent.
+
+### Install and zero-config coexistence
+
+Install and enable this package as a standard DSH plugin using the host plugin-market workflow. It supports the declared DSH range and Cordis 4 without additional runtime dependencies.
+
+**`takeoverNativeCompaction` defaults to `true`.** On startup, if `ctx.compaction` exists with instance value `auto === true`, the plugin changes only that in-memory value to `false`, preventing two automatic compactors from competing. **No YAML edit is required.**
+
+On plugin `dispose`, the exact previous value is restored. Restoration is idempotent. The plugin makes no change when takeover is disabled, native compaction is absent, or native `auto` was not enabled.
+
+```yaml
+# Opt out only when native automatic behavior should remain active
+takeoverNativeCompaction: false
+```
+
+Removing the plugin lets the host unregister its tools and prompt hooks and restores native `auto`; no file rewrite is left behind.
+
+### Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `context_compact({ results, spans })` | Compact selected tool results or closed spans with precise engineering summaries |
+| `context_compact({ inspect: true })` | Inspect large surface nodes without compaction |
+| `context_compact({ conclude_turn: true })` | Commit immediately and conclude only when safety checks pass |
+| `context_recall({ target, query, line_range })` | Retrieve original events or search globally without loss |
+
+The hard watermark defaults to `0.75`, targeting `0.55`. Automatic archival uses deterministic summaries and preserves recallable originals. “Lossless” means the underlying events remain intact and retrievable—not that a summary duplicates every source token.
+
+### Verify and license
 
 ```bash
-DSH_ROOT=/path/to/@deepseek-ai/dsh/node_modules/@deepseek-ai node --test test/compact.test.mjs
+npm test
+node --check lib/index.js
 ```
 
-## License
-
-BSD-3-Clause © mikonnyan
+BSD-3-Clause © mikonnyan. See the GitHub repository in package metadata for source and release notes.

@@ -19,11 +19,23 @@ import {
   commitResultCompaction,
   planSpanCompaction,
   commitSpanCompaction,
+  createUserMessage,
+  compactCheckpointSource,
+  inspectSessionLog,
+  latestClosedTurn,
+  parseTurnsToken,
+  resolveSpanTurns,
+  resolveSurfaceNodeTurns,
   executeRecall,
   isHighContextOccupancy,
   resolveLeafSurfaceSeqs,
   toolPairingBalancedBefore,
   toolPairingBalancedAfter,
+  getGlobalRuntimeState,
+  collectHardResultCandidates,
+  runHardCompaction,
+  auditNativeCompactionPresets,
+  takeoverNativeCompaction,
 } from '../lib/index.js'
 
 const DSH_ROOT = process.env.DSH_ROOT
@@ -59,6 +71,16 @@ async function createTestHarness() {
   })
 
   const sessions = new SessionStore(ctx)
+  const originalPrepare = sessions.prepare.bind(sessions)
+  sessions.prepare = (id, options) => {
+    if (options?.seedSource === 'persistence') {
+      const live = sessions.store.get(id)
+      if (live) live.detach()
+    }
+    const session = originalPrepare(id, options)
+    if (session.header?.id && options?.seedSource !== 'persistence') sessions.enter(session)
+    return session
+  }
   const tokenMeter = new TokenMeter(ctx)
   ctx.sessions = sessions
   ctx.tokenMeter = tokenMeter
@@ -70,6 +92,7 @@ async function createTestHarness() {
   }
 
   return {
+    ctx,
     ctx,
     sessions: ctx.sessions,
     tokenMeter: ctx.tokenMeter,
@@ -161,6 +184,175 @@ function addCompleteTurnWithTool(session, turn, callId, toolName, resultText, us
   session.append('turn/end', { turn, reason: { kind: 'completed' } })
   return tr.seq
 }
+
+function addOpenTurnToolStep(session, turn, step, callId, resultText, toolName = 'read', settle = true) {
+  session.append('step/start', { turn, step })
+  const chunk = session.append('assistant/chunk', { turn, step, chunk: { type: 'tool-call-delta', index: 0, id: callId, name: toolName, argumentsDelta: '{}' } })
+  session.append('assistant/message', { turn, step, message: { id: `a-${turn}-${step}`, role: 'assistant', content: [{ type: 'tool-call', id: callId, name: toolName, arguments: '{}' }] } }, { surfaceOp: 'append', sourceEventSeqs: [chunk.seq] })
+  const call = session.append('tool/call', { turn, step, callId, name: toolName, arguments: '{}' })
+  if (settle) session.append('tool/result', { turn, step, message: { id: `r-${callId}`, role: 'user', source: { kind: 'tool', callId }, content: [{ type: 'tool-result', toolCallId: callId, isError: false, content: [{ type: 'text', text: resultText }] }] } }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+  session.append('step/end', { turn, step })
+}
+
+function makeHardSession(session, tokenMeter) {
+  addCompleteTurnWithTool(session, 1, 'hard_old_1', 'read', 'old\n'.repeat(9000))
+  addCompleteTurnWithTool(session, 2, 'hard_old_2', 'read', 'older\n'.repeat(7000))
+  session.append('turn/start', { turn: 3 })
+  addOpenTurnToolStep(session, 3, 1, 'hard_open_1', 'open\n'.repeat(9000))
+  addOpenTurnToolStep(session, 3, 2, 'hard_open_2', 'recent\n'.repeat(500))
+  addOpenTurnToolStep(session, 3, 3, 'hard_open_3', 'latest\n'.repeat(500))
+  session.append('step/start', { turn: 3, step: 4 })
+  const measurement = tokenMeter.measure(session)
+  return { contextWindow: Math.ceil(measurement.totalTokens / 0.76), measurement }
+}
+
+test('native compaction takeover defaults on, disables auto, and restores exactly once on dispose', () => {
+  const native = { auto: true }
+  const dispose = takeoverNativeCompaction({ compaction: native })
+  assert.equal(native.auto, false)
+  dispose()
+  dispose()
+  assert.equal(native.auto, true)
+
+  const optedOut = { auto: true }
+  takeoverNativeCompaction({ compaction: optedOut }, false)()
+  assert.equal(optedOut.auto, true)
+  const alreadyOff = { auto: false }
+  takeoverNativeCompaction({ compaction: alreadyOff })()
+  assert.equal(alreadyOff.auto, false)
+  assert.doesNotThrow(() => takeoverNativeCompaction({})())
+})
+
+test('hard pre-step is quiet at 74% and archives to <=55% at 76%', async () => {
+  const { sessions, tokenMeter, ctx } = await createTestHarness()
+  const session = sessions.prepare('test-hard-ratio', { meta: { cwd: TEST_CWD } })
+  const { contextWindow } = makeHardSession(session, tokenMeter)
+  const agent = { session }
+  const agentCtx = ctx
+  session.append('request/context', { provider: 'deepseek', model: 'deepseek-chat', contextWindow: Math.ceil(contextWindow / 0.74 * 0.76) })
+  const before = session.surface.replaceGeneration
+  await agentCtx.waterfall('agent/pre-step', { agent, turn: 3, step: 4, messages: [], signal: new AbortController().signal }, () => Promise.resolve({ kind: 'enter', messages: [] }))
+  assert.equal(session.surface.replaceGeneration, before)
+  session.append('request/context', { provider: 'deepseek', model: 'deepseek-chat', contextWindow })
+  await agentCtx.waterfall('agent/pre-step', { agent, turn: 3, step: 4, messages: [], signal: new AbortController().signal }, () => Promise.resolve({ kind: 'enter', messages: [] }))
+  assert.ok(session.surface.replaceGeneration > before)
+  assert.ok(tokenMeter.measure(session).totalTokens / contextWindow <= 0.55)
+})
+
+test('hard candidates include completed open-turn results but exclude in-flight and recent two steps', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-hard-open', { meta: { cwd: TEST_CWD } })
+  addCompleteTurnWithTool(session, 1, 'closed_result', 'read', 'closed\n'.repeat(100))
+  session.append('turn/start', { turn: 2 })
+  addOpenTurnToolStep(session, 2, 1, 'open_old', 'old\n'.repeat(1000))
+  addOpenTurnToolStep(session, 2, 2, 'open_recent', 'recent')
+  addOpenTurnToolStep(session, 2, 3, 'open_latest', 'latest')
+  addOpenTurnToolStep(session, 2, 4, 'open_running', '', 'read', false)
+  const ids = collectHardResultCandidates(session, tokenMeter).map((c) => c.callId)
+  assert.ok(ids.includes('open_old'))
+  assert.ok(ids.includes('closed_result'))
+  assert.ok(!ids.includes('open_recent'))
+  assert.ok(!ids.includes('open_latest'))
+  assert.ok(!ids.includes('open_running'))
+})
+
+test('hard result archive retains exact recall and never calls ctx.llm', async () => {
+  const { sessions, tokenMeter, ctx } = await createTestHarness()
+  let llmCalls = 0
+  ctx.llm = { stream() { llmCalls++; throw new Error('LLM forbidden') } }
+  const session = sessions.prepare('test-hard-recall', { meta: { cwd: TEST_CWD } })
+  makeHardSession(session, tokenMeter)
+  session.append('request/context', { contextWindow: 10000 })
+  const result = runHardCompaction(session, tokenMeter, { hardTargetRatio: 0.55 })
+  assert.ok(result.resultCount > 0)
+  const recalled = executeRecall(session, { target: '@call:hard_open_1', query: 'open', context_lines: 0 })
+  assert.ok(recalled.text.includes('open'))
+  assert.equal(llmCalls, 0)
+})
+
+test('hard pre-step passes through with compaction lock or missing contextWindow', async () => {
+  const { sessions, tokenMeter, ctx } = await createTestHarness()
+  const session = sessions.prepare('test-hard-guards', { meta: { cwd: TEST_CWD } })
+  const { contextWindow } = makeHardSession(session, tokenMeter)
+  const agentCtx = ctx
+  const enter = () => Promise.resolve({ kind: 'enter', messages: [] })
+  let before = session.surface.replaceGeneration
+  session.append('compaction/start', { turn: 3 })
+  session.append('request/context', { contextWindow })
+  await agentCtx.waterfall('agent/pre-step', { agent: { session }, turn: 3, step: 4, signal: new AbortController().signal }, enter)
+  assert.equal(session.surface.replaceGeneration, before)
+  session.append('compaction/end', { turn: 3 })
+  session.append('request/context', {})
+  await agentCtx.waterfall('agent/pre-step', { agent: { session }, turn: 3, step: 4, signal: new AbortController().signal }, enter)
+  assert.equal(session.surface.replaceGeneration, before)
+})
+
+test('overflow retry shrinks once, preserves unshrinkable errors, and resets on assistant/message', async () => {
+  const { sessions, tokenMeter, ctx } = await createTestHarness()
+  const session = sessions.prepare('test-overflow', { meta: { cwd: TEST_CWD } })
+  makeHardSession(session, tokenMeter)
+  const agent = { session }
+  const agentCtx = ctx
+  const failure = { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'too large' }
+  const terminal = () => Promise.resolve(undefined)
+  const payload = { agent, turn: 3, step: 4, failure, signal: new AbortController().signal }
+  assert.deepEqual(await agentCtx.waterfall('agent/request-error', payload, terminal), { kind: 'retry' })
+  const generation = session.surface.replaceGeneration
+  assert.equal(await agentCtx.waterfall('agent/request-error', payload, terminal), undefined)
+  assert.equal(session.surface.replaceGeneration, generation)
+  session.append('assistant/message', { turn: 3, step: 4, message: { role: 'assistant', content: [{ type: 'text', text: 'progress' }] } }, { surfaceOp: 'append' })
+  session.append('step/end', { turn: 3, step: 4 })
+  addCompleteTurnWithTool(session, 4, 'overflow_new', 'read', 'new\n'.repeat(50000))
+  session.append('request/context', { contextWindow: 1000 })
+  session.append('turn/start', { turn: 5 })
+  addOpenTurnToolStep(session, 5, 1, 'overflow_latest', 'latest\n'.repeat(100))
+  const retry = await agentCtx.waterfall('agent/request-error', { ...payload, turn: 5, step: 1 }, terminal)
+  assert.deepEqual(retry, { kind: 'retry' })
+  const tiny = sessions.prepare('test-overflow-unshrinkable', { meta: { cwd: TEST_CWD } })
+  tiny.append('turn/start', { turn: 1 })
+  tiny.append('user/message', { role: 'user', content: [{ type: 'text', text: 'single unshrinkable message' }] }, { surfaceOp: 'append' })
+  const tinyCtx = ctx
+  assert.equal(await tinyCtx.waterfall('agent/request-error', { agent: { session: tiny }, turn: 1, step: 1, failure, signal: new AbortController().signal }, terminal), undefined)
+})
+
+test('non-overflow failures always delegate unchanged', async () => {
+  const { sessions, ctx } = await createTestHarness()
+  const session = sessions.prepare('test-non-overflow', { meta: { cwd: TEST_CWD } })
+  const agentCtx = ctx
+  let delegated = 0
+  const result = await agentCtx.waterfall('agent/request-error', { agent: { session }, turn: 1, step: 1, failure: { code: 'RATE_LIMIT' }, signal: new AbortController().signal }, () => { delegated++; return Promise.resolve({ kind: 'terminal' }) })
+  assert.deepEqual(result, { kind: 'terminal' })
+  assert.equal(delegated, 1)
+})
+
+test('mergeSummaries cold start anchors at previous closed turn, not new user message', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-cold-anchor', { meta: { cwd: TEST_CWD } })
+  addCompleteTurnWithTool(session, 1, 'cold_anchor_1', 'read', 'one\n'.repeat(300))
+  addCompleteTurnWithTool(session, 2, 'cold_anchor_2', 'read', 'two\n'.repeat(300))
+  const turnEnd = getAllEventsForTest(session).findLast((ev) => ev.type === 'turn/end')
+  const coldNow = (turnEnd.data?.time ?? turnEnd.time) + 300001
+  session.append('turn/start', { turn: 3 })
+  session.append('user/message', { role: 'user', content: [{ type: 'text', text: 'fresh user message' }] }, { surfaceOp: 'append' })
+  const plan = planSpanCompaction(session, tokenMeter, { turns: [1, 2], summary: 'cold closed turns', mergeSummaries: true, now: coldNow }, 1)
+  assert.ok(plan.shadowedSeqs.length > 0)
+})
+
+function getAllEventsForTest(session) { return session.events }
+
+test('startup native-compaction audit is read-only and reports unsafe user presets', async () => {
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-preset-audit-'))
+  try {
+    fs.mkdirSync(path.join(root, 'unsafe'))
+    fs.writeFileSync(path.join(root, 'unsafe', 'agent.cordis.yml'), "- id: compaction-basic\n  name: '@deepseek-ai/dsh-compaction-basic'\n")
+    fs.mkdirSync(path.join(root, 'safe'))
+    fs.writeFileSync(path.join(root, 'safe', 'agent.cordis.yml'), "- id: compaction-basic\n  disabled: true\n")
+    assert.deepEqual(auditNativeCompactionPresets(root), ['unsafe'])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
 
 test('single tool/result compaction + shadow pricing + reload consistency', async () => {
   const { sessions, tokenMeter } = await createTestHarness()
@@ -312,7 +504,7 @@ test('spans compaction + nested compaction + recall + persistence restore', asyn
   const r2 = executeRecall(session, { target: '@turn:2', query: 'beta_anchor_55', context_lines: 1 })
   assert.ok(r2.text.includes('beta_anchor_55'))
 
-  const spanTagMatch = /\[recall:\s*(@span:S\d+-\d+)\]/.exec(nestedOut.text)
+  const spanTagMatch = /\[recall:\s*(@span:S\d+-\d+(?:\+S\d+-\d+)*(?: turns:[\d,..-]+)?)[\]\s]/.exec(nestedOut.text)
   assert.ok(spanTagMatch)
   const rSpan = executeRecall(session, { target: spanTagMatch[1], query: 'gamma_anchor_70', context_lines: 0 })
   assert.ok(rSpan.text.includes('gamma_anchor_70'))
@@ -677,13 +869,11 @@ test('positive multi-turn span compaction of earlier turns + current-turn comple
 
   // Step 2 in Turn 3: stage positive multi-turn span (turn:1..turn:2) AND current-turn completed result (call_p3_done)
   session.append('step/start', { turn: 3, step: 2 })
-  // Span covering current open turn (turn:3) must still be forbidden:
-  await assert.rejects(
-    () => compactTool.execute({
-      spans: [{ from: 'turn:2', to: 'turn:3', summary: 'Should fail on open turn 3' }],
-    }, { callId: 'call_fail_open_span', agent: fakeAgent, signal: ctrl.signal }),
-    /current open turn/
-  )
+  // Span ending at the open turn clamps back to the latest closed turn.
+  const clampedOpenTurn = planSpanCompaction(session, tokenMeter, {
+    from: 'turn:2', to: 'turn:3', summary: 'Open turn clamps back to closed turn 2.',
+  })
+  assert.equal(clampedOpenTurn.resolvedTo, 'turn:2')
 
   const tokensBeforeStage = tokenMeter.measure(session).surfaceTokens
   const stagedRes = await compactTool.execute({
@@ -772,11 +962,16 @@ test('abort retention across turns + next-turn turn-stopping commit + per-sessio
   await emitTurnStopping(agentA, 3, ctrlA3.signal)
   sessionA.append('turn/end', { turn: 3, reason: { kind: 'aborted', reason: 'user interrupted turn 3' } })
 
-  // sessionA must NOT have flushed and must NOT have lost its staged queue on turn/end!
-  assert.equal(tokenMeter.measure(sessionA).surfaceTokens, tokensABeforeAbort, 'aborted turn must not flush compactions')
+  // The observer itself performs zero appends. The microtask commits safely
+  // after turn/end and leaves retries untouched; before it runs queue survives.
+  assert.equal(tokenMeter.measure(sessionA).surfaceTokens, tokensABeforeAbort, 'turn/end observer must not synchronously reenter append')
+  assert.equal(getStagedQueueSnapshot(sessionA).spans.length, 1, 'queue survives inside the event observer')
+  await Promise.resolve()
   const snapAAfterAbort = getStagedQueueSnapshot(sessionA)
-  assert.equal(snapAAfterAbort.spans.length, 1, 'staged span must survive abort + turn/end')
-  assert.equal(snapAAfterAbort.results.length, 1, 'staged result must survive abort + turn/end')
+  assert.equal(snapAAfterAbort.spans.length, 0, `aborted boundary microtask commits staged span: ${JSON.stringify(getGlobalRuntimeState().bySession.get(sessionA)?.lastBoundaryOutcome)}`)
+  assert.equal(snapAAfterAbort.results.length, 0, 'aborted boundary microtask commits staged result')
+  assert.equal(snapAAfterAbort.dropped.length, 0, 'aborted flush does not consume retries/drop items')
+  assert.ok(tokenMeter.measure(sessionA).surfaceTokens < tokensABeforeAbort, 'microtask flush is observable after one microtask checkpoint')
 
   // Complete sessionB Turn 2 normally -> only sessionB flushes
   sessionB.append('step/end', { turn: 2, step: 1 })
@@ -784,7 +979,7 @@ test('abort retention across turns + next-turn turn-stopping commit + per-sessio
   sessionB.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
   assert.ok(tokenMeter.measure(sessionB).surfaceTokens < tokensBBeforeCommit, 'sessionB flushed independently')
   assert.equal(getStagedQueueSnapshot(sessionB).results.length, 0)
-  assert.equal(getStagedQueueSnapshot(sessionA).spans.length, 1, 'sessionA queue untouched by sessionB flush')
+  assert.equal(getStagedQueueSnapshot(sessionA).spans.length, 0, 'sessionA queue was already flushed by its own microtask; sessionB must not duplicate it')
 
   // Now run Turn 4 on sessionA and finish normally -> staged items from aborted Turn 3 commit at Turn 4 turn-stopping!
   const ctrlA4 = new AbortController()
@@ -802,6 +997,27 @@ test('abort retention across turns + next-turn turn-stopping commit + per-sessio
   const msgsA = sessionA.deriveMessages()
   assert.ok(msgsA.some((m) => m.source?.plugin === 'compact' && m.content.some((b) => b.text?.includes('SessionA Turn 1 summary: alpha_12.'))))
   assert.ok(msgsA.some((m) => m.source?.kind === 'tool' && m.content[0].content[0].text.includes('SessionA Turn 2 result: beta_34.')))
+})
+
+test('HMR re-import preserves staged queue and restart recovers uncommitted context_compact call from log', async () => {
+  const { sessions, registeredTools } = await createTestHarness()
+  const session = sessions.prepare('test-hmr-recovery', { meta: { cwd: TEST_CWD } })
+  addCompleteTurnWithTool(session, 1, 'hmr_result', 'read', `HMR ${'x'.repeat(2500)}`)
+  session.append('turn/start', { turn: 2 })
+  const agent = { session }
+  await registeredTools.get('context_compact').execute({ results: [{ callId: 'hmr_result', summary: 'preserved across reload' }] }, { callId: 'hmr_stage', agent, signal: new AbortController().signal })
+  const before = getStagedQueueSnapshot(session)
+  assert.equal(before.results.length, 1)
+  const reloaded = await import(`../lib/index.js?hmr=${Date.now()}`)
+  assert.equal(reloaded.getStagedQueueSnapshot(session).results[0].summary, 'preserved across reload')
+  getGlobalRuntimeState().bySession.delete(session) // simulate process memory loss
+  const recovered = reloaded.getStagedQueueSnapshot(session)
+  assert.equal(recovered.results.length, 0, 'only logged tool/call records can recover after process loss')
+  session.append('tool/call', { turn: 2, step: 1, callId: 'hmr_stage', name: 'context_compact', arguments: JSON.stringify({ results: [{ callId: 'hmr_result', summary: 'preserved across reload' }] }) })
+  getGlobalRuntimeState().bySession.delete(session)
+  const directRecovery = reloaded.recoverStagedFromLog(session)
+  assert.equal(directRecovery?.results?.size, 1)
+  assert.equal(reloaded.getStagedQueueSnapshot(session).results[0]?.summary, 'preserved across reload')
 })
 
 test('flush failure retry retention (max 2 retries, drop & record after exceeding) + re-plan + silent skip when already compacted', async () => {
@@ -1042,6 +1258,7 @@ test('soft watermark auto-hint: (1) silent below watermark; (2) triggers at >=20
   assert.equal(wmBelow.triggered, false, 'should not trigger when turns < 20 and compactableTokens < 60k')
   assert.equal(wmBelow.hint, '')
   assert.equal(buildSoftWatermarkHint(session, tokenMeter), '')
+  assert.equal(directoryCtx.text({ agent: fakeAgent }), '', 'below watermark must not emit a changing runtime-context directory')
   assert.equal(session.events.length, eventsBeforeCheck1, 'must not pollute session.events')
 
   // (2a) Continue to 24 closed turns -> triggers turn-based soft watermark (>= 20 turns), keeps recent 5 (20..24), suggests turn:1..turn:19 + Top 3 callIds
@@ -1070,14 +1287,14 @@ test('soft watermark auto-hint: (1) silent below watermark; (2) triggers at >=20
   )
   assert.ok(wmTriggered.hint.includes('[context-compact 水位提醒: 待压缩池已达软水位（共 24 轮未压缩）'))
   assert.ok(!/~\d+\.\d+k/.test(wmTriggered.hint), 'hint must not contain real-time changing floating-point k numbers')
-  assert.ok(wmTriggered.hint.includes('建议已完成区间: turn:1..turn:19'))
+  assert.ok(wmTriggered.hint.includes('建议已完成区间: from:"auto", to:"turnsBack:1"'))
   assert.ok(wmTriggered.hint.includes('call_wm_2(read,'))
   assert.ok(wmTriggered.hint.includes('call_wm_5(grep,'))
   assert.ok(wmTriggered.hint.includes('call_wm_8(read,'))
 
   const firstContextText = directoryCtx.text({ agent: fakeAgent })
   const firstLatchedHint = buildSoftWatermarkHint(session, tokenMeter)
-  assert.ok(firstContextText.includes('建议已完成区间: turn:1..turn:19'))
+  assert.ok(firstContextText.includes('建议已完成区间: from:"auto", to:"turnsBack:1"'))
   assert.equal(session.events.length, eventsSnapshotBeforeReq, 'session.events must remain completely untouched')
   assert.deepEqual(session.surface.nodes, surfaceSnapshotBeforeReq, 'session.surface.nodes must remain untouched')
 
@@ -1174,7 +1391,7 @@ test('incremental compactableTokens watermark: high baseline (compacted summarie
     { from: wmDeltaTriggered.suggestedSpan.from, to: wmDeltaTriggered.suggestedSpan.to },
     { from: 'turn:7', to: 'turn:12' }
   )
-  assert.ok(wmDeltaTriggered.hint.includes('建议已完成区间: turn:7..turn:12'))
+  assert.ok(wmDeltaTriggered.hint.includes('建议已完成区间: from:"auto", to:"turnsBack:1"'))
   assert.ok(wmDeltaTriggered.hint.includes('call_delta_12(read,'))
 
   // Step 4: Compact turn:7..turn:12 -> compactableTokens drops back to 0 even though surfaceTokens is still >25k!
@@ -1234,4 +1451,704 @@ test('system-prompt snapshots do not inflate watermark and prompt context reuses
   } finally {
     tokenMeter.measure = originalMeasure
   }
+})
+
+function surfaceSeqsForTurns(session, minTurn, maxTurn) {
+  const logInfo = inspectSessionLog(session)
+  const seqs = []
+  for (const seq of session.surface.nodes) {
+    const nt = resolveSurfaceNodeTurns(session, seq, logInfo)
+    if (nt.minTurn >= minTurn && nt.maxTurn <= maxTurn && nt.minTurn > 0) seqs.push(seq)
+  }
+  return seqs
+}
+
+function plantSummaryCheckpoint(session, fromTurn, toTurn, text) {
+  const seqs = surfaceSeqsForTurns(session, fromTurn, toTurn)
+  assert.ok(seqs.length > 0, `expected surface nodes for T${fromTurn}..T${toTurn}`)
+  const nodes = [...session.surface.nodes]
+  const startPos = nodes.indexOf(seqs[0])
+  const endPos = nodes.indexOf(seqs[seqs.length - 1])
+  assert.deepEqual(nodes.slice(startPos, endPos + 1), seqs, 'planted range must be one contiguous surface run')
+  const msg = createUserMessage({
+    content: [{ type: 'text', text }],
+    source: compactCheckpointSource(`plant-${fromTurn}-${toTurn}`),
+  })
+  session.append('user/message', msg, {
+    surfaceOp: { op: 'replace', start: seqs[0], end: seqs[seqs.length - 1] },
+    sourceEventSeqs: seqs,
+  })
+}
+
+test('summary @auto is deterministic, bounded, supports a judgement tail and rejects epoch merge', async () => {
+  const { buildAutoSpanDigest, parseAutoSummary, planSpanCompaction } = await import('../lib/index.js')
+  assert.deepEqual(parseAutoSummary('@auto root cause'), { auto: true, tail: 'root cause' })
+  const session = { events: [], surface: { nodes: [] } }
+  session.events.push({ seq: 0, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'implement protocol' }] } })
+  const digest = buildAutoSpanDigest(session, { eventTurnMap: new Map([[0, 1]]) }, [0])
+  assert(digest.includes('implement protocol') && digest.length <= 300)
+  assert.throws(() => planSpanCompaction(session, { measure: () => ({ nodes: [] }) }, { to: 'turn:1', summary: '@auto', mergeSummaries: true, now: Date.now() + 300000 }), /mergeSummaries/)
+})
+
+test('Pillar 2: closing-turn heavy output auto-compacts and recalls losslessly', async () => {
+  const { sessions, tokenMeter, emitTurnStopping } = await createTestHarness()
+  const session = sessions.prepare('test-pillar2-auto-result', { meta: { cwd: TEST_CWD } })
+  const text = Array.from({ length: 900 }, (_, i) => `AUTO_${i + 1}: unique_anchor_${i + 1} ${'Z'.repeat(40)}`).join('\n')
+  addCompleteTurnWithTool(session, 1, 'call_auto_heavy', 'read', text)
+  assert.ok(tokenMeter.measure(session).nodes.find((n) => n.seq === session.events.findLast((e) => e?.type === 'tool/result')?.seq).tokens >= 4000)
+  const before = tokenMeter.measure(session).surfaceTokens
+  await emitTurnStopping({ id: 'agent-auto', session }, 1, new AbortController().signal)
+  const compacted = session.deriveMessages().find((m) => m.source?.kind === 'tool' && m.source.callId === 'call_auto_heavy')
+  const digest = compacted.content[0].content[0].text
+  assert.ok(digest.startsWith('[Compact-Auto] read ('))
+  assert.ok(digest.includes('AUTO_1:'))
+  assert.ok(digest.includes('AUTO_900:'))
+  assert.ok(digest.includes('[recall: @call:call_auto_heavy]'))
+  assert.ok(tokenMeter.measure(session).surfaceTokens < before)
+  const recall = executeRecall(session, { target: '@call:call_auto_heavy', query: 'unique_anchor_777', context_lines: 0 })
+  assert.ok(recall.text.includes('unique_anchor_777'))
+  assert.ok(session.events.some((e) => e?.type === 'compaction/prune'))
+  await emitTurnStopping({ id: 'agent-auto', session }, 1, new AbortController().signal)
+  assert.equal(session.events.filter((e) => e?.type === 'compaction/prune').length, 1, 'auto archive must be idempotent')
+})
+
+test('Pillar 3: tier cliff guard triggers independently of the normal soft watermark', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-pillar3-tier-cliff', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 14; t++) {
+    const output = Array.from({ length: 110 }, (_, i) => `TIER_${t}_${i}: ${'T'.repeat(300)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_tier_${t}`, 'read', output)
+  }
+  const status = inspectSoftWatermark(session, tokenMeter)
+  assert.ok(status.surfaceTokens >= 112000, `surface=${status.surfaceTokens}`)
+  assert.ok(status.compactableTokens >= 10000, `compactable=${status.compactableTokens}`)
+  assert.equal(status.tierCliffTriggered, true)
+  assert.equal(status.triggered, true)
+  assert.ok(status.hint.includes('[逼近200k计费阶梯]'))
+})
+
+test('Pillar 3: relay_dispatch free-ride lowers watermark and current-turn result is prioritized', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-pillar3-piggyback', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 8; t++) {
+    const output = Array.from({ length: 65 }, (_, i) => `PIG_${t}_${i}: ${'P'.repeat(30)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_pig_${t}`, 'read', output)
+  }
+  session.append('turn/start', { turn: 9 })
+  session.append('step/start', { turn: 9, step: 1 })
+  const baseline = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(baseline.triggered, false)
+  const c = session.append('assistant/chunk', { turn: 9, step: 1, chunk: { type: 'tool-call-delta', index: 0, id: 'call_relay', name: 'relay_dispatch', argumentsDelta: '{}' } })
+  session.append('assistant/message', { turn: 9, step: 1, message: { id: 'a-pig-9', role: 'assistant', source: { kind: 'model' }, content: [{ type: 'tool-call', id: 'call_relay', name: 'relay_dispatch', arguments: '{}' }] } }, { surfaceOp: 'append', sourceEventSeqs: [c.seq] })
+  const call = session.append('tool/call', { turn: 9, step: 1, callId: 'call_relay', name: 'relay_dispatch', arguments: '{}' })
+  session.append('tool/result', { turn: 9, step: 1, message: { id: 'r-relay', role: 'user', source: { kind: 'tool', callId: 'call_relay' }, content: [{ type: 'tool-result', toolCallId: 'call_relay', content: [{ type: 'text', text: `job accepted ${'R'.repeat(7000)}` }] }] } }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+  const status = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(status.freeRide.active, true)
+  assert.equal(status.softWatermarkTokens, 20000)
+  assert.equal(status.softWatermarkTurns, 8)
+  assert.equal(status.triggered, true)
+  assert.equal(status.topCandidates[0].callId, 'call_relay')
+  assert.equal(status.topCandidates[0].currentTurn, true)
+  assert.ok(status.openTurnLargeResults[0].tokens >= 1500)
+  assert.ok(status.hint.includes('Top结果:'))
+  assert.ok(status.hint.includes('当轮'))
+  assert.ok(status.hint.includes('搭便车窗口'))
+})
+
+test('Pillar 3: mergeSummaries creates an L1 epoch with recursive lossless recall', async () => {
+  const { sessions, tokenMeter, registeredTools, emitTurnStopping } = await createTestHarness()
+  const session = sessions.prepare('test-pillar3-epoch', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 10; t++) {
+    const out = Array.from({ length: 60 }, (_, i) => `EPOCH_${t}_${i}: ${'E'.repeat(25)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_epoch_${t}`, 'read', out)
+    commitSpanCompaction(session, tokenMeter, planSpanCompaction(session, tokenMeter, {
+      from: `turn:${t}`, to: `turn:${t}`, summary: `L0 summary turn ${t}; anchor EPOCH_${t}_59.`,
+    }, 1))
+  }
+  const leavesBeforeMerge = new Set(session.events.filter((ev) => ev?.type === 'user/message' && ev.surfaceOp !== 'append').flatMap((ev) => resolveLeafSurfaceSeqs(session.events, [ev.seq])))
+  session.append('turn/start', { turn: 11 })
+  session.append('step/start', { turn: 11, step: 1 })
+  const watermark = inspectSoftWatermark(session, tokenMeter)
+  assert.equal(watermark.summaryNodeCount, 10)
+  assert.equal(watermark.suggestedEpochMerge, null, 'hot cache never suggests an epoch merge')
+  const coldNow = Date.now() + 300000
+  const coldWatermark = inspectSoftWatermark(session, tokenMeter, { now: coldNow })
+  assert.equal(coldWatermark.suggestedEpochMerge.summaryCount, 8)
+  assert.deepEqual({ from: coldWatermark.suggestedEpochMerge.from, to: coldWatermark.suggestedEpochMerge.to }, { from: 'turn:1', to: 'turn:8' })
+  assert.throws(() => planSpanCompaction(session, tokenMeter, { ...watermark, ...coldWatermark.suggestedEpochMerge, summary: 'hot merge rejected' }, 1), /cold start/)
+  const compactTool = registeredTools.get('context_compact')
+  const agent = { id: 'agent-epoch', session }
+  const clock = Date.now
+  Date.now = () => coldNow
+  let staged
+  try {
+    staged = await compactTool.execute({ spans: [{ ...coldWatermark.suggestedEpochMerge, summary: 'L1 epoch turns 1-8.' }] }, { callId: 'call_epoch_merge', agent, signal: new AbortController().signal })
+    assert.ok(staged.text.includes('staged'))
+    session.append('step/end', { turn: 11, step: 1 })
+    await emitTurnStopping(agent, 11, new AbortController().signal)
+  } finally { Date.now = clock }
+
+  const summaryEvents = session.events.filter((e) => e?.type === 'user/message' && e.surfaceOp !== 'append')
+  const l1 = summaryEvents.at(-1)
+  assert.ok(l1.sourceEventSeqs.length > 0)
+  const leavesAfterMerge = new Set(session.events.filter((ev) => ev?.type === 'user/message' && ev.surfaceOp !== 'append' && session.surface.nodes.includes(ev.seq)).flatMap((ev) => resolveLeafSurfaceSeqs(session.events, [ev.seq])))
+  assert.deepEqual(leavesAfterMerge, leavesBeforeMerge, 'dedup preserves every original leaf')
+  assert.equal(session.surface.nodes.filter((seq) => summaryEvents.some((ev) => ev.seq === seq)).length, 3, `eight old L0 nodes leave the surface; new epoch and recent two remain; staged=${staged.text}`)
+  const recalled = executeRecall(session, { target: '@turn:8', query: 'EPOCH_8_59', context_lines: 0 })
+  assert.ok(recalled.text.includes('EPOCH_8_59'))
+  const spanTag = /(@span:S\d+-\d+(?:\+S\d+-\d+)*(?: turns:[\d,..-]+)?)/.exec(session.events[l1.seq].data.content.map((b) => b.text).join('\n'))?.[1]
+  assert.ok(spanTag)
+  assert.ok(executeRecall(session, { target: spanTag, query: 'EPOCH_1_59', context_lines: 0 }).text.includes('EPOCH_1_59'))
+})
+
+
+test('ordinary span compaction absorbs fully covered old summaries without extra model output', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-ordinary-dedup', { meta: { cwd: TEST_CWD } })
+  for (let turn = 1; turn <= 3; turn++) addCompleteTurnWithTool(session, turn, `ordinary_${turn}`, 'read', `ORDINARY_${turn} ${'x'.repeat(1800)}`)
+  commitSpanCompaction(session, tokenMeter, planSpanCompaction(session, tokenMeter, { from: 'turn:1', to: 'turn:1', summary: 'ordinary L0 one' }, 1))
+  const firstSeq = session.surface.nodes.find((seq) => session.events[seq]?.type === 'user/message' && session.events[seq]?.surfaceOp !== 'append')
+  const epoch = planSpanCompaction(session, tokenMeter, { from: 'turn:1', to: 'turn:2', summary: 'owner covers old summary', mergeSummaries: true, now: Date.now() + 300000 }, 1)
+  commitSpanCompaction(session, tokenMeter, { ...epoch, now: Date.now() + 300000 })
+  session.surface.nodes.unshift(firstSeq)
+  const retainedBefore = session.surface.nodes.filter((seq) => seq !== firstSeq)
+  assert(session.surface.nodes.includes(firstSeq), 'fixture retains a non-adjacent covered duplicate')
+  const redundant = planSpanCompaction(session, tokenMeter, { from: 'turn:3', to: 'turn:3', summary: 'ordinary new span absorbs duplicate' }, 1)
+  assert(redundant.redundantSummarySeqs.includes(firstSeq))
+  assert(redundant.clusters.some((cluster) => cluster.seqs.length === 1 && cluster.seqs[0] === firstSeq))
+  commitSpanCompaction(session, tokenMeter, redundant)
+  assert(!session.surface.nodes.includes(firstSeq))
+  for (const seq of retainedBefore.filter((seq) => !redundant.shadowedSeqs.includes(seq))) assert(session.surface.nodes.includes(seq), `unrelated surface seq ${seq} survives independent prune`)
+  assert(session.events[firstSeq], 'append-only original checkpoint remains recallable')
+  assert(executeRecall(session, { target: '@turn:1', query: 'ORDINARY_1', context_lines: 0 }).returnedLines > 0)
+})
+
+test('conclude eligibility admits only a successfully persisted context_compact sibling', () => {
+  const session = { events: [], seq: 4 }
+  session.events[1] = { seq: 1, type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [
+    { type: 'text', text: 'Dispatched; compression committed.' },
+    { type: 'tool-call', id: 'compact-sibling', name: 'context_compact', arguments: '{}' },
+    { type: 'tool-call', id: 'dispatch-self', name: 'relay_dispatch', arguments: '{}' },
+  ] } } }
+  session.events[2] = { seq: 2, type: 'tool/call', data: { callId: 'compact-sibling', name: 'context_compact' } }
+  const exec = { agent: { phase: { kind: 'running', turn: 1, step: 1 } } }
+  assert.equal(checkConcludeTurnEligibility(session, exec, 'dispatch-self', ['context_compact']).canConclude, false)
+  session.events[3] = { seq: 3, type: 'tool/result', data: { message: { isError: true, source: { callId: 'compact-sibling' }, content: [{ type: 'tool-result', isError: true, content: [{ type: 'text', text: 'failed' }] }] } } }
+  assert.equal(checkConcludeTurnEligibility(session, exec, 'dispatch-self', ['context_compact']).reason, 'sibling-tool-not-successful')
+  session.events[3].data.message.isError = false
+  session.events[3].data.message.content[0].isError = false
+  const allowed = checkConcludeTurnEligibility(session, exec, 'dispatch-self', ['context_compact'])
+  assert.equal(allowed.canConclude, true, JSON.stringify(allowed))
+  session.events[3] = undefined
+  assert.equal(checkConcludeTurnEligibility(session, exec, 'dispatch-self').reason, 'other-tool-calls')
+})
+
+test('small read_image results auto-archive after two turns and stay recallable', async () => {
+  const { sessions, tokenMeter, registeredTools, emitTurnStopping } = await createTestHarness()
+  const session = sessions.prepare('test-image-auto-archive', { meta: { cwd: TEST_CWD } })
+  addCompleteTurnWithTool(session, 1, 'image_call', 'read_image', 'tiny')
+  addCompleteTurnWithTool(session, 2, 'recent_text', 'read', 'keep this recent result')
+  session.append('turn/start', { turn: 3 })
+  session.append('step/start', { turn: 3, step: 1 })
+  const watermark = inspectSoftWatermark(session, tokenMeter, { keepRecentTurns: 5 })
+  assert.ok(watermark.topCandidates.some((candidate) => candidate.callId === 'image_call'))
+  assert.ok(watermark.outsideSpanLargeResultTokens > 0)
+  const ctrl = new AbortController()
+  session.append('step/end', { turn: 3, step: 1 })
+  session.append('turn/end', { turn: 3, reason: { kind: 'completed' } })
+  await emitTurnStopping({ id: 'agent-image', session }, 3, ctrl.signal)
+  const derived = session.deriveMessages().find((m) => m.source?.callId === 'image_call')
+  assert.match(derived.content[0].content[0].text, /\[Compact-Auto\].*read_image.*\[recall: @call:image_call\]/)
+  assert.ok(!JSON.stringify(derived).includes('tiny'))
+  assert.ok(executeRecall(session, { target: '@call:image_call', query: 'tiny', context_lines: 0 }).text.includes('tiny'))
+  assert.ok(session.surface.nodes.some((seq) => session.events[seq]?.data?.message?.source?.callId === 'recent_text'))
+})
+
+test('deterministic summary dedup handles subsets, equal sets and partial overlap', async () => {
+  const { findRedundantSummaryCheckpoints } = await import('../lib/index.js')
+  const events = [
+    { seq: 0, type: 'user/message', surfaceOp: 'append' },
+    { seq: 1, type: 'user/message', surfaceOp: 'append' },
+    { seq: 2, type: 'user/message', surfaceOp: 'append' },
+    { seq: 3, type: 'user/message', surfaceOp: { op: 'replace' }, sourceEventSeqs: [0], data: { source: { kind: 'plugin', plugin: 'compact' } } },
+    { seq: 4, type: 'user/message', surfaceOp: { op: 'replace' }, sourceEventSeqs: [0, 1], data: { source: { kind: 'plugin', plugin: 'compact' } } },
+    { seq: 5, type: 'user/message', surfaceOp: { op: 'replace' }, sourceEventSeqs: [0], data: { source: { kind: 'plugin', plugin: 'compact' } } },
+    { seq: 6, type: 'user/message', surfaceOp: { op: 'replace' }, sourceEventSeqs: [1, 2], data: { source: { kind: 'plugin', plugin: 'compact' } } },
+  ]
+  const session = { events, surface: { nodes: [3, 4, 5, 6] } }
+  assert.deepEqual(findRedundantSummaryCheckpoints(session), [3, 5])
+  assert.deepEqual(findRedundantSummaryCheckpoints(session, [4]), [3, 5])
+})
+
+test('sandwiched island turns stay in the compactable watermark pool', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-island-watermark', { meta: { cwd: TEST_CWD } })
+
+  for (let t = 1; t <= 5; t++) {
+    const out = Array.from({ length: 30 }, (_, i) => `ISL_EARLY_${t}_${i}: ${'E'.repeat(24)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_isl_early_${t}`, 'read', out)
+  }
+  commitSpanCompaction(session, tokenMeter, planSpanCompaction(session, tokenMeter, {
+    from: 'turn:1',
+    to: 'turn:5',
+    summary: 'Turns 1-5 checkpoint.',
+  }, 1))
+
+  for (const t of [6, 7]) {
+    const out = Array.from({ length: 80 }, (_, i) => `ISL_T${t}_${i}: ${'I'.repeat(48)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_isl_${t}`, 'read', out)
+  }
+  for (let t = 8; t <= 10; t++) {
+    addCompleteTurnWithTool(session, t, `call_isl_mid_${t}`, 'read', `mid ${t} ${'M'.repeat(60)}`)
+  }
+  plantSummaryCheckpoint(session, 8, 10, 'Turns 8-10 checkpoint planted after the T6-T7 island.')
+  for (let t = 11; t <= 15; t++) {
+    addCompleteTurnWithTool(session, t, `call_isl_tail_${t}`, 'read', 'short tool output < 500t')
+  }
+
+  const wm = inspectSoftWatermark(session, tokenMeter)
+  assert.deepEqual(wm.islandTurns, [6, 7])
+  assert.deepEqual(wm.islandSpans, [{ from: 'turn:6', to: 'turn:7' }])
+  assert.equal(wm.uncompactedClosedTurns, 7, 'island T6-T7 plus protected tail T11-T15')
+  assert.equal(wm.compactableTurns, 2, 'keepRecent tail must not hide the sandwiched island')
+  assert.equal(wm.triggered, false)
+  assert.equal(wm.reason, 'warm-island-suppressed')
+  assert.equal(wm.warmIslandSuppressed, true)
+  assert.equal(wm.suggestedSpan.from, 'turn:6')
+  assert.equal(wm.suggestedSpan.to, 'turn:7')
+  assert.equal(wm.hint, '')
+  const coldIsland = inspectSoftWatermark(session, tokenMeter, { now: Date.now() + 300001 })
+  assert.equal(coldIsland.triggered, true)
+  assert.equal(coldIsland.reason, 'islands')
+  assert.ok(coldIsland.hint.includes('待补压孤岛区间: turn:6..turn:7'))
+
+  const logInfo = inspectSessionLog(session)
+  const priced = new Map(tokenMeter.measure(session).nodes.map((n) => [n.seq, n.tokens]))
+  let islandTokens = 0
+  for (const seq of session.surface.nodes) {
+    const ev = session.events[seq]
+    const nt = resolveSurfaceNodeTurns(session, seq, logInfo)
+    if (ev?.surfaceOp === 'append' && (nt.minTurn === 6 || nt.minTurn === 7)) {
+      islandTokens += priced.get(seq) ?? 0
+    }
+  }
+  assert.ok(islandTokens > 0)
+  assert.equal(wm.spanCompactableTokens, islandTokens)
+  assert.equal(wm.compactableTokens, islandTokens)
+})
+
+test('planSpanCompaction auto-bridges the preceding island and keeps the summary prefix immutable', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-island-bridge', { meta: { cwd: TEST_CWD } })
+
+  for (let t = 1; t <= 10; t++) {
+    const out = Array.from({ length: 70 }, (_, i) => `BR_${t}_${i}: ${'B'.repeat(36)}`).join('\n')
+    addCompleteTurnWithTool(session, t, `call_br_${t}`, 'read', out)
+  }
+  const committedPrefix = commitSpanCompaction(session, tokenMeter, planSpanCompaction(session, tokenMeter, {
+    from: 'turn:1',
+    to: 'turn:5',
+    summary: 'Turns 1-5 immutable prefix.',
+  }, 1))
+  const prefixSeq = committedPrefix.replaceEventSeq
+  const prefixBefore = structuredClone(session.events[prefixSeq])
+  const t6Seqs = surfaceSeqsForTurns(session, 6, 6)
+  assert.ok(t6Seqs.length > 0)
+
+  const plan = planSpanCompaction(session, tokenMeter, {
+    from: 'turn:7',
+    to: 'turn:10',
+    summary: 'Bridge T6 into the T7-T10 span.',
+  }, 1)
+  assert.equal(plan.resolvedFrom, 'turn:6')
+  assert.equal(plan.resolvedTo, 'turn:10')
+  for (const seq of t6Seqs) {
+    assert.ok(plan.shadowedSeqs.includes(seq), `T6 seq ${seq} must be bridged into T7..T10`)
+  }
+  assert.ok(!plan.shadowedSeqs.includes(prefixSeq))
+
+  const snapped = planSpanCompaction(session, tokenMeter, {
+    from: 'turn:3',
+    to: 'turn:10',
+    summary: 'Start landed inside the existing summary.',
+  }, 1)
+  assert.equal(snapped.resolvedFrom, 'turn:6')
+  assert.equal(snapped.resolvedTo, 'turn:10')
+  assert.ok(!snapped.shadowedSeqs.includes(prefixSeq))
+
+  const committed = commitSpanCompaction(session, tokenMeter, plan)
+  assert.deepEqual(session.events[prefixSeq], prefixBefore, 'historical summary bytes must stay immutable')
+  assert.ok(session.surface.nodes.includes(prefixSeq))
+  assert.equal(session.surface.nodes[0], prefixSeq, 'summary prefix stays at the surface head')
+  for (const seq of t6Seqs) {
+    assert.ok(!session.surface.nodes.includes(seq))
+  }
+  assert.ok(session.surface.nodes.includes(committed.replaceEventSeq))
+  assert.ok(committed.shadowedSeqs.includes(t6Seqs[0]))
+  assert.ok(!committed.shadowedSeqs.includes(prefixSeq))
+})
+
+test('v3 from auto starts at turn 1, then the physical turn after latest checkpoint', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-v3-auto', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 5; t++) addCompleteTurnWithTool(session, t, `v3_auto_${t}`, 'read', `AUTO_${t} ${'x'.repeat(1200)}`)
+  const initial = planSpanCompaction(session, tokenMeter, { from: 'auto', to: 'turn:2', summary: 'Initial auto range.' }, 1)
+  assert.equal(initial.resolvedFrom, 'turn:1')
+  commitSpanCompaction(session, tokenMeter, initial)
+  const next = planSpanCompaction(session, tokenMeter, { from: 'latest-compacted', to: 'turn:4', summary: 'Next physical uncompacted turns.' }, 1)
+  assert.equal(next.resolvedFrom, 'turn:3')
+  assert.ok(!next.shadowedSeqs.includes(session.surface.nodes[0]))
+  assert.equal(planSpanCompaction(session, tokenMeter, { to: 'turn:4', summary: 'Omitted from means auto.' }, 1).resolvedFrom, 'turn:3')
+})
+
+test('v3 global history search traverses nested checkpoints and deduplicates leaves', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-v3-index', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 4; t++) addCompleteTurnWithTool(session, t, `v3_idx_${t}`, 'read', `GLOBAL_NEEDLE_${t} ${'x'.repeat(1200)}`)
+  commitSpanCompaction(session, tokenMeter, planSpanCompaction(session, tokenMeter, { from: 'turn:1', to: 'turn:2', summary: 'L0 global search.', }, 1))
+  commitSpanCompaction(session, tokenMeter, { ...planSpanCompaction(session, tokenMeter, { from: 'turn:1', to: 'turn:3', summary: 'L1 global search.', mergeSummaries: true, now: Date.now() + 300000 }, 1), now: Date.now() + 300000 })
+  for (const target of ['@index', '@all', '@search']) {
+    const hit = executeRecall(session, { target, query: 'GLOBAL_NEEDLE_1', context_lines: 0 })
+    assert.equal(hit.returnedLines > 0, true)
+    assert.equal((hit.text.match(/\d+: GLOBAL_NEEDLE_1/g) || []).length, 1)
+    assert.ok(hit.text.includes('@call:v3_idx_1') && hit.text.includes('@span:S') && hit.text.includes('turn:1'))
+  }
+  const page = executeRecall(session, { target: '@index', query: 'GLOBAL_NEEDLE', context_lines: 0, line_range: [1, 2] })
+  assert.equal(page.hasMore, true)
+  assert.deepEqual(page.nextLineRange, [3, page.totalLines])
+})
+
+test('v3 idle system-prompt observation commits staged work after five minutes', async () => {
+  const { sessions, tokenMeter, registeredTools, promptContexts } = await createTestHarness()
+  const session = sessions.prepare('test-v3-idle', { meta: { cwd: TEST_CWD } })
+  addCompleteTurnWithTool(session, 1, 'v3_idle_1', 'read', `IDLE_OLD ${'x'.repeat(1500)}`)
+  session.append('turn/start', { turn: 2 })
+  const agent = { session }
+  const tool = registeredTools.get('context_compact')
+  const staged = await tool.execute({ results: [{ callId: 'v3_idle_1', summary: 'idle flush' }] }, { callId: 'v3_idle_stage', agent, signal: new AbortController().signal })
+  assert.ok(staged.text.includes('staged'))
+  session.append('assistant/message', { turn: 2, step: 1, time: Date.now() - 301000, message: { role: 'assistant', content: [{ type: 'text', text: 'idle boundary' }] } }, { surfaceOp: 'append' })
+  const context = promptContexts.get('context-compact:directory')
+  context.text({ agent })
+  assert.equal(getStagedQueueSnapshot(session).results.length, 0)
+  assert.equal(session.surface.nodes.some((seq) => session.events[seq].surfaceOp !== 'append'), true)
+})
+
+function bulkyNeedleOutput(turn, needle, lines = 80) {
+  return Array.from({ length: lines }, (_, i) => `T${turn}_L${i + 1}: ${needle}_${i + 1} ${'X'.repeat(30)}`).join('\n')
+}
+
+function surfaceTextBlob(session) {
+  return session.deriveMessages().map((m) => JSON.stringify(m)).join('\n')
+}
+
+function surfaceSeqsForTurn(session, turn) {
+  const logInfo = inspectSessionLog(session)
+  return session.surface.nodes.filter((seq) => resolveSurfaceNodeTurns(session, seq, logInfo).turns.has(turn))
+}
+
+function checkpointMessages(session) {
+  return session.deriveMessages().filter((m) => m.source?.plugin === 'compact')
+}
+
+test('cold-wake hook flushes staged work and archives the latest closed heavy result', async () => {
+  const { sessions, tokenMeter, registeredTools } = await createTestHarness()
+  const session = sessions.prepare('test-cold-wake', { meta: { cwd: TEST_CWD } })
+  const big = Array.from({ length: 900 }, (_, i) => `COLD_${i}: ${'C'.repeat(40)}`).join('\n')
+  addCompleteTurnWithTool(session, 1, 'cold_wake_big', 'read', big)
+  session.append('turn/start', { turn: 2 })
+  const agent = { session }
+  const tool = registeredTools.get('context_compact')
+  await tool.execute({ results: [{ callId: 'cold_wake_big', summary: 'staged cold-wake digest' }] }, { callId: 'cold_stage', agent, signal: new AbortController().signal })
+  assert.equal(getStagedQueueSnapshot(session).results.length, 1)
+  const hook = globalThis[Symbol.for('dsh.context-compact.hooks.v1')]?.flushBeforeColdWake
+  assert.equal(typeof hook, 'function')
+  const result = await hook(session.id, Date.now())
+  assert.equal(result.flushed, true)
+  assert.equal(getStagedQueueSnapshot(session).results.length, 0)
+  assert.equal(isResultAlreadyCompacted(session, 'cold_wake_big').compacted, true)
+  assert.equal(executeRecall(session, { target: '@call:cold_wake_big', query: 'COLD_899', context_lines: 0 }).returnedLines, 1)
+})
+
+test('spans[].turns parsers: number, turn:, range, turnsBack vs latest closed, duplicates, open-turn drop', async () => {
+  const { sessions } = await createTestHarness()
+  const session = sessions.prepare('test-turns-parse', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 5; t++) addCompleteTurnWithTool(session, t, `parse_${t}`, 'read', bulkyNeedleOutput(t, `PARSE_${t}`))
+
+  const closedLog = inspectSessionLog(session)
+  assert.equal(closedLog.openTurn, null)
+  assert.equal(latestClosedTurn(closedLog), 5)
+  assert.deepEqual(parseTurnsToken('turnsBack:1', latestClosedTurn(closedLog)), [5])
+  assert.deepEqual(parseTurnsToken('turnsBack:3', latestClosedTurn(closedLog)), [3])
+  assert.deepEqual(resolveSpanTurns({ turns: ['turnsBack:1'] }, closedLog), [5])
+
+  session.append('turn/start', { turn: 6 })
+  session.append('step/start', { turn: 6, step: 1 })
+  const openLog = inspectSessionLog(session)
+  assert.equal(openLog.openTurn, 6)
+  assert.equal(latestClosedTurn(openLog), 5)
+  assert.deepEqual(parseTurnsToken(226, 5), [226])
+  assert.deepEqual(parseTurnsToken('226', 5), [226])
+  assert.deepEqual(parseTurnsToken('turn:226', 5), [226])
+  assert.deepEqual(parseTurnsToken('235..237', 5), [235, 236, 237])
+  assert.deepEqual(parseTurnsToken('turn:235..turn:237', 5), [235, 236, 237])
+  assert.deepEqual(parseTurnsToken('turnsBack:1', 5), [5])
+  assert.deepEqual(parseTurnsToken('turnsBack:3', 5), [3])
+  assert.deepEqual(
+    resolveSpanTurns({ turns: [2, 2, '2..3', 'turn:2', 'turnsBack:3', 6] }, openLog),
+    [2, 3],
+  )
+  assert.throws(() => resolveSpanTurns({ turns: [6] }, openLog), /open turn/)
+  assert.throws(() => parseTurnsToken('turnsBack:0', 5), /must be >= 1/)
+  assert.throws(() => parseTurnsToken('237..235', 5), /start 237 > end 235/)
+  assert.throws(() => parseTurnsToken('nope', 5), /unrecognized turns selector/)
+  assert.throws(() => parseTurnsToken('turnsBack:99', 5), /resolves to turn/)
+})
+
+test('non-contiguous spans[].turns keeps unselected turns; span/index recall is exact', async () => {
+  const { sessions, tokenMeter } = await createTestHarness()
+  const session = sessions.prepare('test-turns-noncontiguous', { meta: { cwd: TEST_CWD } })
+
+  const needles = {
+    1: 'KEEP_T1',
+    2: 'COMPACT_T2',
+    3: 'KEEP_T3',
+    4: 'COMPACT_T4',
+    5: 'COMPACT_T5',
+    6: 'KEEP_T6',
+    7: 'COMPACT_T7',
+    8: 'KEEP_T8',
+  }
+  for (let t = 1; t <= 8; t++) {
+    addCompleteTurnWithTool(session, t, `nc_${t}`, 'read', bulkyNeedleOutput(t, needles[t]))
+  }
+
+  const t3Before = surfaceSeqsForTurn(session, 3)
+  const t6Before = surfaceSeqsForTurn(session, 6)
+  assert.ok(t3Before.length > 0 && t6Before.length > 0)
+
+  session.append('turn/start', { turn: 9 })
+  session.append('step/start', { turn: 9, step: 1 })
+
+  const plan = planSpanCompaction(session, tokenMeter, {
+    turns: [2, '4..5', 'turn:7'],
+    summary: 'Non-contiguous T2+T4-5+T7 checkpoint.',
+  }, 1)
+
+  assert.deepEqual(plan.resolvedTurns, [2, 4, 5, 7])
+  assert.equal(plan.resolvedFrom, 'turn:2')
+  assert.equal(plan.resolvedTo, 'turn:7')
+  assert.equal(plan.to, 'turn:7')
+  assert.ok(plan.clusters.length >= 3, 'selected turns are non-contiguous clusters')
+  assert.ok(plan.recallTag.includes('+'), 'three or fewer physical ranges retain legacy format')
+  const targetSet = new Set(plan.compactedSeqs)
+  assert.equal(plan.sourceEventSeqs.length, plan.compactedSeqs.length)
+
+  const logInfo = inspectSessionLog(session)
+  for (const seq of plan.compactedSeqs) {
+    const turns = resolveSurfaceNodeTurns(session, seq, logInfo).turns
+    assert.equal([...turns].every((t) => [2, 4, 5, 7].includes(t)), true, `seq ${seq} must belong to selected turns`)
+    assert.equal(session.events[seq].surfaceOp, 'append')
+  }
+  for (const keepTurn of [3, 6]) {
+    for (const seq of surfaceSeqsForTurn(session, keepTurn)) {
+      assert.equal(targetSet.has(seq), false, `unselected turn ${keepTurn} seq ${seq} must not be compacted`)
+    }
+  }
+
+  const tokensBefore = tokenMeter.measure(session).surfaceTokens
+  const committed = commitSpanCompaction(session, tokenMeter, plan)
+  const tokensAfter = tokenMeter.measure(session).surfaceTokens
+  assert.ok(tokensAfter < tokensBefore)
+  assert.ok(committed.savings > 0)
+  const blob = surfaceTextBlob(session)
+  assert.ok(blob.includes('KEEP_T3'), 'Turn 3 must remain on the surface')
+  assert.ok(blob.includes('KEEP_T6'), 'Turn 6 must remain on the surface')
+  assert.ok(blob.includes('KEEP_T1') && blob.includes('KEEP_T8'))
+  assert.ok(!blob.includes('COMPACT_T2_1'), 'Turn 2 original body must leave the surface')
+  assert.ok(!blob.includes('COMPACT_T4_1'))
+  assert.ok(!blob.includes('COMPACT_T5_1'))
+  assert.ok(!blob.includes('COMPACT_T7_1'))
+  assert.ok(blob.includes('KEEP_T3_1') && blob.includes('KEEP_T6_1'))
+
+  const t3After = surfaceSeqsForTurn(session, 3)
+  const t6After = surfaceSeqsForTurn(session, 6)
+  assert.deepEqual(t3After, t3Before)
+  assert.deepEqual(t6After, t6Before)
+
+  const checkpoints = checkpointMessages(session)
+  assert.equal(checkpoints.length, 1)
+  for (const msg of session.deriveMessages()) {
+    assert.ok(Array.isArray(msg.content) && msg.content.length > 0, `derived message ${msg.id} must have non-empty content (no content: [] tombstones)`)
+    for (const block of msg.content) {
+      if (block.type === 'text') assert.ok(typeof block.text === 'string' && block.text.trim().length > 0)
+    }
+  }
+  const summaryText = checkpoints[0].content.map((b) => b.text ?? '').join('\n')
+  assert.ok(summaryText.includes('<compacted-summary>'))
+  const cpIndex = session.surface.nodes.indexOf(committed.replaceEventSeq)
+  assert.ok(session.surface.nodes.slice(cpIndex + 1).includes(t3Before[0]), 'summary must precede retained island')
+  const tombstones = session.surface.nodes.map((seq) => session.events[seq]).filter((ev) => ev.data?.source?.plugin === 'context-compact-elide')
+  assert.equal(tombstones.length, plan.clusters.length - 1)
+  assert.ok(tombstones.every((ev) => ev.data.content.length > 0 && ev.data.content[0].text.includes('summarized above')))
+  const claims = session.events.filter((ev) => ev?.type === 'compaction/summary' || ev?.type === 'compaction/prune')
+  for (const claim of claims.filter((ev) => ev.data?.compactionId === committed.compactionId || ev.seq > committed.startEventSeq && ev.seq < committed.endEventSeq)) {
+    assert.equal(session.events[claim.seq + 1].surfaceOp.start, claim.data.shadowedRange.start)
+    assert.equal(session.events[claim.seq + 1].surfaceOp.end, claim.data.shadowedRange.end)
+  }
+  assert.ok(summaryText.includes('Non-contiguous T2+T4-5+T7 checkpoint.'))
+  const spanTag = /@span:S\d+-\d+(?:\+S\d+-\d+)*(?: turns:[\d,..-]+)?/.exec(summaryText)?.[0]
+  assert.ok(spanTag)
+  assert.ok(committed.recallTag.includes('+'))
+
+  const spanRecall = executeRecall(session, { target: spanTag, query: 'COMPACT_T', context_lines: 0 })
+  assert.ok(executeRecall(session, { target: spanTag, query: 'COMPACT_T2_1', context_lines: 0 }).text.includes('COMPACT_T2_1'))
+  assert.ok(executeRecall(session, { target: spanTag, query: 'COMPACT_T4_1', context_lines: 0 }).text.includes('COMPACT_T4_1'))
+  assert.ok(executeRecall(session, { target: spanTag, query: 'COMPACT_T5_1', context_lines: 0 }).text.includes('COMPACT_T5_1'))
+  assert.ok(executeRecall(session, { target: spanTag, query: 'COMPACT_T7_1', context_lines: 0 }).text.includes('COMPACT_T7_1'))
+  assert.equal(executeRecall(session, { target: spanTag, query: 'KEEP_T3_', context_lines: 0 }).returnedLines, 0)
+  assert.equal(executeRecall(session, { target: spanTag, query: 'KEEP_T6_', context_lines: 0 }).returnedLines, 0)
+  assert.equal(executeRecall(session, { target: spanTag, query: 'KEEP_T1_', context_lines: 0 }).returnedLines, 0)
+  assert.equal(executeRecall(session, { target: spanTag, query: 'KEEP_T8_', context_lines: 0 }).returnedLines, 0)
+  assert.ok(spanRecall.returnedLines > 0)
+  const recalledTurns = new Set()
+  for (const seq of spanRecall.leafSeqs) {
+    const t = inspectSessionLog(session).eventTurnMap.get(seq)
+    if (t) recalledTurns.add(t)
+  }
+  assert.deepEqual([...recalledTurns].sort((a, b) => a - b), [2, 4, 5, 7])
+
+  const indexAll = executeRecall(session, { target: '@index', query: 'COMPACT_T2_', context_lines: 0 })
+  const indexTurns = new Set()
+  for (const seq of indexAll.leafSeqs) {
+    const t = inspectSessionLog(session).eventTurnMap.get(seq)
+    if (t) indexTurns.add(t)
+  }
+  assert.deepEqual([...indexTurns].sort((a, b) => a - b), [2, 4, 5, 7])
+  for (const [needle, expectHit] of [
+    ['COMPACT_T2_', true],
+    ['COMPACT_T4_', true],
+    ['COMPACT_T5_', true],
+    ['COMPACT_T7_', true],
+    ['KEEP_T3_', false],
+    ['KEEP_T6_', false],
+    ['KEEP_T1_', false],
+    ['KEEP_T8_', false],
+  ]) {
+    const hit = executeRecall(session, { target: '@index', query: needle, context_lines: 0 })
+    assert.equal(new RegExp(`\\d+: .*${needle}`).test(hit.text), expectHit, `@index ${needle}`)
+  }
+
+  const restored = sessions.prepare(session.id, {
+    seed: structuredClone(session.events),
+    meta: structuredClone(session.header),
+    seedSource: 'persistence',
+  })
+  assert.deepEqual(restored.surface.nodes, session.surface.nodes)
+  assert.deepEqual(restored.deriveMessages(), session.deriveMessages())
+  assert.equal(tokenMeter.measure(restored).surfaceTokens, tokenMeter.measure(session).surfaceTokens)
+  const restoredRecall = executeRecall(restored, { target: spanTag, query: 'COMPACT_T5_10', context_lines: 0 })
+  assert.ok(restoredRecall.text.includes('COMPACT_T5_10'))
+  assert.equal(executeRecall(restored, { target: spanTag, query: 'KEEP_T3_', context_lines: 0 }).returnedLines, 0)
+})
+
+test('spans[].turns skips open turn, existing summaries unless mergeSummaries, and equivalent selectors', async () => {
+  const { sessions, tokenMeter, registeredTools, emitTurnStopping } = await createTestHarness()
+  const session = sessions.prepare('test-turns-boundaries', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 5; t++) {
+    addCompleteTurnWithTool(session, t, `bd_${t}`, 'read', bulkyNeedleOutput(t, `BOUND_${t}`))
+  }
+
+  commitSpanCompaction(session, tokenMeter, planSpanCompaction(session, tokenMeter, {
+    from: 'turn:3', to: 'turn:3', summary: 'Pre-existing T3 checkpoint.',
+  }, 1))
+
+  session.append('turn/start', { turn: 6 })
+  session.append('step/start', { turn: 6, step: 1 })
+
+  assert.throws(
+    () => planSpanCompaction(session, tokenMeter, { turns: [6], summary: 'Open only.' }, 1),
+    /open turn/,
+  )
+  assert.throws(
+    () => planSpanCompaction(session, tokenMeter, { summary: 'Neither to nor turns.' }, 1),
+    /requires to or turns/,
+  )
+  assert.throws(
+    () => planSpanCompaction(session, tokenMeter, { turns: [2], summary: '   ' }, 1),
+    /non-empty string/,
+  )
+
+  const skipped = planSpanCompaction(session, tokenMeter, {
+    turns: [2, 3, 4, 6],
+    summary: 'Skip T3 summary and open T6.',
+  }, 1)
+  assert.deepEqual(skipped.resolvedTurns, [2, 3, 4])
+  const skipLog = inspectSessionLog(session)
+  for (const seq of skipped.compactedSeqs) {
+    const ev = session.events[seq]
+    assert.equal(ev.surfaceOp, 'append')
+    assert.equal(ev.data?.source?.plugin === 'compact', false)
+    const turns = [...resolveSurfaceNodeTurns(session, seq, skipLog).turns]
+    assert.equal(turns.some((t) => t === 3 && ev.type === 'user/message' && ev.surfaceOp !== 'append'), false)
+    assert.ok(turns.every((t) => t !== 6))
+  }
+  assert.equal(skipped.compactedSeqs.some((seq) => session.events[seq].data?.source?.plugin === 'compact'), false)
+
+  const viaRange = planSpanCompaction(session, tokenMeter, {
+    turns: ['turn:2..turn:2', '4..4'],
+    to: 'turn:4',
+    summary: 'Equivalent range tokens.',
+  }, 1)
+  const viaMixed = planSpanCompaction(session, tokenMeter, {
+    turns: [2, 'turn:4'],
+    summary: 'Equivalent mixed tokens.',
+  }, 1)
+  assert.deepEqual(viaRange.resolvedTurns, [2, 4])
+  assert.deepEqual(viaMixed.resolvedTurns, [2, 4])
+  assert.equal(isSameSpanTarget(viaRange, viaMixed), true)
+
+  const dupPlan = planSpanCompaction(session, tokenMeter, {
+    turns: [2, 2, '2..2', 'turn:2'],
+    summary: 'Duplicate targets collapse.',
+  }, 1)
+  assert.deepEqual(dupPlan.resolvedTurns, [2])
+
+  commitSpanCompaction(session, tokenMeter, skipped)
+  const blob = surfaceTextBlob(session)
+  assert.ok(blob.includes('Pre-existing T3 checkpoint'), 'existing T3 summary stays when mergeSummaries is not set')
+  assert.ok(blob.includes('BOUND_3_') === false || blob.includes('Pre-existing T3 checkpoint'))
+  const t3StillSummary = session.surface.nodes.some((seq) => {
+    const ev = session.events[seq]
+    return ev?.data?.source?.plugin === 'compact' && JSON.stringify(ev.data).includes('Pre-existing T3 checkpoint')
+  })
+  assert.equal(t3StillSummary, true)
+
+  const merged = planSpanCompaction(session, tokenMeter, {
+    turns: [2, 3, 4],
+    mergeSummaries: true, now: Date.now() + 300000,
+    summary: 'L1 merge including T3 checkpoint.',
+  }, 1)
+  assert.ok(merged.compactedSeqs.some((seq) => session.events[seq]?.data?.source?.plugin === 'compact'))
+
+  const compactTool = registeredTools.get('context_compact')
+  const ctrl = new AbortController()
+  const stageSession = sessions.prepare('test-turns-stage', { meta: { cwd: TEST_CWD } })
+  for (let t = 1; t <= 4; t++) addCompleteTurnWithTool(stageSession, t, `st_${t}`, 'read', bulkyNeedleOutput(t, `STAGE_${t}`))
+  stageSession.append('turn/start', { turn: 5 })
+  stageSession.append('step/start', { turn: 5, step: 1 })
+  const staged = await compactTool.execute({
+    spans: [{ turns: [1, '3..3'], summary: 'Staged non-contiguous 1+3.' }],
+  }, { callId: 'call_turns_stage', agent: { id: 'agent-stage', session: stageSession }, signal: ctrl.signal })
+  assert.ok(staged.text.includes('staged'))
+  const snap = getStagedQueueSnapshot(stageSession)
+  assert.equal(snap.spans.length, 1)
+  assert.deepEqual(snap.spans[0].resolvedTurns, [1, 3])
+  stageSession.append('step/end', { turn: 5, step: 1 })
+  await emitTurnStopping({ id: 'agent-stage', session: stageSession }, 5, ctrl.signal)
+  const stagedBlob = surfaceTextBlob(stageSession)
+  assert.ok(stagedBlob.includes('STAGE_2_1'), 'unselected Turn 2 remains after flush')
+  assert.ok(stagedBlob.includes('STAGE_4_1'), 'unselected Turn 4 remains after flush')
+  assert.ok(!stagedBlob.includes('STAGE_1_1'))
+  assert.ok(!stagedBlob.includes('STAGE_3_1'))
 })

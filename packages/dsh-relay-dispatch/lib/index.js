@@ -8,9 +8,10 @@
 export const name = '@dsh-external/dsh-relay-dispatch'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { execFile } from 'node:child_process'
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 export const inject = ['tools']
 export const PREPARE_SYM = Symbol.for('relay-dispatch.prepare')
@@ -34,6 +35,8 @@ const DEFAULTS = {
   wakeDelayMs: 300, // 后台 job 结算后检查主会话 idle 未消费通知并补唤醒的延时（毫秒）
   maxConsecutiveWakes: 15, // 插件侧连续自动唤醒主会话的安全上限
   maxConcurrentTasks: 4, // v2 聚合派发的同时运行子任务上限
+  resumeDelayMs: 2500, // 启动后延时接管最近 4 小时内分离的 v2 流水线
+  resumeWindowMs: 4 * 60 * 60 * 1000,
   manifestDir: undefined, // v2 清单目录；缺省 ~/.dsh/relay-pipelines，测试可覆盖
   llmTitle: false, // v2 默认只做确定性标题，不额外调用 LLM
   defaultProvider: 'copilot',
@@ -54,6 +57,13 @@ let seq = 0
 function sameDir(a, b) {
   const n = (p) => String(p).replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase()
   return n(a) === n(b)
+}
+
+function isUpstreamBlockedOutput(text) {
+  const s = String(text || '').trim()
+  if (/^Request blocked by Anthropic\b/i.test(s)) return true
+  if (/(?:^|\n)\s*Error:\s*(?:RetriableError:\s*)?\[(?:unavailable|internal|deadline_exceeded|resource_exhausted)\]\s*HTTP\s*(?:429|50\d)\b/i.test(s) && !/\bstatus:\s*(?:done|blocked)\b/i.test(s)) return true
+  return false
 }
 
 function textOf(content) {
@@ -91,17 +101,51 @@ function clip(s, max) {
   return `${text.slice(0, max)}\n…[已截断，原文 ${text.length} 字符；需要全文可用 get_run 查看]`
 }
 
-/** 通知用结论：assistantText 按字符硬截断到 max（含省略标记）以内。 */
+export function squeezeNotificationText(text) {
+  return String(text ?? '').replace(/(?:\r?\n\s*){3,}/g, '\n\n')
+}
+
+/** 预算内保留头 35% / 尾 65%；切点不破坏 Unicode 码点。 */
+export function headTailPreview(text, max, unit = 'chars') {
+  const source = squeezeNotificationText(text)
+  const measure = (s) => unit === 'bytes' ? Buffer.byteLength(s, 'utf8') : Array.from(s).length
+  if (measure(source) <= max) return source
+  const omitted = Array.from(source).length
+  let marker = `\n...[中间省略 ${omitted} 字]...\n`
+  if (measure(marker) >= max) return Array.from(source).slice(-Math.max(1, max)).join('')
+  const fit = (budget, tail) => {
+    const units = Array.from(source)
+    let out = '', used = 0
+    const seq = tail ? [...units].reverse() : units
+    for (const value of seq) {
+      const size = measure(value)
+      if (used + size > budget) break
+      out = tail ? value + out : out + value
+      used += size
+    }
+    return out
+  }
+  // Recompute the omitted count once: its digits are part of the fixed budget.
+  let remaining = max - measure(marker)
+  let head = fit(Math.floor(remaining * 0.35), false)
+  let tail = fit(remaining - measure(head), true)
+  const actualOmitted = Math.max(0, omitted - Array.from(head + tail).length)
+  marker = `\n...[中间省略 ${actualOmitted} 字]...\n`
+  remaining = max - measure(marker)
+  head = fit(Math.floor(remaining * 0.35), false)
+  tail = fit(remaining - measure(head), true)
+  return head + marker + tail
+}
+
+/** 通知用结论：先压平空行，超长时保住末尾交付块。 */
 export function conclusion(snap, max = 2000) {
   const t = snap && (snap.assistantText || snap.finalText || snap.result)
   const text = typeof t === 'string' ? t : t == null ? '' : JSON.stringify(t)
-  if (!text) return snap && snap.error ? String(snap.error).slice(0, max) : '(无)'
-  if (text.length <= max) return text
-  const mark = '…[已截断]'
-  return text.slice(0, max - mark.length) + mark
+  if (!text) return snap && snap.error ? headTailPreview(snap.error, max) : '(无)'
+  return headTailPreview(text, max)
 }
 
-export const DETAIL_BUDGET_BYTES = 3000
+export const DETAIL_BUDGET_BYTES = 5000
 const byteLen = (s) => Buffer.byteLength(s, 'utf8')
 
 /** 按 UTF-8 字节预算截取前缀；不切码点/代理对，Intl.Segmenter 可用时不切字素。 */
@@ -139,9 +183,8 @@ export function buildDelivery(status, text, budget = DETAIL_BUDGET_BYTES, fullTe
   }
   const hint = avail ? '以下仅为预览；完整原文请调用 job_output 获取' : '以下仅为预览（完整原文不可用）'
   const head = `${st}\ntruncated=1 full_length=${fullLength} chars (${byteLen(s)} bytes) ${hint}\n---\n`
-  const mark = '\n…[预览已截断]'
-  const preview = truncateUtf8(s, budget - byteLen(head) - byteLen(mark))
-  return { detail: head + preview + mark, finalText: preview, truncated: true, fullLength, fullTextAvailable: avail }
+  const preview = headTailPreview(s, Math.max(1, budget - byteLen(head)), 'bytes')
+  return { detail: head + preview, finalText: preview, truncated: true, fullLength, fullTextAvailable: avail }
 }
 
 /** detail：头部元信息（状态/标记/读取指引）在预览之前，总 UTF-8 字节 <= budget。 */
@@ -158,25 +201,96 @@ export function summarize(snap, maxChars) {
   return lines.join('\n')
 }
 
+/** 各 Provider 的默认主力模型映射（当只指定 provider 未指定 model 时优先匹配，防止拼出 kimi/claude-sonnet-5.5 等跨厂假模型）。 */
+export const PROVIDER_DEFAULT_MODELS = {
+  kimi: 'kimi-k3.1-pro',
+  cursor: 'grok-4.7-fast',
+  copilot: 'claude-fable-5.2',
+  'google-vertex': 'gemini-4-argon',
+  google: 'gemini-3.8-flash',
+}
+
+/** 判断 targetPath 是否位于 workspace 目录内（或就是 workspace 本身）。 */
+function pathHasDotDshSegment(key) {
+  return key.split('/').includes('.dsh')
+}
+
+export function isPathInsideWorkspace(workspace, targetPath) {
+  if (!workspace || !targetPath) return true
+  const wsKey = writePathKey(resolve(String(workspace)))
+  const tpKey = writePathKey(resolve(String(workspace), String(targetPath)))
+  if (!wsKey || !tpKey) return true
+  if (pathHasDotDshSegment(tpKey) && !pathHasDotDshSegment(wsKey)) return false
+  if (wsKey === tpKey) return true
+  const wsPrefix = wsKey.endsWith('/') ? wsKey : `${wsKey}/`
+  return tpKey.startsWith(wsPrefix)
+}
+
 /** 补全 startArgs 默认值（纯函数，便于测试）。显式传入的字段永不覆盖。 */
 export function fillStartArgs(input, config = DEFAULTS, review = false) {
   const a = { ...(input || {}) }
   const ws = a.workspace
   if (a.provider == null && config.defaultProvider) a.provider = config.defaultProvider
-  if (a.model == null && config.defaultModel) a.model = config.defaultModel
+  if (a.model == null) {
+    const provKey = typeof a.provider === 'string' ? a.provider.trim().toLowerCase() : ''
+    const defaultProvKey = typeof config.defaultProvider === 'string' ? config.defaultProvider.trim().toLowerCase() : ''
+    if (provKey && provKey !== defaultProvKey && PROVIDER_DEFAULT_MODELS[provKey]) {
+      a.model = PROVIDER_DEFAULT_MODELS[provKey]
+    } else if (config.defaultModel) {
+      a.model = config.defaultModel
+    } else if (provKey && PROVIDER_DEFAULT_MODELS[provKey]) {
+      a.model = PROVIDER_DEFAULT_MODELS[provKey]
+    }
+  }
   if (a.authorizationBasis == null) a.authorizationBasis = 'explicit-user-request'
   if (a.sessionMode == null && a.sessionId == null && config.defaultSessionMode) a.sessionMode = config.defaultSessionMode
   if (!review && a.agentPreset == null && config.defaultAgentPreset) a.agentPreset = config.defaultAgentPreset
   if (ws) {
     if (a.reviewTargets == null) a.reviewTargets = [ws]
-    if (a.contextReadScope == null) a.contextReadScope = [ws]
     const writable = review ? false : (a.permissionPreset === 'workspace-write' || a.permissionPreset === 'danger-full-access')
+    if (writable && Array.isArray(a.writeScope) && a.writeScope.length > 0) {
+      const hasOutside = a.writeScope.some((p) => !isPathInsideWorkspace(ws, p))
+      if (hasOutside) {
+        if (a.permissionPreset === 'workspace-write') a.permissionPreset = 'danger-full-access'
+      }
+    }
     if (writable && a.writeScope == null) a.writeScope = [ws]
+    // Harness Relay accepts registered workspaces only in contextReadScope. Preserve the
+    // complete policy separately: compileCapabilityManifest unions write roots back in.
+    if (a.contextReadScope == null) a.contextReadScope = [ws]
+    else a.contextReadScope = a.contextReadScope.filter((p) => isPathInsideWorkspace(ws, p))
+    if (!a.contextReadScope.length) a.contextReadScope = [ws]
   }
   if (!review && a.permissionPreset === 'danger-full-access' && a.confirmedDangerousPermission == null) a.confirmedDangerousPermission = true
   return a
 }
 
+/** Only the host-facing relay payload is narrowed; the immutable capability manifest is compiled first. */
+export function sanitizeStartRunArgs(input, review = false) {
+  const a = { ...(input || {}) }
+  const ws = a.workspace
+  if (!ws) return a
+  if (!review && [a.writeScope, a.contextReadScope].some((scope) => Array.isArray(scope) && scope.some((p) => !isPathInsideWorkspace(ws, p)))) {
+    a.permissionPreset = 'danger-full-access'
+    a.confirmedDangerousPermission = true
+  }
+  if (Array.isArray(a.writeScope)) {
+    a.writeScope = a.writeScope.filter((p) => isPathInsideWorkspace(ws, p))
+    if (!a.writeScope.length) a.writeScope = [ws]
+  }
+  if (Array.isArray(a.contextReadScope)) {
+    a.contextReadScope = a.contextReadScope.filter((p) => isPathInsideWorkspace(ws, p))
+    if (!a.contextReadScope.length) a.contextReadScope = [ws]
+  }
+  return a
+}
+
+export async function flushBeforeColdWake(parentSessionId) {
+  if (!parentSessionId) return false
+  const hook = globalThis[Symbol.for('dsh.context-compact.hooks.v1')]?.flushBeforeColdWake
+  if (typeof hook !== 'function') return false
+  try { await hook(parentSessionId); return true } catch { return false }
+}
 
 // ───────── 派发模式（dispatch-modes.yaml 热读）─────────
 const MODES_PATH = join(homedir(), '.dsh', 'dispatch-modes.yaml')
@@ -235,9 +349,17 @@ export function loadModes(path = MODES_PATH, readFn = readFileSync) {
   try {
     const modes = parseModesYaml(readFn(path, 'utf8'))
     const aliases = extractAliases(modes)
+    const roots = extractRoots(modes.roots)
+    const hosts = isPlainObject(modes.hosts) ? { ...modes.hosts } : {}
+    const mechCommands = Array.isArray(modes.mechCommands?.prefixes) ? modes.mechCommands.prefixes : ['npm test', 'npm --prefix', 'node --test', 'node test/unit.mjs']
+    const targets = isPlainObject(modes.targets) ? { ...modes.targets } : null
     delete modes.aliases
+    delete modes.roots
+    delete modes.mechCommands
+    delete modes.hosts
+    delete modes.targets
     if (!Object.keys(modes).length) throw new Error('文件中没有任何模式')
-    return { modes, aliases }
+    return { modes, aliases, roots, hosts, mechCommands, targets }
   } catch (e) {
     return { modes: BUILTIN_MODES, warning: `dispatch-modes.yaml 读取失败（${(e && e.message) || e}），已回退到插件内置默认模式` }
   }
@@ -291,13 +413,23 @@ export function applyMode(modeCfg, input, aliases = {}) {
   if (modeCfg.checkpoint) parts.push('检查点：任务较长，完成第一阶段后在会话里写一句简短进度，再继续。')
   if (modeCfg.deliverable && String(modeCfg.deliverable).trim()) parts.push(String(modeCfg.deliverable).trim())
   if (parts.length) a.task = parts.join('\n\n')
+  const modeList = (Array.isArray(modeCfg.models) ? modeCfg.models : []).map((s) => {
+    s = al(s)
+    const i = String(s).indexOf('/')
+    return i > 0 ? { provider: s.slice(0, i), model: s.slice(i + 1) } : null
+  }).filter(Boolean)
   let candidates = []
   if (a.provider == null && a.model == null) {
-    candidates = (Array.isArray(modeCfg.models) ? modeCfg.models : []).map((s) => {
-      s = al(s)
-      const i = String(s).indexOf('/')
-      return i > 0 ? { provider: s.slice(0, i), model: s.slice(i + 1) } : null
-    }).filter(Boolean)
+    candidates = modeList
+  } else if (a.provider != null && a.model == null) {
+    const provLower = String(a.provider).trim().toLowerCase()
+    const matched = modeList.filter((c) => c.provider.toLowerCase() === provLower)
+    if (matched.length > 0) {
+      a.model = matched[0].model
+      candidates = matched
+    } else if (PROVIDER_DEFAULT_MODELS[provLower]) {
+      a.model = PROVIDER_DEFAULT_MODELS[provLower]
+    }
   }
   return { args: a, candidates }
 }
@@ -629,6 +761,80 @@ function isPlainObject(v) {
   return Boolean(v && typeof v === 'object' && !Array.isArray(v))
 }
 
+const ROOT_ID = /[^A-Za-z0-9_.-]/g
+function rootId(prefix, value, index) {
+  const raw = String(value || 'root').replace(ROOT_ID, '-').slice(-100)
+  return `${prefix}${index + 1}:${raw || 'root'}`
+}
+function rootList(paths, prefix, workspace) {
+  const values = Array.isArray(paths) ? paths : [workspace]
+  return values.map((path, index) => ({ root_id: rootId(prefix, path, index), canonical_path: resolve(workspace, String(path)) }))
+}
+
+/** Canonical, deterministic policy representation used by both dispatcher and gate. */
+export function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+}
+
+/**
+ * Compile immutable, static child capabilities. This is policy metadata, not an OS sandbox;
+ * ExecBroker remains responsible for final-handle and process isolation.
+ */
+export function compileCapabilityManifest(args, options = {}) {
+  if (!isPlainObject(args) || typeof args.workspace !== 'string' || !args.workspace.trim()) throw new Error('capability manifest requires workspace')
+  const now = options.now ?? Date.now()
+  const issuedAt = typeof now === 'number' ? now : Date.parse(now)
+  const ttlMs = options.ttlMs ?? 240 * 60 * 1000
+  if (!Number.isFinite(issuedAt) || !Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error('invalid capability validity')
+  const writable = ['workspace-write', 'danger-full-access'].includes(args.permissionPreset)
+  const writePaths = writable ? (Array.isArray(args.writeScope) ? args.writeScope : [args.workspace]) : []
+  const readPaths = [...new Set([
+    ...(Array.isArray(args.contextReadScope) ? args.contextReadScope : []),
+    args.workspace,
+    ...(options.readScope || []),
+    ...writePaths,
+  ])]
+  const role = options.role || (options.review ? 'reviewer' : (writable ? 'implementer' : 'investigator'))
+  const manifest = {
+    schema_version: 'capability/v1',
+    task_id: options.taskId || randomUUID(),
+    parent_session: options.parentSession || null,
+    role,
+    issued_at: new Date(issuedAt).toISOString(),
+    expires_at: new Date(issuedAt + ttlMs).toISOString(),
+    allowed_roots: rootList(readPaths, 'ws', args.workspace),
+    read_roots: rootList(readPaths, 'ws', args.workspace),
+    write_roots: rootList(writePaths, 'write', args.workspace),
+    write_scope: [...writePaths],
+    permission_preset: args.permissionPreset || 'read-only',
+    agent_preset: args.agentPreset || null,
+    role_boundaries: {
+      may_write: writable,
+      may_dispatch: false,
+      may_change_permissions: false,
+      allowed_tools: options.allowedTools || ['read', 'glob', 'grep', 'edit', 'write', 'pwsh'],
+    },
+    forbidden_ports: [3080],
+    loopback_ports: [3080, 4098, 4141, 8318],
+    protected_host_processes: ['dsh', 'kimi-bridge', 'kimi-bridge-v2'],
+    protected_process_rules: { no_kill: true, no_restart: true, no_port_probe: true },
+    exec_profiles: [...new Set(options.execProfiles || [])],
+    network: 'none',
+    escalation: 'forbidden',
+    nested_dispatch: { enabled: false, max_depth: 0 },
+    deny_budget: 8,
+  }
+  const unsigned = canonicalJson(manifest)
+  const complete = { ...manifest, policy_digest: `sha256:${createHash('sha256').update(unsigned).digest('hex')}` }
+  for (const value of Object.values(complete)) {
+    if (Array.isArray(value)) { for (const item of value) if (item && typeof item === 'object') Object.freeze(item); Object.freeze(value) }
+    else if (value && typeof value === 'object') Object.freeze(value)
+  }
+  return Object.freeze(complete)
+}
+
 /** 仅用于写范围比较：统一斜杠、去尾部斜杠，Windows/盘符路径忽略大小写。 */
 export function writePathKey(raw) {
   let p = String(raw == null ? '' : raw).trim().replace(/[\\/]+/g, '/')
@@ -656,11 +862,268 @@ export function writeScopesOverlap(a, b) {
   return left.some((x) => right.some((y) => writePathsOverlap(x, y)))
 }
 
+/** 内置根与 yaml roots 仅来自可信配置；调用参数不能新增宏。 */
+export function extractRoots(raw) {
+  const roots = {}
+  for (const [name, value] of Object.entries(raw || {})) {
+    if (!/^[A-Za-z][\w-]*$/.test(name) || typeof value !== 'string' || !isAbsolute(value) || /[\s;&|`$<>"']/.test(value)) throw new Error(`roots.${name} 必须是无空格/shell 元字符的绝对路径`)
+    roots[name] = resolve(value).replace(/\\/g, '/')
+  }
+  return roots
+}
+
+export function expandPathMacro(value, roots = {}, workspace) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error('路径必须是非空字符串')
+  const text = value.trim()
+  const match = /^@([\w-]+)(?:\/(.*))?$/.exec(text)
+  if (match) {
+    const root = match[1] === 'ws' ? workspace : match[1] === 'dsh' ? join(homedir(), '.dsh') : match[1] === 'plugins' ? join(homedir(), '.dsh', 'plugins') : roots[match[1]]
+    if (!root) throw new Error(`未知路径宏 @${match[1]}`)
+    const result = resolve(root, match[2] || '')
+    if (!isPathInsideWorkspace(root, result)) throw new Error(`路径宏越界：${text}`)
+    return result
+  }
+  if (/^@/.test(text)) throw new Error(`无效路径宏：${text}`)
+  return isAbsolute(text) ? resolve(text) : resolve(workspace || process.cwd(), text)
+}
+
+export function expandTextMacros(text, roots = {}, workspace) {
+  const map = { ...roots, dsh: join(homedir(), '.dsh'), plugins: join(homedir(), '.dsh', 'plugins'), ...(workspace ? { ws: workspace } : {}) }
+  return String(text ?? '').replace(/@@([\w-]+)\//g, '\0$1/').replace(/(^|[\s'"`=])@([\w-]+)\/([^\s'"`;|&<>]*)/g, (all, lead, name, tail) => {
+    if (!Object.prototype.hasOwnProperty.call(map, name)) return all
+    return lead + expandPathMacro(`@${name}/${tail}`, map, workspace).replace(/\\/g, '/')
+  }).replace(/\0([\w-]+)\//g, '@$1/')
+}
+
+export function expandTargets(input, modesInfo = {}) {
+  const args = { ...input }
+  const top = args.targets == null ? [] : args.targets
+  if (!Array.isArray(top) || top.some((x) => typeof x !== 'string' || !x.trim())) throw new Error('targets 必须是插件名字符串数组')
+  const tasks = args.tasks == null ? null : args.tasks
+  if (tasks != null && !Array.isArray(tasks)) return args
+  if (!top.length && !(tasks || []).some((t) => t?.targets != null)) return args
+  if (args.followUp) throw new Error('targets 不支持 followUp；续修沿用原计划')
+  if (top.length && tasks?.length > 1) throw new Error('多任务顶层 targets 不允许；请在各 task 内声明 targets')
+  const template = modesInfo.targets
+  if (!template) throw new Error('DSH_E_TARGET_CONFIG: dispatch-modes.yaml 缺少 targets 段')
+  const names = Array.isArray(template.names) ? template.names : []
+  const overrides = {}
+  for (const line of Array.isArray(template.overrides) ? template.overrides : []) {
+    const m = String(line).match(/^([\w-]+)\.([A-Za-z]+)=(.*)$/)
+    if (!m || !['source', 'mirrors', 'files', 'test', 'minTests', 'reload'].includes(m[2])) throw new Error(`无效 targets override：${line}`)
+    ;(overrides[m[1]] ||= {})[m[2]] = m[3]
+  }
+  const configFor = (name) => {
+    if (!names.includes(name)) throw Object.assign(new Error(`DSH_E_TARGET_UNKNOWN: ${name}；可用：${names.join(', ')}`), { code: 'DSH_E_TARGET_UNKNOWN' })
+    const raw = { ...template, ...overrides[name] }
+    const list = (v) => (Array.isArray(v) ? v : String(v || '').split(',').map((x) => x.trim()).filter(Boolean))
+    const replace = (v) => String(v).replaceAll('{name}', name)
+    const source = replace(raw.source || '')
+    const mirrors = list(raw.mirrors).map(replace)
+    const files = list(raw.files).map(replace)
+    if (!source || !mirrors.length || !files.length || !raw.test) throw new Error(`targets.${name} 缺少 source/mirrors/files/test`)
+    return { source, mirrors, files, test: replace(raw.test), minTests: raw.minTests ? Number(raw.minTests) : undefined, reload: replace(raw.reload || `dsh-${name}`) }
+  }
+  const expanded = []
+  const one = (rawNames) => {
+    const out = { syncTargets: [], checks: [], writeScope: [], reloadPlugins: [] }
+    for (const name of rawNames) {
+      const cfg = configFor(name)
+      for (const file of cfg.files) for (const mirror of cfg.mirrors) {
+        out.syncTargets.push({ source: `${cfg.source}/${file}`, target: `${mirror}/${file}`, mode: 'copy' })
+      }
+      for (const file of cfg.files) out.checks.push({ sha: [`${cfg.source}/${file}`, ...cfg.mirrors.map((m) => `${m}/${file}`)] })
+      out.checks.push({ cmd: cfg.test, ...(cfg.minTests ? { minTests: cfg.minTests } : {}) })
+      out.writeScope.push(cfg.source, ...cfg.mirrors)
+      if (cfg.reload !== 'none') out.reloadPlugins.push(cfg.reload)
+    }
+    return out
+  }
+  const merge = (target, ext) => {
+    const oldSync = Array.isArray(target.syncTargets) ? target.syncTargets : []
+    target.syncTargets = [...oldSync]
+    for (const item of ext.syncTargets) if (!target.syncTargets.some((x) => x.source === item.source && x.target === item.target)) target.syncTargets.push(item)
+    const gate = isPlainObject(target.gate) ? { ...target.gate } : { llm: 'never' }
+    gate.checks = Array.isArray(gate.checks) ? [...gate.checks] : []
+    for (const item of ext.checks) if (!gate.checks.some((x) => JSON.stringify(x) === JSON.stringify(item))) gate.checks.push(item)
+    target.gate = gate
+    target.writeScope = [...new Set([...(Array.isArray(target.writeScope) ? target.writeScope : []), ...ext.writeScope])]
+    expanded.push(...ext.writeScope)
+    return ext.reloadPlugins
+  }
+  let reload = [...(args.reloadPlugins || [])]
+  if (tasks) {
+    args.tasks = tasks.map((task, i) => {
+      const requested = task?.targets != null ? task.targets : top
+      if (requested == null) return task
+      if (!Array.isArray(requested) || requested.some((x) => typeof x !== 'string')) throw new Error(`tasks[${i}].targets 必须是字符串数组`)
+      const t = { ...task, startArgs: { ...(task.startArgs || {}) } }
+      const ext = one(requested)
+      const explicitSync = Array.isArray(task.syncTargets) ? task.syncTargets : Array.isArray(args.syncTargets) ? args.syncTargets : []
+      const mergedSync = [...explicitSync]
+      for (const item of ext.syncTargets) if (!mergedSync.some((x) => x.source === item.source && x.target === item.target)) mergedSync.push(item)
+      t.syncTargets = mergedSync
+      const explicitGate = task.gate || args.gate
+      const gate = isPlainObject(explicitGate) ? { ...explicitGate } : { llm: 'never' }
+      gate.checks = Array.isArray(gate.checks) ? [...gate.checks] : []
+      for (const item of ext.checks) if (!gate.checks.some((x) => JSON.stringify(x) === JSON.stringify(item))) gate.checks.push(item)
+      t.gate = gate
+      reload.push(...merge(t.startArgs, ext))
+      if (Object.keys(t.startArgs).some((k) => ['workspace', 'task', 'provider', 'model', 'writeScope', 'contextReadScope'].includes(k))) {
+        Object.assign(t, t.startArgs)
+        t.startArgs = {}
+      }
+      return t
+    })
+  } else if (top.length) {
+    args.startArgs = { ...(args.startArgs || {}) }
+    reload.push(...merge(args.startArgs, one(top)))
+  }
+  args.reloadPlugins = [...new Set(reload)]
+  args.targetWriteScope = [...new Set(expanded)]
+  return args
+}
+
+export function concludeRequested(exec) {
+  const events = exec?.agent?.session?.events
+  if (!Array.isArray(events) || exec?.signal?.aborted) return { ok: false, reason: exec?.signal?.aborted ? 'C6 已取消' : 'C3 无会话事件' }
+  let message
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]
+    if (['step/end', 'turn/end', 'step/start', 'turn/start'].includes(e?.type)) break
+    if (e?.type === 'assistant/message') { message = e; break }
+  }
+  if (!message) return { ok: false, reason: 'C3 当前步无助手消息' }
+  const phase = exec.agent?.phase
+  if ((message.turn != null && phase?.turn != null && message.turn !== phase.turn) || (message.step != null && phase?.step != null && message.step !== phase.step)) return { ok: false, reason: 'C3 消息不属于当前步' }
+  const content = message.data?.message?.content ?? message.content ?? message.data?.content ?? []
+  if (!Array.isArray(content) || !content.some((b) => b?.type === 'text' && String(b.text || '').trim())) return { ok: false, reason: 'C3 助手文字为空' }
+  const sibling = [...content.filter((b) => b?.type === 'tool-call').map((b) => b.name), ...events.filter((e) => e?.type === 'tool/call' && e.seq > (message.seq ?? -1)).map((e) => e.data?.name)]
+    .filter((n) => n && !['relay_dispatch', 'context_compact'].includes(n))
+  if (sibling.length) return { ok: false, reason: `C4 非白名单工具：${[...new Set(sibling)].join(',')}` }
+  return { ok: true, content, events, message }
+}
+
+export async function finishConclude(exec, notes = [], options = {}) {
+  if (notes.length) return 'C5 有派发警告'
+  const state = concludeRequested(exec)
+  if (!state.ok) return state.reason
+  const names = state.content.filter((b) => b?.type === 'tool-call').map((b) => b.name)
+  const compact = state.events.filter((e) => e?.type === 'tool/call' && e.data?.name === 'context_compact').map((e) => e.data?.callId || e.data?.id).filter(Boolean)
+  if (names.includes('context_compact') || compact.length) {
+    const deadline = Date.now() + (options.timeoutMs ?? 50)
+    let result
+    while (Date.now() <= deadline) {
+      result = [...state.events].reverse().find((e) => {
+        if (e?.type !== 'tool/result') return false
+        if (e.data?.name === 'context_compact') return true
+        const callId = e.data?.callId || e.data?.id || e.data?.message?.callId || e.data?.message?.id
+        return Boolean(callId && compact.includes(callId))
+      })
+      if (result) break
+      await new Promise((r) => setTimeout(r, options.intervalMs ?? 5))
+    }
+    if (!result) return 'C4 context_compact 超时未完成'
+    const data = result.data?.message ?? result.data ?? {}
+    const text = (Array.isArray(data.content) ? data.content : []).map((b) => b?.text || '').join('\n')
+    if (data.status === 'error' || data.isError || /^(?:Error:|Invalid)/.test(text.trim())) return 'C4 context_compact 执行失败'
+  }
+  if (exec?.signal?.aborted) return 'C6 已取消'
+  if (typeof exec?.concludeTurn !== 'function') return '宿主不支持 concludeTurn'
+  exec.concludeTurn()
+  return ''
+}
+
+function sensitivePath(path) { return /(?:^|[\\/])(?:\.env(?:\..*)?|\.credentials\.yaml|secrets?)(?:[\\/]|$)/i.test(path) }
+
+/** Infer external read roots from literal paths; sensitive paths are never propagated. */
+export function inferScopes(text, checks = [], ctx = {}) {
+  const sources = [text, ...(Array.isArray(checks) ? checks : []).map((c) => c?.cmd || '')]
+  const readRoots = [], notes = []
+  const add = (raw) => {
+    let value = String(raw || '').trim().replace(/^["'`([{]+|["'`),;，。、；：\]）}]+$/g, '').replace(/\\/g, '/')
+    if (!value) return
+    if (sensitivePath(value)) { notes.push(`dropped_sensitive: ${value}`); return }
+    if (/^~[\\/]/.test(value)) value = join(homedir(), value.slice(2)).replace(/\\/g, '/')
+    else if (/^(?:\$env:USERPROFILE|%USERPROFILE%)/i.test(value)) value = join(homedir(), value.replace(/^(?:\$env:USERPROFILE|%USERPROFILE%)[\\/]?/i, '')).replace(/\\/g, '/')
+    else if (/^@plugins[\\/]/i.test(value)) value = join(homedir(), '.dsh', 'plugins', value.slice(8)).replace(/\\/g, '/')
+    else if (/^@dsh[\\/]/i.test(value)) value = join(homedir(), '.dsh', value.slice(5)).replace(/\\/g, '/')
+    else if (/^@[\w-]+[\\/]/.test(value)) {
+      const name = value.match(/^@([\w-]+)/)[1]
+      if (ctx.roots?.[name]) value = join(ctx.roots[name], value.slice(name.length + 2)).replace(/\\/g, '/')
+      else return
+    }
+    if (!isAbsolute(value)) return
+    if (/^[A-Za-z]:\/?$/.test(value) || sameDir(value, homedir())) throw Object.assign(new Error(`DSH_E_SCOPE_INFER_TOO_BROAD: ${value}`), { code: 'DSH_E_SCOPE_INFER_TOO_BROAD' })
+    let root = value
+    try { if (existsSync(value) && statSync(value).isFile()) root = dirname(value) } catch {}
+    if (/\.[A-Za-z0-9]+$/.test(value)) root = dirname(value)
+    readRoots.push(root)
+  }
+  for (const source of sources) for (const match of String(source || '').matchAll(/(?:\$env:USERPROFILE|%USERPROFILE%|~)[\\/][^\s'"`，。、；：]+|@[\w-]+\/[^\s'"`，。、；：]+|[A-Za-z]:[\\/][^\s'"`]*|(?:^|[\s=(])\/(?:Users|home)\/[^\s'"`，。、；：]+/g)) add(match[0].replace(/^[\s=(]/, ''))
+  const hosts = new Set(), loopbackPorts = new Set()
+  for (const source of sources) {
+    const text = String(source || '')
+    for (const match of text.matchAll(/\b(?:ssh|scp)\s+(?:-[^\s]+\s+)*(?:([\w.-]+)@)?([\w.-]+\.[\w.-]+)/gi)) hosts.add(match[2])
+    for (const match of text.matchAll(/\b(?:127\.0\.0\.1|localhost):(\d{1,5})\b/gi)) loopbackPorts.add(Number(match[1]))
+  }
+  return { readRoots, hosts: [...hosts], loopbackPorts: [...loopbackPorts], notes }
+}
+
+function gateError(code, index, reason) {
+  throw Object.assign(new Error(`${code}: gate.checks[${index}].cmd ${reason}；建议：改用 npm --prefix <dir> test 或目录参数`), { code })
+}
+
+/** Reject non-literal gate commands before a child run, and deterministically expand test globs. */
+export function lintMechanicalChecks(checks, ctx = {}) {
+  return (checks || []).map((input, index) => {
+    const check = { ...input }
+    if (check.exit != null && !Number.isInteger(check.exit)) gateError('DSH_E_GATE_CHECK_FIELD', index, 'exit 必须为整数')
+    if (check.minTests != null && (!Number.isInteger(check.minTests) || check.minTests <= 0)) gateError('DSH_E_GATE_CHECK_FIELD', index, 'minTests 必须为正整数')
+    if (check.timeoutMs != null && (!Number.isInteger(check.timeoutMs) || check.timeoutMs < 1000 || check.timeoutMs > 1800000)) gateError('DSH_E_GATE_CHECK_FIELD', index, 'timeoutMs 必须为 1000..1800000ms 整数')
+    if (!check.cmd) return check
+    const tokens = parseMechanicalCommand(check.cmd)
+    if (!allowedMechCommand(check.cmd, ctx.mechCommands)) gateError('DSH_E_GATE_CMD_NOT_ALLOWED', index, '命令不在白名单')
+    if (tokens.some((t) => /^(?:&&|\|\||\||;|>|2>&1)$/.test(t) || /\$\(|`|\$env:|%[^%]+%/.test(t))) gateError('DSH_E_GATE_CMD_SHELL_SYNTAX', index, '不支持 shell 元字符')
+    const globIndex = tokens.findIndex((t) => /[*?]/.test(t))
+    if (globIndex >= 0) {
+      if (!/^node(?:\.exe)?$/i.test(tokens[0]) || tokens[1] !== '--test' || tokens.length !== 3) gateError('DSH_E_GATE_CMD_GLOB', index, '通配符不会经 shell 展开')
+      const token = tokens[2].replace(/\\/g, '/'), cut = token.search(/[*?]/)
+      const dir = resolve(ctx.workspace || process.cwd(), token.slice(0, cut).replace(/\/[^/]*$/, '') || '.')
+      const files = existsSync(dir) ? readdirSync(dir).filter((f) => globRegex(basename(token)).test(f)).map((f) => join(dir, f)) : []
+      if (!files.length) gateError('DSH_E_GATE_CMD_GLOB', index, '通配符没有匹配文件')
+      if ((ctx.writeScopes || []).some((p) => isPathInsideWorkspace(p, dir))) check.cmdDeferredGlob = true
+      else check.cmdResolved = ['node', '--test', ...files.map((f) => JSON.stringify(f))].join(' ')
+    }
+    if (check.minTests != null && !(/^node(?:\.exe)?$/i.test(tokens[0]) && tokens[1] === '--test') && !(/^npm(?:\.cmd)?$/i.test(tokens[0]) && ((tokens[1] === 'test') || (tokens[1] === '--prefix' && tokens[3] === 'test')))) gateError('DSH_E_GATE_MINTESTS_UNPARSEABLE', index, 'minTests 仅支持 node --test 或 npm test')
+    return check
+  })
+}
+function normalizePathList(value, roots, workspace, field, write = false) {
+  if (value == null) return value
+  if (!Array.isArray(value)) throw new Error(`${field} 必须是路径数组`)
+  return value.map((p) => {
+    const out = expandPathMacro(p, roots, workspace)
+    if (write && sensitivePath(out)) throw new Error(`${field} 禁止敏感路径：${out}`)
+    if (write && isAbsolute(String(p)) === false && !/^@/.test(String(p)) && !isPathInsideWorkspace(workspace, out)) throw new Error(`${field} 相对路径越出 workspace：${p}`)
+    return out
+  })
+}
+
 function validateGate(gate) {
   if (gate == null) return null
   if (!isPlainObject(gate)) throw new Error('gate 必须是对象')
-  if (typeof gate.userAsk !== 'string' || !gate.userAsk.trim()) throw new Error('gate.userAsk 必须是非空字符串')
-  if (typeof gate.criteria !== 'string' || !gate.criteria.trim()) throw new Error('gate.criteria 必须是非空字符串')
+  if (gate.userAsk != null && (typeof gate.userAsk !== 'string' || !gate.userAsk.trim())) throw new Error('gate.userAsk 必须是非空字符串')
+  let normalizedCriteria = gate.criteria
+  if (Array.isArray(normalizedCriteria)) {
+    const items = normalizedCriteria.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean)
+    normalizedCriteria = items.map((s, i) => (/^\d+[.)、]/.test(s) ? s : `${i + 1}. ${s}`)).join('\n')
+  }
+  if (normalizedCriteria != null && (typeof normalizedCriteria !== 'string' || !normalizedCriteria.trim())) throw new Error('gate.criteria 必须是非空字符串或非空字符串数组')
+  if (normalizedCriteria == null && !(Array.isArray(gate.checks) && gate.checks.length)) throw new Error('gate.criteria 缺省时必须提供 gate.checks')
+  if (gate.checks != null && (!Array.isArray(gate.checks) || gate.checks.some((x) => !isPlainObject(x) || Object.keys(x).some((k) => !['sha', 'gitClean', 'noDiff', 'allowAdded', 'cmd', 'exit', 'minTests', 'timeoutMs', 'exists', 'exports'].includes(k))))) throw new Error('gate.checks 含未知检查类型或字段')
+  if (gate.llm != null && !['auto', 'never'].includes(gate.llm)) throw new Error("gate.llm 仅支持 'auto' 或 'never'")
+  if (gate.llm === 'never' && normalizedCriteria?.trim()) throw new Error("gate.llm='never' 时不能提供语义 criteria")
   if (gate.mode != null && gate.mode !== 'verify') throw new Error("gate.mode 目前仅支持 'verify'")
   if (gate.commands != null && (!Array.isArray(gate.commands) || gate.commands.some((x) => typeof x !== 'string' || !x.trim()))) {
     throw new Error('gate.commands 必须是非空字符串组成的数组')
@@ -668,7 +1131,9 @@ function validateGate(gate) {
   if (gate.onPartial != null && gate.onPartial !== 'skip' && gate.onPartial !== 'gate') {
     throw new Error("gate.onPartial 仅支持 'skip' 或 'gate'")
   }
-  return { ...gate, mode: 'verify', onPartial: gate.onPartial || 'skip', commands: gate.commands ? [...gate.commands] : [] }
+  const maxFixRounds = gate.maxFixRounds ?? 1
+  if (!Number.isInteger(maxFixRounds) || maxFixRounds < 0 || maxFixRounds > 5) throw new Error('gate.maxFixRounds 必须是 0..5 的整数')
+  return { ...gate, criteria: normalizedCriteria || '', checks: gate.checks ? gate.checks.map((x) => ({ ...x })) : [], llm: gate.llm || 'auto', mode: 'verify', onPartial: gate.onPartial || 'skip', maxFixRounds, commands: gate.commands ? [...gate.commands] : [] }
 }
 
 /**
@@ -677,6 +1142,11 @@ function validateGate(gate) {
  */
 export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes: BUILTIN_MODES, aliases: {} }) {
   if (!isPlainObject(args)) throw new Error('relay_dispatch 参数必须是对象')
+  if (args.followUp != null) {
+    if (args.tasks != null || args.startArgs != null) throw new Error('followUp 与 tasks/startArgs 互斥')
+    return preflightFollowUp(args.followUp, config, modesInfo)
+  }
+  args = expandTargets(args, modesInfo)
   const hasTasks = args.tasks != null
   if (hasTasks && (!Array.isArray(args.tasks) || args.tasks.length === 0)) throw new Error('tasks 必须是非空数组')
   if (args.startArgs != null && !isPlainObject(args.startArgs)) throw new Error('startArgs 必须是对象')
@@ -684,20 +1154,65 @@ export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes
     throw new Error("onWriteConflict 仅支持 'error' 或 'serial'")
   }
   const onWriteConflict = args.onWriteConflict || 'error'
-  const gate = validateGate(args.gate)
+  const gate = validateGate(hasTasks && args.tasks.some((t) => t?.gate != null) ? (args.tasks.find((t) => t?.gate != null)?.gate || args.gate) : args.gate)
+  const roots = modesInfo.roots || {}
+  if (args.syncTargets != null && (!Array.isArray(args.syncTargets) || args.syncTargets.some((x) => !isPlainObject(x) || typeof x.source !== 'string' || typeof x.target !== 'string'))) throw new Error('syncTargets 必须是 {source,target,root?,mode?} 数组')
+  if (args.handoff != null && !isPlainObject(args.handoff)) throw new Error('handoff 必须是对象')
+  const handoff = Object.fromEntries(Object.entries(args.handoff || {}).map(([name, value]) => {
+    if (typeof value !== 'string' || !value.trim()) throw new Error(`handoff.${name} 必须是 path#exports 字符串`)
+    const [path, symbols = ''] = value.split('#')
+    return [name, { name, path, names: symbols.split(',').map((s) => s.trim()).filter(Boolean) }]
+  }))
   const items = hasTasks ? args.tasks : [null]
+  const scopeErrors = []
   const tasks = items.map((item, index) => {
     if (item != null && !isPlainObject(item)) throw new Error(`tasks[${index}] 必须是对象`)
     if (item && item.startArgs != null && !isPlainObject(item.startArgs)) throw new Error(`tasks[${index}].startArgs 必须是对象`)
     const merged = { ...(args.startArgs || {}), ...((item && item.startArgs) || {}) }
     if (item) {
       for (const key of V2_TASK_SHORTCUTS) {
-        if (item[key] !== undefined) merged[key] = item[key]
+        if (item[key] !== undefined && key !== 'specMetadata') merged[key] = item[key]
       }
     }
     const modeName = (item && item.mode != null ? item.mode : args.mode) || undefined
     const review = Boolean(item && item.review != null ? item.review : args.review)
+    if (merged.workspace != null) merged.workspace = expandPathMacro(merged.workspace, roots, merged.workspace)
+    const specFile = item?.specFile ?? args.specFile
+    if (specFile != null) {
+      const specPath = expandPathMacro(specFile, roots, merged.workspace)
+      if (!existsSync(specPath) || !statSync(specPath).isFile()) throw new Error(`specFile 不存在：${specPath}`)
+      const sections = item?.specSections ?? args.specSections
+      if (sections != null && (!Array.isArray(sections) || sections.some((s) => typeof s !== 'string'))) throw new Error('specSections 必须是字符串数组')
+      const stat = statSync(specPath)
+      merged.task = `${merged.task || ''}\n规格：${specPath} ${(sections || []).join(' ')}。先读再动手；与本任务文本冲突时以本任务文本为准。`
+      merged.specMetadata = { path: specPath, mtime: stat.mtime.toISOString(), size: stat.size, sections: sections || [] }
+    }
+    for (const field of ['writeScope', 'contextReadScope', 'reviewTargets']) if (merged[field] != null) merged[field] = normalizePathList(merged[field], roots, merged.workspace, field, field === 'writeScope')
+    if (merged.task != null) merged.task = expandTextMacros(merged.task, roots, merged.workspace)
     const rawTask = merged.task
+    const inferredScope = inferScopes(rawTask, gate?.checks, { roots })
+    const knownHosts = new Set(Object.values(modesInfo.hosts || {}).map(String))
+    for (const host of inferredScope.hosts) {
+      if (!knownHosts.has(host) && merged.permissionPreset !== 'danger-full-access') scopeErrors.push(Object.assign(new Error(`tasks[${index}] DSH_E_SCOPE_HOST_UNDECLARED: ${host}；请在 dispatch-modes.yaml hosts 声明或显式使用 danger-full-access`), { code: 'DSH_E_SCOPE_HOST_UNDECLARED' }))
+      if (merged.permissionPreset === 'read-only') scopeErrors.push(Object.assign(new Error(`tasks[${index}] DSH_E_SCOPE_PRESET_INSUFFICIENT: SSH 需要 workspace-write 或 danger-full-access（host=${host}）`), { code: 'DSH_E_SCOPE_PRESET_INSUFFICIENT' }))
+    }
+    merged.contextReadScope = [...new Set([...(merged.contextReadScope || [merged.workspace]), ...inferredScope.readRoots])]
+    const outNames = item?.out == null ? [] : item.out
+    const inNames = item?.in == null ? [] : item.in
+    if (!Array.isArray(outNames) || !Array.isArray(inNames) || [...outNames, ...inNames].some((n) => typeof n !== 'string' || !handoff[n.replace(/^~/, '')])) throw new Error(`tasks[${index}] out/in 引用了未知 handoff 名称`)
+    if (outNames.length && new Set(outNames).size !== outNames.length) throw new Error(`tasks[${index}] out 重复`)
+    const produced = outNames.map((name) => handoff[name])
+    for (const contract of produced) {
+      contract.path = expandPathMacro(contract.path, roots, merged.workspace)
+      contract.producer = index
+      merged.task += `\n交接产出（路径与导出名是契约，不得更改）：${contract.path}${contract.names.length ? ` 导出 ${contract.names.join(', ')}` : ''}`
+    }
+    for (const rawName of inNames) {
+      const contract = handoff[rawName.replace(/^~/, '')]
+      merged.task += `\n交接输入：${contract.path}${contract.names.length ? ` 导出 ${contract.names.join(', ')}` : ''}。只读不改；文件不存在或导出名不符即 blocked，不要自己补一个。`
+    }
+    if (item?.syncMode != null && item.syncMode !== 'copy') throw new Error("syncMode 仅支持 'copy'")
+    if (item?.sync != null && (!Array.isArray(item.sync) || item.sync.some((x) => !['plugins', 'pf'].includes(x)))) throw new Error("sync 仅支持 'plugins' 与 'pf'")
     let baseArgs = merged
     let candidates = []
     let modePrefix = ''
@@ -708,7 +1223,26 @@ export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes
       const applied = applyMode(cfg, merged, modesInfo.aliases || {})
       baseArgs = applied.args
       candidates = applied.candidates
+      if (!candidates.length && baseArgs.provider && baseArgs.model && Array.isArray(cfg.models) && cfg.models.length > 0) {
+        const modeCandidates = applyMode(cfg, { task: '' }, modesInfo.aliases || {}).candidates
+        const first = { provider: String(baseArgs.provider), model: String(baseArgs.model) }
+        const rest = modeCandidates.filter((c) => !(c.provider === first.provider && c.model === first.model))
+        if (rest.length > 0) candidates = [first, ...rest]
+      }
     }
+    const readOnly = ['investigate', 'verify', 'review'].includes(modeName) || review || baseArgs.permissionPreset === 'read-only'
+    if (!readOnly && baseArgs.permissionPreset !== 'danger-full-access') {
+      const writes = normalizePathList(baseArgs.writeScope, roots, baseArgs.workspace, 'writeScope') || []
+      const writeIntent = String(rawTask || '').replace(/(?:不要|严禁|禁止|不得|不|未)(?:写入|修改|同步到|复制到)/g, '')
+      if (/(?:写入|修改|同步到|复制到)/.test(writeIntent)) for (const path of inferredScope.readRoots) {
+        if (!isPathInsideWorkspace(baseArgs.workspace, path) && !writes.some((p) => isPathInsideWorkspace(p, path))) scopeErrors.push(Object.assign(new Error(`tasks[${index}] DSH_E_SCOPE_WRITE_UNDECLARED: ${path}；请补 writeScope: ["${path}"]`), { code: 'DSH_E_SCOPE_WRITE_UNDECLARED' }))
+      }
+    }
+    delete baseArgs.specMetadata
+    if (baseArgs.writeScope != null && (!Array.isArray(baseArgs.writeScope) || baseArgs.writeScope.some((p) => typeof p !== 'string' || !p.trim()))) {
+      throw new Error(`tasks[${index}].writeScope 必须是非空路径字符串组成的数组`)
+    }
+    const rawWriteScope = Array.isArray(baseArgs.writeScope) ? [...baseArgs.writeScope] : null
     const previewArgs = fillStartArgs(baseArgs, config, review)
     if (typeof previewArgs.workspace !== 'string' || !previewArgs.workspace.trim()) {
       throw new Error(`tasks[${index}] 缺少 workspace（该模式未配置默认 workspace）`)
@@ -716,11 +1250,25 @@ export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes
     if (typeof previewArgs.task !== 'string' || !previewArgs.task.trim()) {
       throw new Error(`tasks[${index}] 缺少非空 task`)
     }
-    if (previewArgs.writeScope != null && (!Array.isArray(previewArgs.writeScope) || previewArgs.writeScope.some((p) => typeof p !== 'string' || !p.trim()))) {
-      throw new Error(`tasks[${index}].writeScope 必须是非空路径字符串组成的数组`)
-    }
     const writable = !review && V2_WRITABLE_PRESETS.has(previewArgs.permissionPreset)
     const label = String((item && item.label) || cleanBodyTitle(rawTask, modePrefix) || `task-${index + 1}`)
+    const explicitDeps = new Set()
+    for (const rawName of inNames) {
+      if (rawName.startsWith('~')) continue
+      const producer = handoff[rawName].producer
+      if (!Number.isInteger(producer) || producer >= index) throw new Error(`tasks[${index}].in ${rawName} 必须由更靠前的唯一 out 生产`)
+      explicitDeps.add(producer)
+    }
+    const rawDeps = (item && item.dependsOn) ?? (item && item.startArgs && item.startArgs.dependsOn)
+    if (Array.isArray(rawDeps)) {
+      for (const dep of rawDeps) {
+        const d = Number(dep)
+        if (!Number.isInteger(d) || d < 0 || d >= index) {
+          throw new Error(`tasks[${index}].dependsOn 包含无效的前置任务索引 ${JSON.stringify(dep)}（必须为 0..${index - 1} 的整数）`)
+        }
+        explicitDeps.add(d)
+      }
+    }
     return {
       index,
       label,
@@ -732,18 +1280,66 @@ export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes
       previewArgs,
       candidates,
       workspace: previewArgs.workspace,
-      writeScope: writable ? (previewArgs.writeScope || [previewArgs.workspace]) : [],
+      writeScope: writable ? (rawWriteScope || previewArgs.writeScope || [previewArgs.workspace]) : [],
       writable,
-      dependsOn: new Set(),
+      dependsOn: explicitDeps,
+      handoffOut: outNames,
+      handoffIn: inNames,
+      sync: item?.sync || [],
+      syncMode: item?.syncMode,
+      specMetadata: merged.specMetadata,
+      inferredScope,
     }
   })
+
+  if (scopeErrors.length) throw Object.assign(new Error(scopeErrors.map((e) => e.message).join('\n')), { code: scopeErrors.length === 1 ? scopeErrors[0].code : 'DSH_E_SCOPE_PREFLIGHT', errors: scopeErrors })
+
+  for (const [name, contract] of Object.entries(handoff)) {
+    if (!Number.isInteger(contract.producer)) throw new Error(`handoff.${name} 没有 out 生产者`)
+    const producer = tasks[contract.producer]
+    if (!producer.writeScope.some((root) => isPathInsideWorkspace(root, contract.path))) throw new Error(`handoff.${name} 不在生产者 writeScope 内`)
+    for (const task of tasks) if (task.handoffIn.some((n) => n.replace(/^~/, '') === name)) {
+      if (task.writeScope.some((root) => isPathInsideWorkspace(root, contract.path))) throw new Error(`handoff.${name} 不得位于消费者 writeScope 内`)
+      contract.consumers ||= []
+      contract.consumers.push({ index: task.index, parallel: task.handoffIn.includes(`~${name}`) })
+      task.baseArgs.task += `，由 ${producer.label} 实现`
+    }
+  }
+  const rawSyncTargets = hasTasks ? args.tasks.flatMap((t) => t?.syncTargets || []) : args.syncTargets || []
+  const uniqueSyncTargets = rawSyncTargets.filter((x, i) => rawSyncTargets.findIndex((y) => y.source === x.source && y.target === x.target) === i)
+  const syncTargets = uniqueSyncTargets.map((x) => {
+    const root = x.root ? expandPathMacro(x.root, roots, tasks[0]?.workspace) : undefined
+    const source = expandPathMacro(x.source, roots, tasks[0]?.workspace)
+    const target = expandPathMacro(x.target, roots, tasks[0]?.workspace)
+    return { source, target, root: root || (x.target.startsWith('@plugins/') ? join(homedir(), '.dsh', 'plugins') : x.target.startsWith('@pf/') ? roots.pf : dirname(target)), mode: x.mode || 'verify' }
+  }).filter((x, i, all) => all.findIndex((y) => sameDir(y.source, x.source) && sameDir(y.target, x.target)) === i)
+  if (syncTargets.some((x) => x.mode !== 'copy' && x.mode !== 'verify')) throw new Error('syncTargets.mode 仅支持 copy 或 verify')
+  if (gate) {
+    const ws = tasks[0]?.workspace
+    gate.commands = gate.commands.map((c) => expandTextMacros(c, roots, ws))
+    gate.criteria = expandTextMacros(gate.criteria, roots, ws)
+    if (gate.criteria && (/(^|\n)\s*\d+[.)、]?\s*@tasks\s*(?=\n|$)/.test(gate.criteria) || gate.criteria.trim() === '@tasks' || gate.criteria.trim() === 'same')) {
+      const derived = tasks.map((t) => `## ${t.label}\n${t.rawTask}`).join('\n\n')
+      gate.criteria = gate.criteria && gate.criteria.trim() !== '@tasks' && gate.criteria.trim() !== 'same' ? gate.criteria.replace(/(^|\n)(\s*\d+[.)、]?\s*)@tasks\s*(?=\n|$)/g, `$1$2${derived}`) : `逐条核对以下各任务的 Contract / Inv / Delta / Verify 是否成立\n${derived}`
+    }
+    gate.userAsk ||= tasks[0]?.rawTask?.split(/\r?\n/)[0] || '验收流水线'
+    gate.checks = gate.checks.map((check) => {
+      const out = { ...check }
+      for (const key of ['sha', 'exists', 'gitClean']) if (out[key] != null) out[key] = Array.isArray(out[key]) ? out[key].map((p) => expandPathMacro(p, roots, ws)) : expandPathMacro(out[key], roots, ws)
+      if (out.exports) out.exports = { ...out.exports, file: expandPathMacro(out.exports.file, roots, ws) }
+      if (out.cmd) out.cmd = expandTextMacros(out.cmd, roots, ws)
+      return out
+    })
+  }
+
+  if (gate) gate.checks = lintMechanicalChecks(gate.checks, { workspace: tasks[0]?.workspace, mechCommands: modesInfo.mechCommands, writeScopes: tasks.flatMap((t) => t.writeScope) })
 
   const conflicts = []
   for (let i = 0; i < tasks.length; i++) {
     for (let j = i + 1; j < tasks.length; j++) {
       const a = tasks[i]
       const b = tasks[j]
-      if (!a.writable || !b.writable || !sameDir(a.workspace, b.workspace)) continue
+      if (!a.writable || !b.writable) continue
       if (!writeScopesOverlap(a.writeScope, b.writeScope)) continue
       conflicts.push({ a: i, b: j })
       if (onWriteConflict === 'error') {
@@ -755,7 +1351,51 @@ export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes
       b.dependsOn.add(i)
     }
   }
-  return { hasTasks, tasks, gate, onWriteConflict, conflicts }
+  return { hasTasks, tasks, gate, handoff, syncTargets, roots, mechCommands: modesInfo.mechCommands, onWriteConflict, conflicts, reloadPlugins: normalizeReloadPlugins(args.reloadPlugins), targets: args.targets, targetWriteScope: args.targetWriteScope || [] }
+}
+
+export function classifyGateFailure(mech, verdict) {
+  const failed = (mech?.results || []).filter((r) => !r.ok)
+  if (failed.some((r) => /白名单|shell|glob|DSH_E_GATE_/i.test(r.detail || ''))) return 'mech_config_error'
+  if (failed.some((r) => r.kind === 'sha' || r.kind === 'syncTargets')) return 'mech_sync_drift'
+  if (failed.some((r) => ['exists', 'exports', 'handoff'].includes(r.kind))) return 'mech_missing_artifact'
+  if (failed.some((r) => r.kind === 'cmd')) return 'mech_test_fail'
+  return ['partial', 'fail'].includes(verdict) ? 'verdict_partial_fail' : null
+}
+
+export function preflightFollowUp(followUp, config = DEFAULTS, modesInfo = {}) {
+  if (!isPlainObject(followUp) || typeof followUp.pipelineId !== 'string' || !/^[\w.-]+$/.test(followUp.pipelineId)) throw Object.assign(new Error('DSH_E_FOLLOWUP_NO_MANIFEST: 无效 pipelineId'), { code: 'DSH_E_FOLLOWUP_NO_MANIFEST' })
+  const path = join(config.manifestDir || join(homedir(), '.dsh', 'relay-pipelines'), `${followUp.pipelineId}.json`)
+  let previous
+  try { previous = config.readManifest ? config.readManifest(path) : JSON.parse(readFileSync(path, 'utf8')) } catch { throw Object.assign(new Error(`DSH_E_FOLLOWUP_NO_MANIFEST: ${followUp.pipelineId}`), { code: 'DSH_E_FOLLOWUP_NO_MANIFEST' }) }
+  const current = config.currentSessionId
+  if (current == null || previous.parentSessionId !== current) throw Object.assign(new Error('DSH_E_FOLLOWUP_FOREIGN: 只能续修当前会话的流水线'), { code: 'DSH_E_FOLLOWUP_FOREIGN' })
+  if (!['done', 'completed'].includes(previous.phase) || !/RESULT:\s*(?:FAIL|PARTIAL|UNVERIFIED)/.test(previous.machineHeader || '') || (previous.items || []).some((i) => i.startUnknown)) throw Object.assign(new Error(`DSH_E_FOLLOWUP_STATE: phase=${previous.phase}`), { code: 'DSH_E_FOLLOWUP_STATE' })
+  if ((previous.followUps || []).length >= 3) throw Object.assign(new Error('DSH_E_FOLLOWUP_EXHAUSTED'), { code: 'DSH_E_FOLLOWUP_EXHAUSTED' })
+  const plan = previous.plan
+  if (!plan?.tasks?.length) throw Object.assign(new Error('DSH_E_FOLLOWUP_STATE: 清单缺少 plan'), { code: 'DSH_E_FOLLOWUP_STATE' })
+  const items = previous.items || [], index = followUp.target === 'auto' || followUp.target == null ? Math.max(0, items.findIndex((i) => i.kind !== 'gate' && i.status !== 'succeeded')) : followUp.target
+  const task = plan.tasks[index]
+  if (!task || !Number.isInteger(index)) throw Object.assign(new Error('DSH_E_FOLLOWUP_STATE: 无效 target'), { code: 'DSH_E_FOLLOWUP_STATE' })
+  if (followUp.patchTask != null && (typeof followUp.patchTask !== 'string' || !followUp.patchTask.trim() || followUp.patchTask.length > 2000)) throw new Error('patchTask 必须是不超过 2000 字符的非空字符串')
+  const patchTask = followUp.patchTask || '请复核上次交付并重跑继承的机械门；若仍失败请报告具体原因。'
+  const sessionId = items.find((i) => i.index === index && i.kind !== 'gate')?.sessionId
+  const failed = items.find((i) => i.kind === 'gate')?.output || items.find((i) => i.kind !== 'gate' && i.status !== 'succeeded')?.error || ''
+  const nextTasks = plan.tasks.map((t) => ({ ...t, candidates: Array.isArray(t.candidates) ? t.candidates : [], dependsOn: new Set(t.dependsOn || []) }))
+  nextTasks[index] = { ...task, dependsOn: new Set(), rawTask: patchTask, baseArgs: { ...task.baseArgs, task: `${patchTask}\n上次失败明细：\n${String(failed).slice(-500)}`, ...(sessionId ? { sessionId, sessionMode: 'latest-idle' } : { sessionMode: 'fresh' }) } }
+  const nextPlan = { ...plan, tasks: nextTasks, gate: nextTasks[index].followUpGate || plan.gate, followUpOf: followUp.pipelineId, followUpTarget: index }
+  if (followUp.patchGate != null) {
+    if (!isPlainObject(followUp.patchGate)) throw new Error('patchGate 必须是对象')
+    nextPlan.gate = validateGate({ ...plan.gate, ...followUp.patchGate })
+    nextPlan.gate.checks = lintMechanicalChecks(nextPlan.gate.checks, { workspace: task.workspace, mechCommands: plan.mechCommands || modesInfo.mechCommands, writeScopes: task.writeScope || [] })
+  } else nextPlan.gate.checks = lintMechanicalChecks(nextPlan.gate.checks, { workspace: task.workspace, mechCommands: plan.mechCommands || modesInfo.mechCommands, writeScopes: task.writeScope || [] })
+  return { ...nextPlan, followUp: true, previous, scopeNotes: plan.tasks.flatMap((t) => t.inferredScope?.notes || []) }
+}
+
+export function normalizeReloadPlugins(value) {
+  if (value == null) return []
+  if (!Array.isArray(value) || value.some((v) => typeof v !== 'string' || !v.trim())) throw new Error('reloadPlugins 必须是插件名字符串数组')
+  return [...new Set(value.map((v) => v.trim()))]
 }
 
 export const V2_CAPABILITIES_TTL_MS = 60000
@@ -763,7 +1403,7 @@ export const V2_CAPABILITIES_TTL_MS = 60000
 /** start_run 在写任务中结果不可知时不得换模型重试，避免同一任务被实际执行两次。 */
 export function isUnknownStartError(err) {
   const s = String((err && err.message) || err || '')
-  return /start_run 超时|fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|network|connection (failed|refused|reset|closed)|timed? ?out|未返回 runId/i.test(s)
+  return /start_run 超时|fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|network|connection (failed|refused|reset|closed)|timed? ?out|未返回 runId|\b50[0234]\b|overloaded|aborted|disposed/i.test(s)
 }
 
 /** 启动前即应停止候选链重试的错误；写任务遇到结果不可知错误时同样必须停止，防止双写。 */
@@ -775,6 +1415,22 @@ export function isPreStartRejection(err, writable = false) {
 /** 插件卸载或 jobs 服务关闭只分离本地等待，不得误杀远端 run。 */
 export function isDisposeCancelReason(reason) {
   return /disposed/i.test(String(reason || ''))
+}
+
+/**
+ * 热重载/卸载只把本地 job 标成已报告，抑制 [status:killed] 完成通知。
+ * dsh-jobs kill(id, caller, reason) 会校验 owner，成功后把 reported 置真；
+ * kill(id, reason) 会把 reason 当成 caller，owned job 抛错且 reported 保持 false。
+ * 调用方必须先置上 cancelled，避免 kill 重入时再次取消远端 run。
+ */
+function quietDisposedJob(jobs, jobId, caller) {
+  if (!jobId || !jobs || typeof jobs.kill !== 'function') return
+  const reason = 'relay_dispatch disposed'
+  try {
+    jobs.kill(jobId, caller, reason)
+  } catch {
+    try { jobs.kill(jobId, reason) } catch {}
+  }
 }
 
 /** 按模型实际厂商归族，避免同厂商换模型后仍被当成异构审查。 */
@@ -796,6 +1452,105 @@ export function vendorOf(provider, model) {
 export function parseGateVerdict(text) {
   const match = /^\s*verdict:\s*(pass|fail|partial)/im.exec(String(text || ''))
   return match ? match[1].toLowerCase() : 'unknown'
+}
+
+/**
+ * 格式化 v2 流水线汇总文本：
+ * - 当存在 gate 时，把 [gate] 区块置于所有 [task#i] 之前（紧跟在 gate_user_ask 下方），
+ *   并将每个 [task#i] 的内联文本预览上限从 2000 缩减为 300 字符（无 gate 时保持 1500~2000），
+ *   使带 Gate 的 v2 完成通知稳定保持在预算内（full_in_detail=1）。
+ */
+export function formatPipelineSummary(manifest, maxResultChars = 2000, options = {}) {
+  const m = manifest || {}
+  const items = Array.isArray(m.items) ? m.items : []
+  const slim = options.slim === true
+  const brief = options.brief === true
+  const gateObj = m.gate && typeof m.gate === 'object' ? m.gate : null
+  const gateUserAsk = (gateObj && gateObj.userAsk) || m.gateUserAsk
+  const gateItems = items.filter((i) => i && i.kind === 'gate')
+  if (slim && !gateItems.length) gateItems.push({ kind: 'gate', status: 'pass', output: m.gateConclusion || 'pass' })
+  if (gateItems.length === 0 && gateObj && (gateObj.status || gateObj.output || gateObj.verdict)) {
+    gateItems.push({ index: gateObj.index ?? items.length, kind: 'gate', label: gateObj.label || 'gate', ...gateObj })
+  }
+  const taskItems = items.filter((i) => i && i.kind !== 'gate')
+  const hasGate = Boolean(m.gate || gateUserAsk || gateItems.length > 0)
+  const ordered = hasGate ? [...gateItems, ...taskItems] : items
+  const noGateMax = Math.max(1500, Math.min(2000, maxResultChars || 2000))
+  const lines = [`pipeline_id: ${m.pipelineId || '?'}`]
+  if (m.reloaded) lines.push(`reloaded: ${m.reloaded}`)
+  if (gateUserAsk && !slim) lines.push(`gate_user_ask: ${truncateUtf8(String(gateUserAsk), 60)}`)
+  const oneLine = (value, max = 160) => {
+    const text = String(value || '(无)').replace(/\s+/g, ' ').trim()
+    const summaryLine = text.split(/(?:^|\s)(?:summary|总结)[:：]\s*/i).at(-1) || text
+    return clip(summaryLine.replace(/^verdict:\s*\w+\s*/i, ''), max)
+  }
+  if (brief) {
+    const gate = gateItems[0]
+    const failureClass = gate ? classifyGateFailure(gate.mechanical, gate.verdict) : undefined
+    if (gate) lines.push(`[gate] ${gate.status || 'unknown'}/${gate.verdict || 'unknown'} class=${failureClass || 'none'}`)
+    const failures = gate?.mechanical?.results?.filter((r) => !r.ok) || []
+    if (failures.length) {
+      for (const result of failures.slice(0, 3)) {
+        const flat = String(result.detail || '').replace(/\s+/g, ' ').trim()
+        let tail = flat
+        if (byteLen(flat) > 160) {
+          tail = Array.from(flat).reverse().join('')
+          tail = truncateUtf8(tail, 160)
+          tail = Array.from(tail).reverse().join('')
+          tail = `…${tail}`
+        }
+        lines.push(`  x ${result.kind}#${result.index}: ${tail}`)
+      }
+      if (failures.length > 3) lines.push(`  +${failures.length - 3} more`)
+    } else if (gate) {
+      const reason = oneLine(gate.output || gate.error, 300)
+      if (reason && reason !== '(无)') lines.push(`[不通过] ${reason}`)
+    }
+    const unsuccessful = taskItems.filter((item) => item.status !== 'succeeded')
+    for (const item of unsuccessful) {
+      lines.push(`[task#${item.index ?? 0}] ${item.status || 'unknown'} ${oneLine(item.output || item.error, 100)}`)
+      if (item.startUnknown) lines.push('start_unknown=1')
+    }
+    const files = [...new Set(unsuccessful.flatMap((item) => item.git?.available ? item.git.files || [] : []))]
+    if (files.length) lines.push(`changed_files: ${files.slice(0, 6).join(', ')}${files.length > 6 ? ` +${files.length - 6}` : ''}`)
+    if (m.phase === 'detached') lines.push('phase=detached')
+    if (items.some((item) => item.selfReview)) lines.push('self_review=1')
+    const cancelled = m.phase === 'cancelled' || unsuccessful.some((item) => item.status === 'cancelled')
+    const result = /RESULT:\s*(\w+)/.exec(m.machineHeader || '')?.[1]
+    if (!cancelled && result !== 'UNVERIFIED' && m.pipelineId && m.phase !== 'detached' && !items.some((item) => item.startUnknown)) {
+      lines.push(`next: relay_dispatch({followUp:{pipelineId:${JSON.stringify(m.pipelineId)},patchTask:"修复上次失败检查"}})`)
+    }
+    if (m.pipelineId) lines.push(`detail: ~/.dsh/relay-pipelines/${m.pipelineId}.json`)
+    return lines.join('\n')
+  }
+  for (const item of ordered) {
+    const kind = item.kind || 'task'
+    const idx = item.index ?? 0
+    const label = item.label || (kind === 'gate' ? 'gate' : `task-${idx + 1}`)
+    const notes = Array.isArray(item.notes) ? item.notes : []
+    if (slim) {
+      if (kind === 'gate') {
+        lines.push(`[gate] ${item.status}${item.verdict ? `/${item.verdict}` : ''}: ${oneLine(item.output)}`)
+      } else {
+        const files = item.git?.available ? (item.git.files || []) : []
+        lines.push(`[task#${idx}] ${item.status}${item.model ? ` ${item.model}` : ''}; changed_files: ${files.length ? files.join(', ') : '(none)'}; summary: ${oneLine(item.output || item.error, 120)}`)
+      }
+      continue
+    }
+    const itemMax = kind === 'gate' ? Math.min(1500, maxResultChars || 1500) : (hasGate ? 300 : noGateMax)
+    lines.push(`\n[${kind}#${idx}] ${label} -> ${item.status}${item.model ? ` (${item.model})` : ''}${item.runId ? ` runId=${item.runId}` : ''}`)
+    if (item.startUnknown) lines.push('start_unknown=1')
+    if (item.git && item.git.available) lines.push(`changed_files: ${(item.git.files && item.git.files.join(', ')) || '(无)'}`)
+    if (notes.length) lines.push(notes.join('；'))
+    lines.push(conclusion({ assistantText: item.output || item.error || '(无)' }, itemMax))
+  }
+  const failed = items.some((i) => i.status === 'failed') || items.some((i) => i.kind === 'gate' && i.verdict !== 'pass')
+  if (failed && m.pipelineId && !['running', 'gate', 'detached'].includes(m.phase) && !items.some((i) => i.startUnknown)) {
+    const target = items.find((i) => i.kind !== 'gate' && i.status !== 'succeeded')?.index ?? 0
+    lines.push(`repairable: yes  fix_target=${target}`)
+    lines.push(`next: relay_dispatch({followUp:{pipelineId:${JSON.stringify(m.pipelineId)},patchTask:"修复上次失败检查"}})`)
+  }
+  return lines.join('\n')
 }
 
 function execGit(workspace, args, env = {}, timeoutMs = 30000) {
@@ -865,6 +1620,133 @@ export async function diffGitTrees(workspace, before, after, options = {}) {
   }
 }
 
+function filesUnder(path) {
+  const stat = statSync(path)
+  if (stat.isFile()) return [{ absolute: path, relative: basename(path) }]
+  const out = []
+  const walk = (dir, prefix = '') => {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name === 'node_modules' || entry.name === '.git' || entry.name.includes('.bak')) continue
+      const absolute = join(dir, entry.name), relative = prefix ? `${prefix}/${entry.name}` : entry.name
+      if (entry.isDirectory()) walk(absolute, relative)
+      else if (entry.isFile()) out.push({ absolute, relative })
+    }
+  }
+  walk(path)
+  return out
+}
+function pathSha(path) {
+  const files = filesUnder(path)
+  return createHash('sha256').update(files.map((f) => `${f.relative}\0${createHash('sha256').update(readFileSync(f.absolute)).digest('hex')}\0`).join('')).digest('hex')
+}
+export function staticExports(file, names) {
+  const source = readFileSync(file, 'utf8')
+  return names.filter((raw) => {
+    const name = raw.split('(')[0].trim()
+    if (!/^[A-Za-z_$][\w$]*$/.test(name)) return false
+    const escaped = name.replace(/[$]/g, '\\$')
+    return new RegExp(`\\bexport\\s+(?:async\\s+)?(?:function|class|const|let|var)\\s+${escaped}\\b|\\bexport\\s*\\{[^}]*\\b${escaped}\\b[^}]*\\}`, 'm').test(source)
+  })
+}
+export function verifyHandoffContract(contract) {
+  if (!existsSync(contract.path)) return { ok: false, detail: `缺少交接产物：${contract.path}` }
+  const missing = (contract.names || []).filter((name) => !staticExports(contract.path, [name]).length)
+  return { ok: !missing.length, detail: missing.length ? `缺少导出：${missing.join(', ')}` : `交接产物有效：${contract.path}` }
+}
+function globRegex(glob) {
+  return new RegExp('^' + String(glob).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '\0').replace(/\*/g, '[^/]*').replace(/\0/g, '.*').replace(/\?/g, '.') + '$', 'i')
+}
+function allowedMechCommand(command, prefixes) {
+  if ((prefixes || []).some((prefix) => command === prefix || command.startsWith(`${prefix} `))) return true
+  const tokens = parseMechanicalCommand(command)
+  if (/^node(?:\.exe)?$/i.test(tokens[0] || '') && tokens[1] && /(?:^|[\\/])test[\\/][\w.-]+\.(?:m?js|cjs)$/i.test(tokens[1])) return true
+  return false
+}
+export function parseMechanicalCommand(command) {
+  const tokens = String(command).match(/"[^"]*"|'[^']*'|\S+/g) || []
+  return tokens.map((token) => token.replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, '$1$2'))
+}
+function execCheck(command, cwd, timeoutMs = 120000) {
+  return new Promise((resolve) => {
+    const [rawExecutable, ...args] = parseMechanicalCommand(command)
+    const isWinCmd = process.platform === 'win32' && /^(?:npm|npx|pnpm|yarn)(?:\.cmd)?$/i.test(rawExecutable)
+    const cliName = `${rawExecutable.replace(/\.cmd$/i, '').toLowerCase()}-cli.js`
+    const npmCliCandidates = isWinCmd ? [
+      join(dirname(process.execPath), 'node_modules', 'npm', 'bin', cliName),
+      process.env.ProgramFiles ? join(process.env.ProgramFiles, 'nodejs', 'node_modules', 'npm', 'bin', cliName) : '',
+    ].filter(Boolean) : []
+    const npmCli = npmCliCandidates.find((candidate) => existsSync(candidate)) || ''
+    const useNodeCli = Boolean(npmCli && existsSync(npmCli))
+    // Node 22 blocks direct .cmd execution without a shell on Windows.
+    const useCmd = isWinCmd && !useNodeCli
+    const executable = useNodeCli ? process.execPath : useCmd ? (process.env.ComSpec || 'cmd.exe') : rawExecutable
+    const finalArgs = useNodeCli
+      ? [npmCli, ...args]
+      : useCmd
+        ? ['/d', '/s', '/c', [rawExecutable, ...args].map((arg) => `"${String(arg).replace(/"/g, '""')}"`).join(' ')]
+        : args
+    execFile(executable, finalArgs, { cwd, windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({ code: error?.code ?? 0, output: `${stdout || ''}${stderr || ''}` }))
+  })
+}
+export async function runMechanicalChecks(checks, ctx = {}) {
+  const results = []
+  for (const check of checks || []) {
+    const started = Date.now()
+    let kind = 'unknown', ok = false, detail = ''
+    try {
+      if (check.sha) {
+        kind = 'sha'; const hashes = check.sha.map((p) => pathSha(p)); ok = new Set(hashes).size === 1; detail = check.sha.map((p, i) => `${p}=${hashes[i]}`).join(' ')
+      } else if (check.gitClean) {
+        kind = 'gitClean'; detail = await execGit(check.gitClean, ['status', '--porcelain']); ok = !detail.trim(); detail ||= 'clean'
+      } else if (check.noDiff) {
+        kind = 'noDiff'; const regexes = check.noDiff.map(globRegex); const bad = []
+        for (const item of ctx.items || []) for (const line of String(item.git?.nameStatus || '').split(/\r?\n/).filter(Boolean)) {
+          const [status, file] = line.split(/\s+/, 2)
+          if (regexes.some((re) => re.test(file)) && !(check.allowAdded && status === 'A')) bad.push(file)
+        }
+        ok = !bad.length; detail = bad.length ? `禁止变更：${[...new Set(bad)].join(', ')}` : '无禁止差分'
+      } else if (check.cmd) {
+        kind = 'cmd'
+        if (!allowedMechCommand(check.cmd, ctx.mechCommands)) throw new Error(`机械命令不在白名单：${check.cmd}`)
+        let command = check.cmdResolved || check.cmd
+        if (check.cmdDeferredGlob) command = lintMechanicalChecks([{ ...check, cmdDeferredGlob: false }], { ...ctx, writeScopes: [] })[0].cmdResolved
+        const run = await execCheck(command, ctx.workspace, check.timeoutMs)
+        const matches = [...run.output.matchAll(/tests\s+(\d+)\s*$/gim)]
+        const tests = matches.length ? matches.reduce((sum, m) => sum + Number(m[1]), 0) : null
+        ok = run.code === (check.exit ?? 0) && (check.minTests == null || (tests != null && tests >= check.minTests))
+        detail = `exit=${run.code} tests=${tests ?? 'unknown'} ${run.output.slice(-500)}`
+      } else if (check.exists) {
+        kind = 'exists'; const paths = Array.isArray(check.exists) ? check.exists : [check.exists]; const missing = paths.filter((p) => !existsSync(p)); ok = !missing.length; detail = missing.length ? `不存在：${missing.join(', ')}` : '全部存在'
+      } else if (check.exports) {
+        kind = 'exports'; const found = staticExports(check.exports.file, check.exports.names || []); ok = found.length === (check.exports.names || []).length && existsSync(check.exports.file); detail = `导出 ${found.join(', ') || '(无)'}`
+      } else throw new Error('未知机械检查')
+    } catch (err) { ok = false; detail = String((err && err.message) || err) }
+    results.push({ index: results.length, kind, ok, detail, ms: Date.now() - started })
+  }
+  return { pass: results.every((r) => r.ok), results }
+}
+
+export function syncTargetsNow(targets, pipelineId) {
+  const copied = []
+  for (const target of targets || []) {
+    const source = resolve(target.source), destination = resolve(target.target)
+    if (sensitivePath(destination) || !isPathInsideWorkspace(target.root, destination)) throw new Error(`syncTargets 目标越界或敏感：${destination}`)
+    for (const file of filesUnder(source)) {
+      const relative = statSync(source).isFile() ? basename(source) : file.relative
+      const dest = statSync(source).isFile() ? destination : join(destination, relative)
+      if (!isPathInsideWorkspace(target.root, dest)) throw new Error(`syncTargets 文件目标越界：${dest}`)
+      mkdirSync(dirname(dest), { recursive: true })
+      if (target.mode === 'copy') {
+        if (existsSync(dest)) copyFileSync(dest, `${dest}.bak-${pipelineId}`)
+        copyFileSync(file.absolute, dest)
+      }
+      copied.push({ source: file.absolute, target: dest })
+    }
+  }
+  const mismatches = copied.filter((x) => !existsSync(x.target) || createHash('sha256').update(readFileSync(x.source)).digest('hex') !== createHash('sha256').update(readFileSync(x.target)).digest('hex'))
+  return { pass: !mismatches.length, copied: copied.length, mismatches }
+}
+
 export function apply(ctx, rawConfig) {
   const config = { ...DEFAULTS, ...(rawConfig || {}) }
   const tools = ctx.tools
@@ -877,7 +1759,8 @@ export function apply(ctx, rawConfig) {
   const titleTasks = new Set()
   const wakeTimers = new Set()
   const wakeStates = new WeakMap()
-  const activePipelines = new Set()
+  const activePipelines = new Map()
+  const resumerTimers = new Set()
   let capabilitiesCache = { at: 0, ids: null }
 
   function getWakeState(agent) {
@@ -1213,7 +2096,9 @@ export function apply(ctx, rawConfig) {
       try { cancel() } catch {}
     }
     wakeTimers.clear()
-    for (const cancel of [...activePipelines]) {
+    for (const timer of resumerTimers) clearTimeout(timer)
+    resumerTimers.clear()
+    for (const cancel of [...activePipelines.values()]) {
       try { cancel('relay_dispatch disposed') } catch {}
     }
     activePipelines.clear()
@@ -1258,6 +2143,7 @@ export function apply(ctx, rawConfig) {
         const myGen = ++prepState.generation
         const orig = prepState.orig
         const wrapped = function (id, opts) {
+          let prepared
           try {
             const s = slot
             const stack = new Error().stack || ''
@@ -1286,7 +2172,35 @@ export function apply(ctx, rawConfig) {
           } catch (err) {
             logParent(`prepare gen=${myGen} id=${id || '?'} slot=error cwdMatch=false result=reject reason=error:${(err && err.message) || err} parentSession=none`)
           }
-          return orig.call(this, id, opts)
+          prepared = orig.call(this, id, opts)
+          // Session.prepare currently persists only a fixed header subset and freezes
+          // prepared.header via Object.freeze(). Attach the immutable manifest onto a
+          // WeakMap / symbol or extensible target without mutating a frozen header object.
+          if (slot?.used && slot.sessionId === id && slot.capabilityManifest) {
+            const manifest = slot.capabilityManifest
+            const attachManifest = (obj) => {
+              if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return
+              try {
+                if (Object.isExtensible(obj)) {
+                  obj.capabilityManifest = manifest
+                  obj.capability_manifest = manifest
+                }
+              } catch {}
+            }
+            attachManifest(prepared)
+            attachManifest(prepared?.session)
+            attachManifest(prepared?.header)
+            attachManifest(prepared?.session?.header)
+            try {
+              const mapKey = Symbol.for('@dsh-external/capability-manifests')
+              if (!globalThis[mapKey]) globalThis[mapKey] = new Map()
+              globalThis[mapKey].set(id, manifest)
+              if (prepared?.header && typeof prepared.header === 'object') {
+                globalThis[mapKey].set(prepared.header, manifest)
+              }
+            } catch {}
+          }
+          return prepared
         }
         sess.prepare = wrapped
         logParent(`wrapper installed generation=${myGen}`)
@@ -1356,12 +2270,45 @@ export function apply(ctx, rawConfig) {
   }
 
   /** 串行化 start 调用：同一时刻只有一个槽，并发派发不会串号；单次调用带超时并在超时/dispose 时清槽释放队列。 */
-  function startLinked(toolName, args, exec, rawTask, prefix) {
+  function startLinked(toolName, args, exec, rawTask, prefix, capabilityReadScope, execProfiles = []) {
     if (disposed) return Promise.reject(new Error('relay_dispatch plugin disposed'))
     const parent = exec && exec.agent && exec.agent.session && exec.agent.session.header && exec.agent.session.header.id
     const canLink = Boolean(parent && args && args.workspace && !args.sessionId && config.linkParentSession !== false)
+    const isResume = Boolean(args.sessionId)
     const timeoutMs = config.startTimeoutMs ?? 120000
     const windowMs = config.slotWindowMs ?? timeoutMs
+    const hasExternalWrite = toolName !== TOOL_START_REVIEW && args.permissionPreset !== 'danger-full-access' && Array.isArray(args.writeScope) && args.writeScope.some((p) => !isPathInsideWorkspace(args.workspace, p))
+    const hasExternalRead = toolName !== TOOL_START_REVIEW && args.permissionPreset !== 'danger-full-access' && Array.isArray(args.contextReadScope) && args.contextReadScope.some((p) => !isPathInsideWorkspace(args.workspace, p))
+    const capabilityManifest = compileCapabilityManifest(hasExternalWrite ? { ...args, permissionPreset: 'danger-full-access' } : args, {
+      parentSession: parent || null,
+      review: toolName === TOOL_START_REVIEW,
+      readScope: capabilityReadScope,
+      execProfiles,
+      now: typeof config.now === 'function' ? config.now() : Date.now(),
+      ttlMs: (config.capabilityTtlMinutes ?? config.maxWaitMinutes) * 60000,
+    })
+    // Do NOT pass capabilityManifest in start_run / start_review MCP arguments because
+    // MCP tool schema sets additionalProperties: false. The in-process sessions.prepare
+    // wrapper + Symbol.for('@dsh-external/capability-manifests') is the authoritative path.
+    const cleanArgs = { ...args }
+    if (!isResume && Array.isArray(cleanArgs.writeScope)) {
+      cleanArgs.writeScope = cleanArgs.writeScope.filter((p) => isPathInsideWorkspace(args.workspace, p))
+      if (!cleanArgs.writeScope.length) cleanArgs.writeScope = [args.workspace]
+    }
+    if (!isResume && Array.isArray(cleanArgs.contextReadScope)) {
+      cleanArgs.contextReadScope = cleanArgs.contextReadScope.filter((p) => isPathInsideWorkspace(args.workspace, p))
+      if (!cleanArgs.contextReadScope.length) cleanArgs.contextReadScope = [args.workspace]
+    }
+    delete cleanArgs.capabilityManifest
+    if (hasExternalWrite || hasExternalRead) {
+      cleanArgs.permissionPreset = 'danger-full-access'
+      cleanArgs.confirmedDangerousPermission = true
+    }
+    if (args.sessionId) {
+      cleanArgs.permissionPreset = args.permissionPreset
+      cleanArgs.confirmedDangerousPermission = args.confirmedDangerousPermission
+    }
+    args = cleanArgs
 
     const run = async () => {
       if (disposed) throw new Error('relay_dispatch plugin disposed')
@@ -1375,6 +2322,7 @@ export function apply(ctx, rawConfig) {
             expiresAt: now + windowMs,
             active: true,
             used: false,
+            capabilityManifest,
           }
         : null
       if (my) slot = my
@@ -1448,6 +2396,25 @@ export function apply(ctx, rawConfig) {
     return parseResult(result)
   }
 
+  async function runPluginReloads(plugins, agent, hasFailures) {
+    const names = normalizeReloadPlugins(plugins)
+    if (!names.length) return ''
+    if (disposed) return `reload_pending: ${names.join(', ')}`
+    if (hasFailures || activePipelines.size > 1) return `reload_pending: ${names.join(', ')}`
+    const results = []
+    for (const pkg of [...names.filter((p) => p !== 'dsh-relay-dispatch'), ...names.filter((p) => p === 'dsh-relay-dispatch')]) {
+      try {
+        const result = await tools.execute({ callId: `relay-dispatch-reload-${Date.now()}-${++seq}`, name: 'dev_reload_package', arguments: { packageName: pkg, package: pkg, name: pkg }, ...(agent ? { agent } : {}), signal: new AbortController().signal })
+        const parsed = parseResult(result)
+        if (parsed?.ok === false || parsed?.success === false) throw new Error(parsed.error || 'reload rejected')
+        results.push(`${pkg}(ok)`)
+      } catch (err) {
+        results.push(`${pkg}(failed:${clip(String(err?.message || err), 80)})`)
+      }
+    }
+    return `reloaded: ${results.join(', ')}`
+  }
+
   // ───────── v2：tasks -> join -> gate 单聚合 Job 流水线 ─────────
   function pipelineManifestDir() {
     return config.manifestDir || join(homedir(), '.dsh', 'relay-pipelines')
@@ -1469,22 +2436,56 @@ export function apply(ctx, rawConfig) {
     return kept.length ? kept : candidates
   }
 
-  async function startPipelineV2(args, exec, jobs) {
+  async function startPipelineV2(args, exec, jobs, restored = null) {
     const agent = exec && exec.agent
-    const { modes, warning, aliases } = loadModes(config.modesPath || MODES_PATH)
-    // 同步预检：任何参数/写冲突错误都在此抛出，不调用 relay 工具、不注册 Job。
-    const plan = preflightDispatchV2(args, config, { modes, aliases: aliases || {} })
-    const notes = warning ? [warning] : []
-    const pipelineId = `p-${Date.now().toString(36)}-${++seq}`
+    const sessionId = agent?.session?.header?.id || null
+    const faultPath = join(config.manifestDir || join(homedir(), '.dsh', 'relay-pipelines'), '.dispatcher-fault.json')
+    const statsPath = join(config.manifestDir || join(homedir(), '.dsh', 'relay-pipelines'), '.guard-stats.json')
+    const bumpStat = (name) => {
+      if (config.writeManifest === false) return
+      try { mkdirSync(dirname(statsPath), { recursive: true }); const data = existsSync(statsPath) ? JSON.parse(readFileSync(statsPath, 'utf8')) : {}; data[name] = (data[name] || 0) + 1; writeFileSync(statsPath, JSON.stringify(data, null, 2)) } catch (err) { emitWarn(`[relay-dispatch] guard stats 写入失败：${String(err?.message || err)}`) }
+    }
+    const clearFault = () => {
+      if (config.writeManifest === false || !sessionId) return
+      try { const old = existsSync(faultPath) ? JSON.parse(readFileSync(faultPath, 'utf8')) : {}; writeFileSync(faultPath, JSON.stringify({ sessionId, count: 0, lastCode: null, lastAt: new Date().toISOString(), previousCount: old.sessionId === sessionId ? old.count || 0 : 0 })) } catch (err) { emitWarn(`[relay-dispatch] dispatcher fault 清零失败：${String(err?.message || err)}`) }
+    }
+    const recordFault = (err) => {
+      const code = String(err?.code || err?.message || 'dispatcher_fault').split(':')[0].slice(0, 100)
+      bumpStat(`dispatch.preflight_reject.${code}`)
+      if (config.writeManifest === false || !sessionId || err?.startUnknown || err?.kind === 'parameter' || /^DSH_E_(?:GATE|FOLLOWUP|SCOPE|PREFLIGHT)/.test(code) || /互斥|写范围冲突|非空数组|缺少 startArgs|未知 mode/.test(err?.message || '')) return
+      try { mkdirSync(dirname(faultPath), { recursive: true }); const old = existsSync(faultPath) ? JSON.parse(readFileSync(faultPath, 'utf8')) : {}; const count = old.sessionId === sessionId ? (old.count || 0) + 1 : 1; writeFileSync(faultPath, JSON.stringify({ sessionId, count, lastCode: code, lastAt: new Date().toISOString() })) } catch (writeErr) { emitWarn(`[relay-dispatch] dispatcher fault 写入失败：${String(writeErr?.message || writeErr)}`) }
+    }
+    const { modes, warning, aliases, roots, hosts = {}, mechCommands = ['npm test', 'npm --prefix', 'node --test', 'node test/unit.mjs'], targets } = loadModes(config.modesPath || MODES_PATH)
+    // 恢复时使用清单中的原始计划；新流水线仍在注册 Job 前同步预检。
+    let plan
+    let expansionNotes = []
+    try {
+      const expanded = restored ? args : expandTargets(args, { targets })
+      expansionNotes = expanded.targetWriteScope?.length ? ['targets 展开含工作区外 writeScope；权限按既有规则升级'] : []
+      plan = restored ? { ...restored.plan, tasks: restored.plan.tasks.map((t) => ({ ...t, dependsOn: new Set(Array.isArray(t.dependsOn) ? t.dependsOn : []) })) } : preflightDispatchV2(expanded, { ...config, currentSessionId: agent?.session?.header?.id }, { modes, aliases: aliases || {}, roots: roots || {}, hosts, mechCommands, targets })
+    } catch (err) { recordFault(err); throw err }
+    if (plan.followUp) bumpStat('dispatch.followup.started')
+    if (plan.tasks.some((t) => t.inferredScope?.readRoots?.length)) bumpStat('dispatch.scope_inferred')
+    const notes = restored ? (restored.notes || []) : [...(warning ? [warning] : []), ...expansionNotes]
+    const pipelineId = restored ? restored.pipelineId : plan.followUp ? `${plan.followUpOf}-f${(plan.previous.followUps || []).length + 1}` : `p-${Date.now().toString(36)}-${++seq}`
     const manifestPath = join(pipelineManifestDir(), `${pipelineId}.json`)
+    const parentSessionId = restored ? (restored.parentSessionId || null) : ((agent && agent.session && agent.session.header && agent.session.header.id) || null)
+    const createdAt = restored ? restored.createdAt : new Date().toISOString()
     let capabilityIds = null
     try { capabilityIds = await getCapabilityIdsV2(exec) } catch (e) { notes.push(`list_capabilities 失败，未过滤候选：${(e && e.message) || e}`) }
-    const items = plan.tasks.map((t) => ({
-      index: t.index, kind: 'task', label: t.label, status: 'pending',
-      workspace: t.workspace, writable: t.writable, dependsOn: [...t.dependsOn],
-      runId: undefined, sessionId: undefined, webUrl: undefined, model: undefined,
-      output: '', error: undefined, startUnknown: false, notes: [], git: undefined,
-    }))
+    const restoredItems = new Map((restored?.items || []).filter((item) => item.kind !== 'gate').map((item) => [item.index, item]))
+    const restoredGate = (restored?.items || []).find((item) => item.kind === 'gate')
+    const items = plan.tasks.map((t) => {
+      const previous = restoredItems.get(t.index)
+      return {
+        index: t.index, kind: 'task', label: t.label, status: plan.followUp && t.index !== plan.followUpTarget ? 'succeeded' : (previous?.status || 'pending'),
+        workspace: t.workspace, writable: t.writable, dependsOn: [...t.dependsOn],
+        runId: previous?.runId, sessionId: previous?.sessionId, webUrl: previous?.webUrl, model: previous?.model,
+        output: previous?.output || '', error: previous?.error, startUnknown: previous?.startUnknown || false, verdict: previous?.verdict, selfReview: previous?.selfReview || 0, reloadPending: previous?.reloadPending || false,
+        midRunRetries: previous?.midRunRetries || 0, beforeGit: previous?.beforeGit,
+        notes: previous?.notes || [], git: previous?.git,
+      }
+    })
     let jobId
     let finalRead = null
     let pipelinePhase = 'running'
@@ -1496,15 +2497,23 @@ export function apply(ctx, rawConfig) {
       phase: pipelinePhase,
       pipelineId,
       jobId,
+      parentSessionId,
+      createdAt,
+      plan: { ...plan, tasks: plan.tasks.map((t) => ({ ...t, dependsOn: [...(t.dependsOn || [])] })) },
       updatedAt: new Date().toISOString(),
       onWriteConflict: plan.onWriteConflict,
+      parentPipelineId: plan.followUpOf,
+      scopeNotes: plan.tasks.flatMap((t) => t.inferredScope?.notes || []),
       gateUserAsk: plan.gate ? plan.gate.userAsk : undefined,
+      fixRound: items.find((i) => i.fixRound)?.fixRound || 0,
       notes,
       items: items.map((i) => ({
         index: i.index, kind: i.kind, label: i.label, status: i.status,
         runId: i.runId, sessionId: i.sessionId, webUrl: i.webUrl, model: i.model,
-        startUnknown: i.startUnknown || undefined, error: i.error,
-        verdict: i.verdict, selfReview: i.selfReview || undefined,
+        startUnknown: i.startUnknown || undefined, error: i.error, output: i.output,
+        verdict: i.verdict, selfReview: i.selfReview || undefined, gateKind: i.gateKind, mechanical: i.mechanical,
+        reloadPending: i.reloadPending || undefined,
+        midRunRetries: i.midRunRetries || 0, beforeGit: i.beforeGit, fixRound: i.fixRound || 0,
         dependsOn: i.dependsOn, git: i.git,
       })),
     })
@@ -1569,71 +2578,94 @@ export function apply(ctx, rawConfig) {
     async function runOne(t, item, abort) {
       item.status = 'running'
       writeManifest()
-      try {
-        if (disposed) throw new Error('relay_dispatch disposed')
-        const before = item.writable ? await captureGitTree(t.workspace) : { available: false }
-        const startTool = t.review ? TOOL_START_REVIEW : TOOL_START_RUN
-        const attempts = t.candidates.length ? filterCandidatesV2(t.candidates, capabilityIds, item.notes) : [null]
-        let started, used, lastErr
-        for (const c of attempts) {
+      if (item.runId) {
+        try {
+          const { snap, cancelled: runCancelled } = await waitRunV2(item, { runId: item.runId }, abort)
+          if (disposed || isDisposeCancelReason(abort.signal.reason)) return
+          item.output = runCancelled ? buildCancelConclusion(snap, 'cancelled') : fullConclusion(snap)
+          const blocked = !runCancelled && isUpstreamBlockedOutput(item.output)
+          item.status = runCancelled || snap?.status === 'cancelled' ? 'cancelled' : (snap?.status === 'succeeded' && !blocked ? 'succeeded' : 'failed')
+          if (blocked) item.error = clip(item.output, 300)
+        } catch (err) {
+          if (disposed || isDisposeCancelReason(abort.signal.reason)) return
+          item.status = abort.signal.aborted ? 'cancelled' : 'failed'
+          item.error = String((err && err.message) || err)
+          item.output ||= item.error
+        } finally { writeManifest() }
+        return
+      }
+      const before = item.beforeGit || (item.writable ? await captureGitTree(t.workspace) : { available: false })
+      item.beforeGit = before
+      const attempts = Array.isArray(t.candidates) && t.candidates.length ? filterCandidatesV2(t.candidates, capabilityIds, item.notes) : [null]
+      let attemptIndex = Math.min(item.midRunRetries || 0, Math.max(0, attempts.length - 1))
+      while (!abort.signal.aborted && !disposed) {
+        let beforeFailure = null
+        try {
+          const startTool = t.review ? TOOL_START_REVIEW : TOOL_START_RUN
+          const c = attempts[attemptIndex]
           const sa = c ? { ...t.baseArgs, provider: c.provider, model: c.model } : t.baseArgs
+          let started
           try {
-            started = await startLinked(startTool, fillStartArgs(sa, config, t.review), exec, t.rawTask, t.modePrefix)
-            // start_run 已返回但等待启动期间发生用户取消：立即取消刚拿到的远端 run，防孤儿写任务。
-            if (abort.signal.aborted) {
-              const orphanRunId = started && (started.runId || (started.run && started.run.runId))
-              if (orphanRunId && !disposed && !isDisposeCancelReason(abort.signal.reason)) {
-                await call(TOOL_CANCEL, { runId: orphanRunId }, agent, new AbortController().signal).catch(() => {})
-              }
-              throw new Error('启动完成后检测到已取消')
-            }
-            used = c ? `${c.provider}/${c.model}` : `${sa.provider || config.defaultProvider}/${sa.model || config.defaultModel}`
-            lastErr = undefined
-            break
+            started = await startLinked(startTool, fillStartArgs(sa, config, t.review), { ...(exec || {}), signal: abort.signal }, t.rawTask, t.modePrefix, t.baseArgs.contextReadScope, t.inferredScope?.hosts.map((h) => `ssh:${h}`))
           } catch (err) {
-            const msg = String((err && err.message) || err)
-            lastErr = new Error(msg)
             if (t.writable && isUnknownStartError(err)) {
-              // start_unknown：写任务可能已被对端接受，换模型重试会造成双写。
               item.startUnknown = true
               item.notes.push('start_unknown：写任务启动结果不可知，为防止双写不再换模型重试')
-              break
             }
-            if (c && isPreStartRejection(err, t.writable)) break
-            if (c) item.notes.push(`跳过 ${c.provider}/${c.model}：启动失败 ${clip(msg, 200)}`)
-            if (abort.signal.aborted || disposed) break
+            throw err
           }
+          const runId = started && (started.runId || (started.run && started.run.runId))
+          if (!runId) throw new Error(`start 未返回 runId：${clip(started, 600)}`)
+          // Persist the handle before observing abort/dispose so reload can always adopt it.
+          item.runId = runId
+          item.sessionId = started.sessionId || (started.run && started.run.sessionId)
+          item.webUrl = started.webUrl
+          item.model = c ? `${c.provider}/${c.model}` : `${sa.provider || config.defaultProvider}/${sa.model || config.defaultModel}`
+          writeManifest()
+          if (abort.signal.aborted) {
+            if (!disposed && !isDisposeCancelReason(abort.signal.reason)) await call(TOOL_CANCEL, { runId }, agent, new AbortController().signal).catch(() => {})
+            return
+          }
+          const { snap, cancelled: runCancelled } = await waitRunV2(item, started, abort)
+          if (disposed || isDisposeCancelReason(abort.signal.reason)) return
+          item.output = runCancelled ? buildCancelConclusion(snap, 'cancelled') : fullConclusion(snap)
+          const blocked = !runCancelled && isUpstreamBlockedOutput(item.output)
+          item.status = runCancelled || snap?.status === 'cancelled' ? 'cancelled' : (snap?.status === 'succeeded' && !blocked ? 'succeeded' : 'failed')
+          if (blocked) item.error = clip(item.output, 300)
+          if (item.status === 'failed') beforeFailure = item.output
+        } catch (err) {
+          if (disposed || isDisposeCancelReason(abort.signal.reason)) return
+          item.status = abort.signal.aborted ? 'cancelled' : 'failed'
+          item.error = String((err && err.message) || err)
+          if (item.startUnknown) item.error = `start_unknown: ${item.error}`
+          item.output ||= item.error
+          beforeFailure = item.output
         }
-        if (lastErr) throw lastErr
-        const runId = started && (started.runId || (started.run && started.run.runId))
-        if (!runId) throw new Error(`start 未返回 runId：${clip(started, 600)}`)
-        item.runId = runId
-        item.sessionId = started.sessionId || (started.run && started.run.sessionId)
-        item.webUrl = started.webUrl
-        item.model = used
-        writeManifest()
-        const { snap, cancelled: runCancelled } = await waitRunV2(item, started, abort)
-        item.output = runCancelled ? buildCancelConclusion(snap, 'cancelled') : fullConclusion(snap)
-        item.status = runCancelled || (snap && snap.status === 'cancelled')
-          ? 'cancelled'
-          : (snap && snap.status === 'succeeded' ? 'succeeded' : 'failed')
         if (item.writable) {
           const after = await captureGitTree(t.workspace)
           const diff = await diffGitTrees(t.workspace, before, after)
-          item.git = {
-            available: diff.available, changed: diff.changed, files: diff.files,
-            nameStatus: diff.nameStatus, numstat: diff.numstat, statText: diff.statText,
-            beforeTree: diff.beforeTree, afterTree: diff.afterTree,
+          item.git = { available: diff.available, changed: diff.changed, files: diff.files, nameStatus: diff.nameStatus, numstat: diff.numstat, statText: diff.statText, beforeTree: diff.beforeTree, afterTree: diff.afterTree }
+        }
+        if (item.status === 'succeeded' && t.handoffOut?.length) {
+          for (const name of t.handoffOut) {
+            const verdict = verifyHandoffContract(plan.handoff[name])
+            if (!verdict.ok) { item.status = 'failed'; item.error = verdict.detail; item.output += `\n${verdict.detail}`; break }
           }
         }
-      } catch (err) {
-        item.status = abort.signal.aborted || disposed ? 'cancelled' : 'failed'
-        item.error = String((err && err.message) || err)
-        if (item.startUnknown) item.error = `start_unknown: ${item.error}`
-        if (!item.output) item.output = item.error
-      } finally {
+        const cleanWritable = !item.writable || (item.git?.available && !item.git.changed)
+        if (item.status === 'failed' && !item.startUnknown && cleanWritable && (item.midRunRetries || 0) < 1 && attemptIndex + 1 < attempts.length) {
+          item.midRunRetries = (item.midRunRetries || 0) + 1
+          attemptIndex++
+          item.notes.push(`mid_run_failover=1：${beforeFailure ? clip(beforeFailure, 160) : 'failed'}；切换 ${attempts[attemptIndex].provider}/${attempts[attemptIndex].model}`)
+          item.runId = undefined; item.sessionId = undefined; item.error = undefined
+          writeManifest()
+          continue
+        }
+        if (item.status === 'failed' && item.writable && item.git && (!item.git.available || item.git.changed)) item.notes.push('mid_run_failover=0：写任务非零改动或 Git 快照不可用，禁止自动重试')
         writeManifest()
+        return
       }
+      if (!disposed && abort.signal.aborted) { item.status = 'cancelled'; writeManifest() }
     }
 
     jobId = jobs.start({
@@ -1647,7 +2679,12 @@ export function apply(ctx, rawConfig) {
           if (cancelled) return
           cancelled = true
           const detachOnly = disposed || isDisposeCancelReason(reason)
-          if (detachOnly) pipelinePhase = 'detached'
+          // 先落 detached 清单，再让本地 job 以 reported 结算。kill 会重入本函数，cancelled 已置位。
+          if (detachOnly) {
+            pipelinePhase = 'detached'
+            writeManifest()
+            if (jobId) quietDisposedJob(jobs, jobId, agent)
+          }
           try { abort.abort(reason || 'cancelled') } catch {}
           // DSH 关闭/插件热重载只分离本地等待，远端 run 必须继续存活；仅用户显式取消才 cancel_run。
           if (!detachOnly) {
@@ -1656,10 +2693,10 @@ export function apply(ctx, rawConfig) {
                 call(TOOL_CANCEL, { runId: item.runId }, agent, new AbortController().signal).catch(() => {})
               }
             }
+            writeManifest()
           }
-          writeManifest()
         }
-        activePipelines.add(disposeCancel)
+        activePipelines.set(pipelineId, disposeCancel)
         const snapshotText = () => {
           const lines = [V2_MACHINE_HEADER, `pipeline_id: ${pipelineId}`, 'state: running']
           for (const item of items) {
@@ -1668,8 +2705,10 @@ export function apply(ctx, rawConfig) {
           return lines.join('\n')
         }
         const finish = (r) => {
-          activePipelines.delete(disposeCancel)
-          if (pipelinePhase !== 'detached') pipelinePhase = 'completed'
+          activePipelines.delete(pipelineId)
+          // 热重载只结束旧实例的本地等待：保留 detached 清单供新实例接管，不能发假完成通知。
+          if (disposed || pipelinePhase === 'detached') return { ...r, status: 'killed' }
+          pipelinePhase = 'completed'
           finalRead = `${pipelineResultHeader}\n${r.output || ''}\n${modelNote()}`
           writeManifest()
           if (!cancelled) scheduleOwnerWake(agent, jobId)
@@ -1680,14 +2719,16 @@ export function apply(ctx, rawConfig) {
           const maxConc = Math.max(1, config.maxConcurrentTasks ?? DEFAULTS.maxConcurrentTasks)
           const launch = (t) => {
             const item = items[t.index]
-            const p = runOne(t, item, abort).finally(() => { running.delete(t.index) })
+            const upstream = [...t.dependsOn].map((d) => items[d]).filter((i) => i?.git?.files?.length)
+            const launchTask = upstream.length ? { ...t, baseArgs: { ...t.baseArgs, task: `${t.baseArgs.task}\n上游实际变更：${upstream.flatMap((i) => i.git.files).join(', ')}` } } : t
+            const p = runOne(launchTask, item, abort).finally(() => { running.delete(t.index) })
             running.set(t.index, p)
           }
           while (!abort.signal.aborted && !disposed) {
             let changed = false
             for (const t of plan.tasks) {
               const item = items[t.index]
-              if (item.status !== 'pending') continue
+              if (item.status !== 'pending' && !(item.status === 'running' && item.runId && !running.has(t.index))) continue
               const deps = [...t.dependsOn]
               if (deps.some((d) => ['failed', 'cancelled', 'skipped'].includes(items[d].status))) {
                 item.status = 'skipped'
@@ -1706,30 +2747,57 @@ export function apply(ctx, rawConfig) {
             if (!changed) break
           }
           if (running.size > 0) await Promise.allSettled([...running.values()])
+          // dispose 后 runOne 保留 running/runId；此处不得取消 pending 或创建假 gate 结果。
+          if (disposed || pipelinePhase === 'detached' || isDisposeCancelReason(abort.signal.reason)) {
+            if (disposed || isDisposeCancelReason(abort.signal.reason)) pipelinePhase = 'detached'
+            writeManifest()
+            return { status: 'killed', output: `pipeline ${pipelineId} detached` }
+          }
           for (const item of items) {
             if (item.status === 'pending') { item.status = 'cancelled'; item.output = '已取消' }
           }
 
           let gateSelfReview = false
+          let fixRound = restored?.fixRound || 0
           if (plan.gate) {
-            const gateItem = {
+            const gateItem = restoredGate ? {
+              ...restoredGate, notes: [...(restoredGate.notes || [])],
+              index: items.length, kind: 'gate', label: 'gate',
+              workspace: plan.tasks[0] && plan.tasks[0].workspace, writable: false, dependsOn: [],
+              selfReview: restoredGate.selfReview || 0,
+            } : {
               index: items.length, kind: 'gate', label: 'gate', status: 'pending',
               workspace: plan.tasks[0] && plan.tasks[0].workspace, writable: false, dependsOn: [],
               output: '', error: undefined, startUnknown: false, notes: [], git: undefined,
               verdict: 'unknown', selfReview: 0,
             }
+            gateSelfReview = gateItem.selfReview === 1
             items.push(gateItem)
+            if (disposed || pipelinePhase === 'detached' || isDisposeCancelReason(abort.signal.reason)) {
+              if (disposed || isDisposeCancelReason(abort.signal.reason)) pipelinePhase = 'detached'
+              writeManifest()
+              return { status: 'killed', output: `pipeline ${pipelineId} detached` }
+            }
             const succeeded = plan.tasks.filter((t) => items[t.index].status === 'succeeded')
             const partial = succeeded.length < plan.tasks.length
-            if (!succeeded.length) {
-              gateItem.status = 'skipped'
-              gateItem.output = '没有成功的子任务，gate 跳过'
+            if (restoredGate?.status === 'succeeded' && ['pass', 'fail', 'partial'].includes(restoredGate.verdict)) {
+              gateItem.notes.push('热重载恢复：复用已完成的 Gate 结果，未重新发起子会话')
+            } else if (restoredGate?.runId) {
+              try {
+                const { snap, cancelled: gateCancelled } = await waitRunV2(gateItem, { runId: gateItem.runId }, abort)
+                gateItem.output = gateCancelled ? buildCancelConclusion(snap, 'gate cancelled') : fullConclusion(snap)
+                gateItem.status = gateCancelled ? 'cancelled' : (snap?.status === 'succeeded' ? 'succeeded' : 'failed')
+                gateItem.verdict = parseGateVerdict(gateItem.output)
+                gateItem.notes.push('热重载恢复：复用原 Gate runId，未重新发起子会话')
+              } catch (err) {
+                gateItem.status = 'failed'; gateItem.error = String((err && err.message) || err); gateItem.output ||= gateItem.error
+              }
+            } else if (!succeeded.length) {
+              gateItem.status = 'skipped'; gateItem.output = '没有成功的子任务，gate 跳过'
             } else if (partial && plan.gate.onPartial === 'skip') {
-              gateItem.status = 'skipped'
-              gateItem.output = '部分子任务未成功，onPartial=skip，gate 跳过'
+              gateItem.status = 'skipped'; gateItem.output = '部分子任务未成功，onPartial=skip，gate 跳过'
             } else if (abort.signal.aborted || disposed) {
-              gateItem.status = 'cancelled'
-              gateItem.output = '已取消'
+              gateItem.status = 'cancelled'; gateItem.output = '已取消'
             } else {
               const usedModels = new Set(succeeded.map((t) => items[t.index].model).filter(Boolean))
               const usedVendors = new Set([...usedModels].map((id) => {
@@ -1737,57 +2805,130 @@ export function apply(ctx, rawConfig) {
                 return vendorOf(slash >= 0 ? id.slice(0, slash) : '', slash >= 0 ? id.slice(slash + 1) : id)
               }))
               const verifyCfg = (modes && modes.verify) || BUILTIN_MODES.verify
-              const evidence = succeeded.map((t) => {
-                const it = items[t.index]
-                const git = it.git && it.git.available ? it.git : null
-                const gitText = [
-                  `变更文件：${(git && git.files && git.files.join(', ')) || '(无快照证据)'}`,
-                  `numstat:\n${(git && git.numstat) || '(无)'}`,
-                  `statText:\n${(git && git.statText) || '(无)'}`,
-                ].join('\n')
-                return `## ${it.label} (${it.model || '?'})\n${conclusion({ assistantText: it.output }, 1500)}\n${gitText}`
-              }).join('\n\n')
-              const gateTaskText = [
-                plan.gate.criteria,
-                `用户原始需求：${plan.gate.userAsk}`,
-                '输出要求：第一行必须且只能是 `verdict: pass`、`verdict: fail` 或 `verdict: partial` 之一；随后再列证据。会话自身成功不代表验收通过，必须依据标准与真实 Git 证据作判断。',
-                plan.gate.commands.length ? `请执行以下验证命令并报告结果：\n${plan.gate.commands.map((c) => `- ${c}`).join('\n')}` : '',
-                evidence,
-              ].filter(Boolean).join('\n\n')
-              const applied = applyMode(verifyCfg, { workspace: succeeded[0].workspace, task: gateTaskText }, aliases || {})
-              // 优先剔除同厂商模型；若无异构候选，也必须回退原链真正跑一次守门员，并明确标记自审。
-              const originalGateCandidates = filterCandidatesV2(applied.candidates, capabilityIds, [])
-              let gateCandidates = applied.candidates.filter((c) =>
-                !usedModels.has(`${c.provider}/${c.model}`) && !usedVendors.has(vendorOf(c.provider, c.model)))
-              gateCandidates = filterCandidatesV2(gateCandidates, capabilityIds, gateItem.notes)
-              if (!gateCandidates.length) {
-                gateSelfReview = true
-                gateItem.selfReview = 1
-                gateCandidates = originalGateCandidates
-                gateItem.notes.push('self_review=1：无异构厂商候选，已回退原 gate 候选链实际执行守门员；主会话仍须复核')
+              const runGate = async () => {
+                const evidence = succeeded.map((t) => {
+                  const it = items[t.index]
+                  const git = it.git && it.git.available ? it.git : null
+                  return `## ${it.label} (${it.model || '?'})\n${conclusion({ assistantText: it.output }, 1500)}\n变更文件：${(git && git.files && git.files.join(', ')) || '(无快照证据)'}\nnumstat:\n${(git && git.numstat) || '(无)'}\nstatText:\n${(git && git.statText) || '(无)'}`
+                }).join('\n\n')
+                const gateTaskText = [plan.gate.criteria, `用户原始需求：${plan.gate.userAsk}`, '输出要求：第一行必须且只能是 `verdict: pass`、`verdict: fail` 或 `verdict: partial` 之一；随后再列证据。会话自身成功不代表验收通过，必须依据标准与真实 Git 证据作判断。', plan.gate.commands.length ? `请执行以下验证命令并报告结果：\n${plan.gate.commands.map((c) => `- ${c}`).join('\n')}` : '', evidence].filter(Boolean).join('\n\n')
+                const applied = applyMode(verifyCfg, { workspace: succeeded[0].workspace, task: gateTaskText, maxTurns: 6 }, aliases || {})
+                const originalGateCandidates = filterCandidatesV2(applied.candidates, capabilityIds, [])
+                let gateCandidates = applied.candidates.filter((c) => !usedModels.has(`${c.provider}/${c.model}`) && !usedVendors.has(vendorOf(c.provider, c.model)))
+                gateCandidates = filterCandidatesV2(gateCandidates, capabilityIds, gateItem.notes)
+                if (!gateCandidates.length) {
+                  gateSelfReview = true; gateItem.selfReview = 1; gateCandidates = originalGateCandidates
+                  gateItem.notes.push('self_review=1：无异构厂商候选，已回退原 gate 候选链实际执行守门员；主会话仍须复核')
+                }
+                const gt = { index: gateItem.index, label: 'gate', mode: 'verify', review: false, rawTask: gateTaskText, modePrefix: '', baseArgs: applied.args, candidates: gateCandidates, workspace: succeeded[0].workspace, writable: false }
+                await runOne(gt, gateItem, abort)
+                gateItem.verdict = parseGateVerdict(gateItem.output)
+                if (gateItem.verdict === 'unknown') gateItem.notes.push('守门员输出未包含可解析 verdict，验收状态记为 unknown')
+                writeManifest()
               }
-              const gt = {
-                index: gateItem.index, label: 'gate', mode: 'verify', review: false,
-                rawTask: gateTaskText, modePrefix: '', baseArgs: applied.args,
-                candidates: gateCandidates, workspace: succeeded[0].workspace, writable: false,
+              let gateKind = ''
+              const runGateAll = async () => {
+                gateItem.runId = undefined; gateItem.sessionId = undefined
+                let syncResult = { pass: true, copied: 0, mismatches: [] }
+                if (plan.syncTargets?.length) syncResult = syncTargetsNow(plan.syncTargets, pipelineId)
+                const parallelFailures = Object.values(plan.handoff || {}).flatMap((contract) => (contract.consumers || []).filter((c) => c.parallel).map(() => verifyHandoffContract(contract))).filter((x) => !x.ok)
+                const checks = [...(plan.gate.checks || []), ...(syncResult.mismatches.length ? [{ exists: syncResult.mismatches.map((x) => x.target) }] : [])]
+                const mech = await runMechanicalChecks(checks, { workspace: succeeded[0].workspace, items, mechCommands: plan.mechCommands || mechCommands })
+                if (!syncResult.pass) mech.results.push({ kind: 'syncTargets', ok: false, detail: `${syncResult.mismatches.length} 个目标 SHA256 不一致` })
+                else if (plan.syncTargets?.length) mech.results.push({ kind: 'syncTargets', ok: true, detail: `${syncResult.copied} 个文件 SHA256 一致` })
+                for (const failure of parallelFailures) mech.results.push({ kind: 'handoff', ok: false, detail: failure.detail })
+                mech.pass = mech.results.every((r) => r.ok)
+                gateItem.mechanical = mech
+                if (!mech.pass) {
+                  gateKind = 'mech'; gateItem.gateKind = gateKind; gateItem.status = 'succeeded'; gateItem.verdict = 'fail'
+                  gateItem.output = `verdict: fail\n机械门失败：\n${mech.results.filter((r) => !r.ok).map((r) => `${r.kind}: ${r.detail}`).join('\n')}`
+                } else if (!plan.gate.criteria.trim() || plan.gate.llm === 'never') {
+                  gateKind = 'mech'; gateItem.gateKind = gateKind; gateItem.status = 'succeeded'; gateItem.verdict = 'pass'
+                  gateItem.output = `verdict: pass\n机械门通过：${mech.results.map((r) => r.kind).join(', ') || 'none'}`
+                } else {
+                  await runGate()
+                  gateKind = `${plan.gate.checks?.length || plan.syncTargets?.length ? 'mech+' : ''}llm`; gateItem.gateKind = gateKind
+                }
               }
-              await runOne(gt, gateItem, abort)
-              gateItem.verdict = parseGateVerdict(gateItem.output)
-              if (gateItem.verdict === 'unknown') gateItem.notes.push('守门员输出未包含可解析 verdict，验收状态记为 unknown')
-              writeManifest()
+              await runGateAll()
+              while (!abort.signal.aborted && !disposed && gateItem.status === 'succeeded' && ['partial', 'fail'].includes(gateItem.verdict) && fixRound < plan.gate.maxFixRounds) {
+                const failureClass = classifyGateFailure(gateItem.mechanical, gateItem.verdict)
+                if (failureClass?.startsWith('mech_')) bumpStat(`dispatch.autofix.${failureClass}`)
+                if (failureClass === 'mech_config_error') { gateItem.notes.push('auto_fix=0：mech_config_error'); break }
+                if (failureClass === 'mech_sync_drift' && plan.syncTargets?.length) {
+                  fixRound++
+                  gateItem.notes.push(`auto_fix_round=${fixRound}：mech_sync_drift 无 LLM 重同步`)
+                  bumpStat('dispatch.autofix.mech_sync_drift')
+                  syncTargetsNow(plan.syncTargets, pipelineId)
+                  const failedIndices = gateItem.mechanical.results.filter((r) => !r.ok).map((r) => r.index).filter(Number.isInteger)
+                  const previousChecks = plan.gate.checks || []
+                  plan.gate.checks = failedIndices.map((i) => previousChecks[i]).filter(Boolean)
+                  await runGateAll()
+                  plan.gate.checks = previousChecks
+                  continue
+                }
+                const target = [...succeeded].reverse().find((t) => items[t.index].writable && items[t.index].sessionId)
+                if (!target) { gateItem.notes.push('auto_fix=0：没有可复用 sessionId 的写任务，fail-closed'); break }
+                gateItem.fixTarget = target.index
+                const targetItem = items[target.index]
+                const findings = gateItem.output
+                fixRound++
+                targetItem.fixRound = fixRound
+                targetItem.notes.push(`auto_fix_round=${fixRound}：复用原 sessionId 修复 Gate 结论`)
+                const beforeFix = targetItem.beforeGit || await captureGitTree(target.workspace)
+                try {
+                  const fixTask = `请就地修复上一轮交付缺口，不扩大需求范围。以下为 Gate 完整审查结论（尤其处理所有[不通过]项）：\n${findings}`
+                  const rawFixArgs = fillStartArgs({
+                    ...target.baseArgs,
+                    task: fixTask,
+                    sessionMode: 'latest-idle',
+                    sessionId: targetItem.sessionId,
+                  }, config, false)
+                  delete rawFixArgs.sessionMode
+                  delete rawFixArgs.resumeSessionId
+                  // 初次派发会把外部路径保留在 CapabilityManifest，但 start_run 只接受 workspace 内 scope。
+                  // auto_fix 复用原始参数时也必须执行同一过滤，避免续跑被底层拒绝。
+                  const hasExternalFixWrite = Array.isArray(rawFixArgs.writeScope) && rawFixArgs.writeScope.some((p) => !isPathInsideWorkspace(target.workspace, p))
+                  if (Array.isArray(rawFixArgs.writeScope)) {
+                    rawFixArgs.writeScope = rawFixArgs.writeScope.filter((p) => isPathInsideWorkspace(target.workspace, p))
+                    if (!rawFixArgs.writeScope.length) rawFixArgs.writeScope = [target.workspace]
+                  }
+                  if (Array.isArray(rawFixArgs.contextReadScope)) {
+                    rawFixArgs.contextReadScope = rawFixArgs.contextReadScope.filter((p) => isPathInsideWorkspace(target.workspace, p))
+                    if (!rawFixArgs.contextReadScope.length) rawFixArgs.contextReadScope = [target.workspace]
+                  }
+                  if (hasExternalFixWrite) rawFixArgs.permissionPreset = 'danger-full-access'
+                  const fixArgs = JSON.parse(JSON.stringify(rawFixArgs))
+                  const resumed = await startLinked(TOOL_START_RUN, fixArgs, { ...(exec || {}), signal: abort.signal }, fixTask, target.modePrefix, target.baseArgs.contextReadScope, target.inferredScope?.hosts.map((h) => `ssh:${h}`))
+                  targetItem.runId = resumed.runId || targetItem.runId
+                  targetItem.sessionId = resumed.sessionId || targetItem.sessionId
+                  targetItem.status = 'running'; writeManifest()
+                  const { snap, cancelled: runCancelled } = await waitRunV2(targetItem, resumed, abort)
+                  if (disposed || isDisposeCancelReason(abort.signal.reason)) break
+                  targetItem.output = runCancelled ? buildCancelConclusion(snap, 'fix cancelled') : fullConclusion(snap)
+                  targetItem.status = !runCancelled && snap?.status === 'succeeded' ? 'succeeded' : (runCancelled ? 'cancelled' : 'failed')
+                  const afterFix = await captureGitTree(target.workspace)
+                  const diff = await diffGitTrees(target.workspace, beforeFix, afterFix)
+                  targetItem.git = { available: diff.available, changed: diff.changed, files: diff.files, nameStatus: diff.nameStatus, numstat: diff.numstat, statText: diff.statText }
+                  if (targetItem.status !== 'succeeded') break
+                  gateItem.runId = undefined; gateItem.sessionId = undefined; gateItem.midRunRetries = 0
+                  gateItem.output = ''; gateItem.error = undefined; gateItem.verdict = 'unknown'
+                  gateItem.notes.push(`auto_fix_round=${fixRound} 完成，仅重跑失败机械检查或复审`)
+                  const failedIndices = gateItem.mechanical?.results?.filter((r) => !r.ok).map((r) => r.index).filter(Number.isInteger) || []
+                  const previousChecks = plan.gate.checks || []
+                  if (failureClass?.startsWith('mech_')) plan.gate.checks = failedIndices.map((i) => previousChecks[i]).filter(Boolean)
+                  await runGateAll()
+                  plan.gate.checks = previousChecks
+                } catch (err) {
+                  if (disposed || isDisposeCancelReason(abort.signal.reason)) break
+                  targetItem.status = 'failed'; targetItem.error = `auto_fix failed: ${String((err && err.message) || err)}`
+                  gateItem.notes.push(targetItem.error); writeManifest(); break
+                }
+              }
             }
             writeManifest()
           }
 
-          const lines = [`pipeline_id: ${pipelineId}`]
-          if (plan.gate) lines.push(`gate_user_ask: ${plan.gate.userAsk}`)
-          for (const item of items) {
-            lines.push(`\n[${item.kind}#${item.index}] ${item.label} -> ${item.status}${item.model ? ` (${item.model})` : ''}${item.runId ? ` runId=${item.runId}` : ''}`)
-            if (item.startUnknown) lines.push('start_unknown=1')
-            if (item.git && item.git.available) lines.push(`changed_files: ${item.git.files.join(', ') || '(无)'}`)
-            if (item.notes.length) lines.push(item.notes.join('；'))
-            lines.push(conclusion({ assistantText: item.output || item.error || '(无)' }, config.maxResultChars))
-          }
           const failedN = items.filter((i) => i.status === 'failed').length
           const succN = items.filter((i) => i.status === 'succeeded').length
           const isCancelled = cancelled || abort.signal.aborted
@@ -1803,11 +2944,25 @@ export function apply(ctx, rawConfig) {
             else if (gateVerdict === 'pass' || gateVerdict === 'partial') result = 'PARTIAL'
           }
           const needsMainAttention = result === 'PASS' ? 'no' : 'yes'
-          pipelineResultHeader = `${V2_MACHINE_HEADER} | RESULT: ${result} | needs_main_attention: ${needsMainAttention} | self_review: ${gateSelfReview ? 1 : 0}`
+          if (plan.followUp) bumpStat(`dispatch.followup.${result === 'PASS' ? 'passed' : 'failed'}`)
+          await flushBeforeColdWake(parentSessionId)
+          let reloadSummary = await runPluginReloads(args.reloadPlugins ?? restored?.plan?.reloadPlugins, agent, failedN > 0 || isCancelled || items.some((i) => i.reloadPending))
+          if (reloadSummary.startsWith('reload_pending:')) items.forEach((i) => { i.reloadPending = true })
+          writeManifest()
+          pipelineResultHeader = `${V2_MACHINE_HEADER} | RESULT: ${result} | needs_main_attention: ${needsMainAttention} | self_review: ${gateSelfReview ? 1 : 0} | gate_kind: ${gateItem?.gateKind || (plan.gate ? 'llm' : 'none')}${plan.followUpOf ? ` | followup_of=${plan.followUpOf}` : ''}`
           // 机器头只由 buildDelivery/finalRead 添加一次，output 保持正文，避免 detail 重复两行 RESULT。
-          const output = lines.join('\n')
+          const output = formatPipelineSummary({
+            pipelineId,
+            gate: plan.gate,
+            gateUserAsk: plan.gate ? plan.gate.userAsk : undefined,
+            items,
+            reloaded: reloadSummary,
+            phase: isCancelled ? 'cancelled' : pipelinePhase,
+            machineHeader: pipelineResultHeader,
+          }, config.maxResultChars, { slim: result === 'PASS' && needsMainAttention === 'no', brief: result !== 'PASS' || needsMainAttention !== 'no' })
           const deliveryStatus = isCancelled ? 'cancelled' : (failedN === 0 ? 'succeeded' : (succN > 0 ? 'partial' : 'failed'))
-          const deliv = buildDelivery(deliveryStatus, output, DETAIL_BUDGET_BYTES, true, pipelineResultHeader)
+          const budget = result === 'PASS' && needsMainAttention === 'no' ? 800 : 1200
+          const deliv = buildDelivery(deliveryStatus, output, budget, true, pipelineResultHeader)
           return { status: isCancelled ? 'killed' : (failedN ? 'failed' : 'completed'), ...deliv, output }
         })().then(finish)
         return {
@@ -1818,6 +2973,15 @@ export function apply(ctx, rawConfig) {
         }
       },
     })
+    clearFault()
+    if (plan.followUp && config.writeManifest !== false) {
+      try {
+        const previousPath = join(pipelineManifestDir(), `${plan.followUpOf}.json`)
+        const previous = JSON.parse(readFileSync(previousPath, 'utf8'))
+        previous.followUps = [...new Set([...(previous.followUps || []), pipelineId])]
+        writeFileSync(previousPath, JSON.stringify(previous, null, 2))
+      } catch (err) { emitWarn(`[relay-dispatch] followUp 父清单关联失败：${String(err?.message || err)}`) }
+    }
     return {
       jobId,
       pipelineId,
@@ -1826,51 +2990,88 @@ export function apply(ctx, rawConfig) {
       note: `已创建 v2 流水线（${plan.tasks.length} 个任务${plan.gate ? ' + gate' : ''}，onWriteConflict=${plan.onWriteConflict}）。清单：${manifestPath}`,
       manifestPath,
       machineHeader: V2_MACHINE_HEADER,
+      ...(args.conclude === true ? { concludeReason: await finishConclude(exec, notes, config.concludeFence) } : {}),
     }
   }
+
+  /** 接管插件重载/DSH 分离的流水线；沿用已有 runId 等待，绝不重复 start_run。 */
+  function resumeDetachedPipelines() {
+    const jobs = ctx.get('jobs')
+    if (!jobs || disposed || config.resumeDetachedPipelines === false) return
+    let names = []
+    try { names = readdirSync(pipelineManifestDir()).filter((n) => n.endsWith('.json')) } catch { return }
+    const cutoff = Date.now() - (config.resumeWindowMs ?? DEFAULTS.resumeWindowMs)
+    for (const name of names) {
+      try {
+        const restored = JSON.parse(readFileSync(join(pipelineManifestDir(), name), 'utf8'))
+        if (restored.phase !== 'detached' || !restored.plan || activePipelines.has(restored.pipelineId)) continue
+        if ((parseTimeMs(restored.updatedAt || restored.createdAt) ?? 0) < cutoff) continue
+        const parent = restored.parentSessionId
+        const agents = ctx.get('agents')
+        const sessions = ctx.get('sessions')
+        const owner = (parent && agents && typeof agents.get === 'function' && agents.get(parent)) || {
+          id: parent || undefined,
+          session: parent && sessions && typeof sessions.get === 'function' ? sessions.get(parent) : undefined,
+        }
+        const exec = { agent: owner, signal: new AbortController().signal }
+        startPipelineV2({}, exec, jobs, restored).catch((err) => emitWarn(`[relay-dispatch] 恢复流水线失败：${String((err && err.message) || err)}`))
+      } catch (err) {
+        emitWarn(`[relay-dispatch] 读取分离流水线 ${name} 失败：${String((err && err.message) || err)}`)
+      }
+    }
+  }
+  const resumeTimer = setTimeout(resumeDetachedPipelines, config.resumeDelayMs ?? DEFAULTS.resumeDelayMs)
+  resumeTimer.unref?.()
+  resumerTimers.add(resumeTimer)
 
   ctx.effect(() => tools.register({
     name: 'relay_dispatch',
     description:
-      '派发 Harness relay 任务并在后台等待：立即返回 jobId，结束时通过 job 完成通知回传精简结论。' +
-      '【startArgs 默认值】最少只需 workspace+task（workspace 须为 Harness 已注册工作区）。未传时自动补：provider/model=' + config.defaultProvider + '/' + config.defaultModel +
-      '；sessionMode=fresh；authorizationBasis=explicit-user-request；reviewTargets 与 contextReadScope=[workspace]；permissionPreset 为 workspace-write/danger-full-access 且无 writeScope 时 writeScope=[workspace]；danger-full-access 时 confirmedDangerousPermission=true；' +
-      'agentPreset 可透传' + (config.defaultAgentPreset ? '（默认 ' + config.defaultAgentPreset + '）' : '（默认不设，用官方 preset）') + '；显式传入的字段不被覆盖。' +
-      '【mode】可选：investigate/implement/verify/review/heavy/rp（键取自 ~/.dsh/dispatch-modes.yaml，每次派发热读）；套用其 permission/workspace/agentPreset/reasoningEffort，并拼 taskPrefix+task+deliverable；未显式给 provider/model 时按 models 候选链依次尝试（跳过不存在的模型，start_run 报错换下一个）；返回里写明实际模型。最简用法：{mode, startArgs:{workspace, task}}。' +
-      '派发后不要调用 wait_run 或 job_output 轮询；没有其他活就直接结束本轮。',
+      '派发 Harness relay 任务，后台执行：立即返回 jobId，结束时通知回传结论；派发后不要轮询 wait_run/job_output，无事即结束本轮。\n' +
+      '最少只需 {workspace, task}（workspace 须已在 Harness 注册）；未传的字段自动补默认，provider/model 默认 ' + config.defaultProvider + '/' + config.defaultModel + '，显式传入的不被覆盖。\n' +
+      'mode：' + Object.keys(loadModes(config.modesPath || MODES_PATH).modes).join('/') + '；套用该模式的权限/模型候选链/交付格式。最简用法：{mode, startArgs:{workspace, task}}。',
     parameters: {
       type: 'object',
       properties: {
         startArgs: {
           type: 'object',
           additionalProperties: true,
-          description: '原样传给 start_run（review=true 时为 start_review）的参数对象，如 workspace/task/provider/model 等',
+          properties: {},
+          description: '传给 start_run/start_review 的参数：workspace/task/provider/model 等',
         },
-        mode: { type: 'string', description: '派发模式名（见 dispatch-modes.yaml）；不给则保持原行为' },
-        review: { type: 'boolean', description: 'true 时改用 start_review（只读审查）' },
-        maxWaitMinutes: { type: 'integer', description: '后台最长等待分钟数（缺省 240）' },
-        tasks: { type: 'array', description: 'v2：多任务流水线；每项 {startArgs?, mode?, review?, label?, workspace/task/provider/model/writeScope 快捷字段}；与顶层 startArgs 合并。单个聚合 Job，完成通知首行为 relay_dispatch_v2: 1', items: { type: 'object', additionalProperties: true } },
-        gate: { type: 'object', description: "v2：全部子任务 join 后的异构验证门；{userAsk, criteria, commands?, onPartial?: 'skip'|'gate'}；自动剔除已参与实现的模型，无可用异构模型时 self_review=1 兜底", additionalProperties: true },
-        onWriteConflict: { type: 'string', description: "v2：同 workspace 写范围重叠时 'error'（默认，同步预检直接报错）或 'serial'（自动串行）", enum: ['error', 'serial'] },
+        mode: { type: 'string', description: 'investigate/implement/verify/review/heavy/rp/uncensored' },
+        review: { type: 'boolean', description: 'true 用 start_review（只读）' },
+        maxWaitMinutes: { type: 'integer', description: '最长等待分钟，默认 240' },
+        conclude: { type: 'boolean', description: '同一步已写出最终回复文字时设为 true；派发成功且 context_compact 同步成功后结束本轮，省去后续一步' },
+        targets: { type: 'array', items: { type: 'string' }, description: '声明式插件套件宏；自动展开同步、机械 Gate、writeScope 与 reloadPlugins' },
+        tasks: { type: 'array', description: '多任务；每项 {startArgs?,mode?,review?,label?,workspace/task/provider/model/writeScope}，与顶层 startArgs 合并', items: { type: 'object', additionalProperties: true, properties: {} } },
+        specFile: { type: 'string', description: '规格文件；预检存在并给 task/Gate 拼指针，支持 @ws/@dsh/@plugins/yaml roots 宏' },
+        specSections: { type: 'array', items: { type: 'string' } },
+        handoff: { type: 'object', description: "交接契约 {name:'path#exportA,exportB'}；task.in/out 自动依赖并校验", additionalProperties: true, properties: {} },
+        syncTargets: { type: 'array', description: "{source,target,root?,mode?:'verify'|'copy'}；copy 自动备份并同步后校验 SHA256", items: { type: 'object', additionalProperties: true, properties: {} } },
+        gate: { type: 'object', description: "v2 验证门；criteria:'@tasks' 自动拼 task 原文；checks:[{sha/gitClean/noDiff/cmd+minTests/exists/exports}]，llm:'auto'|'never'", additionalProperties: true, properties: {} },
+        onWriteConflict: { type: 'string', description: "同 workspace 写范围重叠时 'error'（默认）或 'serial'", enum: ['error', 'serial'] },
+        reloadPlugins: { type: 'array', items: { type: 'string' }, description: '任务全部成功后静默热重载指定插件；有失败时仅列出待重载项' },
+        followUp: { type: 'object', description: '基于失败流水线续修/重跑机械门：{pipelineId,patchTask?,patchGate?}；与 tasks/startArgs 互斥', additionalProperties: true, properties: {} },
       },
       required: [],
       additionalProperties: false,
     },
     output: {
-      schema: { type: 'object', additionalProperties: true },
+      schema: { type: 'object', additionalProperties: true, properties: {} },
       render: (_args, value) => [{
         type: 'text',
         text: value.pipelineId
-          ? `已派发 v2 流水线 pipelineId=${value.pipelineId}（${value.tasks} 个任务${value.gate ? ' + gate' : ''}，jobId=${value.jobId}）。 ${value.note || ''} 结束时会收到通知，不要轮询。`
-          : `已派发 runId=${value.runId}，后台等待中（jobId=${value.jobId}）。` +
-            (value.webUrl ? ` 会话：${value.webUrl}。` : '') +
-            ' ' + (value.note || '') + ' 结束时会收到通知，不要轮询。',
+          ? `OK pipelineId=${value.pipelineId} jobId=${value.jobId}${value.concludeReason ? ` conclude skipped: ${value.concludeReason}` : ''}`
+          : `OK runId=${value.runId} jobId=${value.jobId}${value.concludeReason ? ` conclude skipped: ${value.concludeReason}` : ''}`,
       }],
     },
     async execute(args, exec) {
       const jobs = ctx.get('jobs')
       if (!jobs) throw new Error('background jobs unavailable')
-      if (args.tasks != null || args.gate != null) return startPipelineV2(args, exec, jobs)
+      normalizeReloadPlugins(args.reloadPlugins)
+      if (args.targets != null || args.tasks?.some((t) => t?.targets != null)) return startPipelineV2(args, exec, jobs)
+      if (args.tasks != null || args.gate != null || args.followUp != null) return startPipelineV2(args, exec, jobs)
       if (!args.startArgs) throw new Error('缺少 startArgs；多任务/gate 流水线请使用 tasks[]')
       const startTool = args.review ? TOOL_START_REVIEW : TOOL_START_RUN
       const notes = []
@@ -1912,7 +3113,7 @@ export function apply(ctx, rawConfig) {
         const c = attempts[i]
         const sa = c ? { ...baseArgs, provider: c.provider, model: c.model } : baseArgs
         try {
-          started = await startLinked(startTool, fillStartArgs(sa, config, !!args.review), exec, rawTask, modePrefix)
+          started = await startLinked(startTool, fillStartArgs(sa, config, !!args.review), exec, rawTask, modePrefix, baseArgs.contextReadScope)
           if (started && started.__parentMismatchWarning) notes.push(started.__parentMismatchWarning)
           used = c ? `${c.provider}/${c.model}` : `${sa.provider || config.defaultProvider}/${sa.model || config.defaultModel}`
           lastErr = undefined
@@ -1975,7 +3176,33 @@ export function apply(ctx, rawConfig) {
             if (!cancelled) scheduleOwnerWake(agent, jobId)
             return r
           }
+          const finalize = async (r) => {
+              if (!r.output && r.detail) r.output = String(r.detail).replace(/^status:[^\n]*\n(?:full_in_detail=1\n)?/, '')
+              if (r.output === '(无)' && r.detail && r.detail !== '(无)') r.output = String(r.detail).replace(/^status:[^\n]*\n(?:full_in_detail=1\n)?/, '')
+              const coldHook = globalThis[Symbol.for('dsh.context-compact.hooks.v1')]?.flushBeforeColdWake
+              if (!normalizeReloadPlugins(args.reloadPlugins).length && typeof coldHook !== 'function') return r
+              const reloadSummary = await runPluginReloads(args.reloadPlugins, agent, r.status !== 'completed' || cancelled)
+              await flushBeforeColdWake(agent?.session?.header?.id)
+              if (reloadSummary) {
+                const rebuilt = buildDelivery(r.detail?.startsWith('status: cancelled') ? 'cancelled' : (r.status === 'completed' ? 'succeeded' : 'failed'), r.output || '', DETAIL_BUDGET_BYTES, true, reloadSummary)
+                r.detail = rebuilt.detail
+                r.finalText = rebuilt.finalText
+                r.truncated = rebuilt.truncated
+                r.fullLength = rebuilt.fullLength
+                r.fullTextAvailable = rebuilt.fullTextAvailable
+              }
+              return r
+          }
           const done = (async () => {
+            const finalize = async (r) => {
+              const reloadSummary = await runPluginReloads(args.reloadPlugins, agent, r.status !== 'completed' || cancelled)
+              await flushBeforeColdWake(agent?.session?.header?.id)
+              if (reloadSummary) {
+                const rebuilt = buildDelivery(r.detail?.startsWith('status: cancelled') ? 'cancelled' : (r.status === 'completed' ? 'succeeded' : 'failed'), r.output || '', DETAIL_BUDGET_BYTES, true, reloadSummary)
+                Object.assign(r, rebuilt)
+              }
+              return r
+            }
             let snap = started
             let cancelRequestedAt = snap && snap.cancelRequested ? (parseTimeMs(snap.cancelRequestedAt ?? snap.canceledAt) ?? getNow()) : null
             let cancelReason = null
@@ -2124,8 +3351,9 @@ export function apply(ctx, rawConfig) {
                 return { status: 'killed', ...deliv, output }
               }
               const output = fullConclusion(snap)
-              const ok = snap && snap.status === 'succeeded'
-              const deliv = buildDelivery(String(snap && snap.status), output)
+              const blocked = isUpstreamBlockedOutput(output)
+              const ok = snap && snap.status === 'succeeded' && !blocked
+              const deliv = buildDelivery(blocked ? 'failed' : String(snap && snap.status), output)
               return { status: ok ? 'completed' : 'failed', ...deliv, output }
             } catch (err) {
               if (cancelled || cancelledRun || (snap && snap.status === 'cancelled')) {
@@ -2136,14 +3364,17 @@ export function apply(ctx, rawConfig) {
               const output = fullConclusion(snap)
               return { status: 'failed', detail: String((err && err.message) || err), output }
             }
-          })().then(finish)
+          })().then(finalize).then(finish)
           return {
             cancel: (reason) => {
               if (cancelled) return
               cancelled = true
-              abort.abort(reason || 'cancelled')
+              const detachOnly = disposed || isDisposeCancelReason(reason)
+              // v1 没有可接管的流水线清单，只把本地 job 标 reported，避免卸载后再投递 [status:killed]。
+              if (detachOnly && jobId) quietDisposedJob(jobs, jobId, agent)
+              try { abort.abort(reason || 'cancelled') } catch {}
               // jobs 服务关闭或插件卸载只中止本地等待，绝不误杀仍在执行的远端会话。
-              if (!(disposed || isDisposeCancelReason(reason))) {
+              if (!detachOnly) {
                 call(TOOL_CANCEL, { runId }, agent, new AbortController().signal).catch(() => {})
               }
             },
@@ -2153,7 +3384,7 @@ export function apply(ctx, rawConfig) {
           }
         },
       })
-      return { jobId, runId, model: used, note: modelNote, ...(webUrl ? { webUrl } : {}) }
+      return { jobId, runId, model: used, note: modelNote, ...(webUrl ? { webUrl } : {}), ...(args.conclude === true ? { concludeReason: await finishConclude(exec, notes, config.concludeFence) } : {}) }
     },
   }))
 }

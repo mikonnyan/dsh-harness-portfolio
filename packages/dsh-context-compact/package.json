@@ -1,16 +1,31 @@
 {
   "name": "@dsh-external/dsh-context-compact",
-  "version": "0.1.0",
-  "description": "Event-stream surgical context compaction (context_compact) and lossless recall (context_recall) for DeepSeek Harness",
-  "author": "mikonnyan",
+  "version": "0.0.1",
+  "description": "Surgical context compaction with lossless recall and zero-config native auto-compaction takeover for DeepSeek Harness",
+  "private": false,
   "type": "module",
+  "author": "mikonnyan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikonnyan/dsh-context-compact.git"
+  },
+  "homepage": "https://github.com/mikonnyan/dsh-context-compact#readme",
+  "bugs": {
+    "url": "https://github.com/mikonnyan/dsh-context-compact/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "context-compaction",
+    "agent",
+    "llm"
+  ],
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
   "files": [
     "lib",
     "cordis.patch.yml",
-    "README.md",
-    "MIGRATION.md"
+    "README.md"
   ],
   "license": "BSD-3-Clause",
   "exports": {

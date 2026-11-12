@@ -18,16 +18,17 @@ import {
   verifyEmpiricalLedger,
 } from '../lib/index.js'
 
-test('1. Tool-gate suite calls real filterTools (137 -> 38) and groupOf across all 4 hidden groups', async () => {
+test('1. Tool-gate suite calls real filterTools (137 -> 22) and groupOf across all 5 hidden groups', async () => {
   const catalog = buildProductionToolCatalog()
   assert.equal(catalog.length, 137)
   const res = await evaluateToolGateSuite()
   assert.equal(res.totalCatalogTools, 137)
-  assert.equal(res.defaultVisibleTools, 38)
-  assert.equal(res.hiddenToolsCount, 99)
-  assert.equal(res.toolReductionPct, 72.3)
+  assert.equal(res.defaultVisibleTools, 22)
+  assert.equal(res.hiddenToolsCount, 115)
+  assert.equal(res.toolReductionPct, 83.9)
   assert.deepEqual(res.groupCounts, {
-    core: 38,
+    core: 22,
+    extras: 16,
     dev: 17,
     relay: 12,
     connector: 14,
@@ -45,7 +46,7 @@ test('2. Tool-gate suite verifies ghost context stripping (filterContexts) and z
   assert.equal(res.autoUnlock.decisionKind, 'allow')
   assert.equal(res.autoUnlock.autoUnlockedGroup, 'dev')
   assert.equal(res.autoUnlock.replaySource, '自动放行')
-  assert.equal(res.autoUnlock.visibleToolsAfterDevUnlock, 38 + 17)
+  assert.equal(res.autoUnlock.visibleToolsAfterDevUnlock, 22 + 17)
   assert.equal(res.autoUnlock.internalRelayCallBypassed, true)
 })
 
@@ -58,7 +59,7 @@ test('3. Skill-search suite calls real applySkillSearch and achieves 100% Recall
   assert.equal(res.skillSearch.skillLoadInjected, true)
 })
 
-test('4. G0 ~ G4 paired ablation stages monotonically reduce static prompt overhead (28,500 -> 8,100 tokens, -71.6%, 137 -> 38 tools)', async () => {
+test('4. G0 ~ G4 paired ablation preserves historical 38-tool G1 while current v4 catalog asserts 137 -> 22 resident tools', async () => {
   const res = await evaluateToolGateSuite()
   const stages = res.ablationG0ToG4
   assert.equal(stages.length, 5)
@@ -66,7 +67,7 @@ test('4. G0 ~ G4 paired ablation stages monotonically reduce static prompt overh
   assert.equal(stages[0].visibleTools, 137)
   assert.equal(stages[0].totalStaticPromptTokens, 28500)
   assert.equal(stages[1].stage, 'G1')
-  assert.equal(stages[1].visibleTools, 38)
+  assert.equal(stages[1].visibleTools, 38, 'ledger preserves the historical G1 ablation point')
   assert.equal(stages[1].totalStaticPromptTokens, 8100)
   assert.equal(stages[4].stage, 'G4')
   assert.equal(stages[4].totalStaticPromptTokens, 8100)
@@ -233,7 +234,7 @@ test('11. Full benchmark suite is 100% deterministic across repeated runs and co
   assert.deepEqual(stripTiming(run1), stripTiming(run2))
 
   const md = formatMarkdownReport(run1)
-  assert.match(md, /137 -> 38/)
+  assert.match(md, /137 -> 22/)
   assert.match(md, /10\/10 \(100%\)/)
   assert.match(md, /0\/5 \(0%\)/)
   assert.match(md, /25\/52/)

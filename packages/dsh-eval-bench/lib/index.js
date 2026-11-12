@@ -261,7 +261,7 @@ export function createCompactRuntime(tokenMeter = createDeterministicTokenMeter(
 
 /**
  * Build a deterministic 137-tool catalog matching the production DSH tool distribution:
- * - 38 core resident tools (including `tool_unlock` and `relay_dispatch`)
+ * - 22 core resident tools plus 16 low-frequency extras (bypass direct calls)
  * - 17 `dev_*` tools
  * - 12 `mcp__harness_relay__*` tools
  * - 14 `mcp_connector_*` tools
@@ -342,7 +342,7 @@ export async function evaluateToolGateSuite() {
 
   // 1. Filter 137 -> 38 tools
   const filteredTools = filterTools(catalog, freshSession, cfg, {})
-  const groupCounts = { core: 0, dev: 0, relay: 0, connector: 0, browser: 0 }
+  const groupCounts = { core: 0, extras: 0, dev: 0, relay: 0, connector: 0, browser: 0 }
   for (const t of catalog) {
     const g = groupOf(t.name, cfg) ?? 'core'
     groupCounts[g] = (groupCounts[g] ?? 0) + 1
@@ -749,6 +749,7 @@ export async function evaluateNichSuite(corpus = loadNichCorpus()) {
     {
       from: 'turn:1',
       to: 'turn:5',
+      mergeSummaries: true,
       summary:
         'Gen-3 outer @span (Turns 1..5): full multi-stage investigation checkpoint (ARCH_VERDICT: surface-index-cut-verified-v2.4).',
     },
