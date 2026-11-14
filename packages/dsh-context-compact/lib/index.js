@@ -8,6 +8,10 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { decideAutoCompact, autoCompactState, noteAutoFailure, autoFailures, observeRequestStats, DEFAULT_MIN_INTERVAL_REQUESTS } from './auto-engine.js'
+import { collectSalience, renderSalienceSections } from './salience.js'
+import { coalesceSummaryBlocks, extractRecallTags } from './coalesce.js'
+import { takeRecallSlot, capRecallText, markAutoCompactSample, noteRecallRebound, closedRecallResults, recallEvictStub, evictRecallBlock, recallTurnOf } from './recall-budget.js'
 
 export const name = '@dsh-external/dsh-context-compact'
 // Cordis 4 resolves every inject key as required (array, or a name → config map).
@@ -23,19 +27,27 @@ export const DEFAULT_MAX_FLUSH_RETRIES = 2
 export const DEFAULT_SOFT_WATERMARK_TOKENS = 60000
 export const DEFAULT_SOFT_WATERMARK_TURNS = 20
 export const DEFAULT_KEEP_RECENT_TURNS = 5
+export const DEFAULT_KEEP_RECENT_CLOSED = 2
+export const RECALL_EVICT_TOKENS = 2000
 export const DEFAULT_TOP_CANDIDATES = 3
 export const DEFAULT_OPEN_TURN_LARGE_RESULT_TOKENS = 1500
 export const DEFAULT_AUTO_COMPACT_OPEN_TURN_THRESHOLD = 4000
 export const DEFAULT_PIGGYBACK_THRESHOLD_TOKENS = 20000
 export const DEFAULT_PIGGYBACK_THRESHOLD_TURNS = 8
 export const DEFAULT_PIGGYBACK_IDLE_MS = 300000
-export const DEFAULT_TIER_CLIFF_TOKENS = 112000
+export const DEFAULT_TIER_CLIFF_TOKENS = 180000
 export const DEFAULT_TIER_CLIFF_COMPACTABLE_TOKENS = 10000
 export const DEFAULT_HARD_WATERMARK_RATIO = 0.75
 export const DEFAULT_HARD_TARGET_RATIO = 0.55
 export const DEFAULT_HARD_KEEP_RECENT_STEPS = 2
 export const DEFAULT_OVERFLOW_TARGET_RATIO = 0.50
 export const DEFAULT_OVERFLOW_MAX_RETRIES = 1
+export const DEFAULT_CACHE_HIT_RATIO = 0.1
+export const DEFAULT_CACHE_MISS_RATIO = 1
+export const DEFAULT_COALESCE_BLOCKS = 6
+export const DEFAULT_COALESCE_TOKENS = 5000
+export const DEFAULT_RECALL_PER_TURN = 2
+export { DEFAULT_MIN_INTERVAL_REQUESTS }
 
 const BACKGROUND_DISPATCH_TOOLS = new Set(['relay_dispatch', 'subagent', 'subagent_fork', 'claude_code', 'cursor_agent'])
 const COMPACTION_TOOLS = new Set(['context_compact', 'context_recall'])
@@ -151,12 +163,86 @@ export function eventMessage(session, ev) {
   return ev?.type === 'user/message' ? ev.data : ev?.data?.message
 }
 export const PREFIX_EPOCH_KEY = '@dsh-external/prefix-epoch'
-export function publishPrefixClass(session, summarySeq, prefixClass) {
-  const reg = globalThis[Symbol.for(PREFIX_EPOCH_KEY)] ??= { v: 1, bySession: new WeakMap() }
+export function epochRecord(session) {
+  const reg = globalThis[Symbol.for(PREFIX_EPOCH_KEY)] ??= { v: 2, bySession: new WeakMap() }
+  if (!reg.bySession) reg.bySession = new WeakMap()
+  reg.v = 2
   let rec = reg.bySession.get(session)
-  if (!rec) reg.bySession.set(session, rec = { classBySummarySeq: new Map() })
+  if (!rec) {
+    rec = { classBySummarySeq: new Map(), requestClock: { now: 0, requestSeq: 0 }, pmw: { open: false, reason: null, requestSeq: 0 }, calibration: 1 }
+    reg.bySession.set(session, rec)
+  } else {
+    rec.classBySummarySeq ??= new Map()
+    rec.requestClock ??= { now: 0, requestSeq: 0 }
+    rec.pmw ??= { open: false, reason: null, requestSeq: rec.requestClock.requestSeq || 0 }
+    if (typeof rec.calibration !== 'number' || !(rec.calibration > 0)) rec.calibration = 1
+  }
+  return rec
+}
+export function publishPrefixClass(session, summarySeq, prefixClass) {
+  const rec = epochRecord(session)
   rec.classBySummarySeq.set(summarySeq, prefixClass)
-  if (rec.classBySummarySeq.size > 64) rec.classBySummarySeq.delete(rec.classBySummarySeq.keys().next().value)
+  const nodes = session?.surface?.nodes
+  const watermark = Array.isArray(nodes) ? nodes.reduce((min, seq) => typeof seq === 'number' && seq < min ? seq : min, Infinity) : Infinity
+  if (Number.isFinite(watermark)) {
+    for (const seq of [...rec.classBySummarySeq.keys()]) if (typeof seq === 'number' && seq < watermark) rec.classBySummarySeq.delete(seq)
+  }
+  if (prefixClass === 'rewrite') rec.pmw = { open: true, reason: 'rewrite', requestSeq: rec.requestClock.requestSeq || 0 }
+  return rec
+}
+/** One clock per log length, shared with tool-gate through the prefix-epoch registry (R8). */
+export function stampRequestClock(session, now = Date.now()) {
+  if (!session) return now
+  const rec = epochRecord(session)
+  const length = logLength(session)
+  if (rec.requestClock.length !== length) {
+    rec.requestClock.requestSeq = (rec.requestClock.requestSeq || 0) + 1
+    rec.requestClock.length = length
+    rec.requestClock.now = now
+  } else if (!(rec.requestClock.now > 0)) rec.requestClock.now = now
+  return rec.requestClock.now
+}
+
+/** Log-only receipt. assistant/message would require a surfaceOp and change the model prefix. */
+export function landSyntheticReceipt(session, text) {
+  const data = { source: { kind: 'synthetic-receipt' }, message: { role: 'assistant', content: [{ type: 'text', text }] } }
+  try {
+    if (typeof session?.record === 'function') {
+      session.record('assistant/message', data)
+      return data
+    }
+  } catch {}
+  if (typeof session?.append === 'function') {
+    try { session.append('context-compact/receipt', data) } catch {}
+    return data
+  }
+  const events = session?.events
+  if (Array.isArray(events) && Object.isExtensible(events)) {
+    try { events.push({ type: 'assistant/message', data }) } catch {}
+  }
+  return data
+}
+
+export function extractSummaryText(ev) {
+  const summary = ev?.data?.summary
+  if (typeof summary === 'string') return summary
+  const blocks = Array.isArray(summary) ? summary
+    : Array.isArray(ev?.data?.content) ? ev.data.content
+    : Array.isArray(ev?.data?.message?.content) ? ev.data.message.content
+    : []
+  return blocks.filter((b) => b && typeof b.text === 'string').map((b) => b.text).join('\n')
+}
+
+export function buildCompactionProjection(surfaceTokens, calibration, atSeq) {
+  const cal = typeof calibration === 'number' && calibration > 0 ? calibration : 1
+  return { surfaceTokens: Math.max(0, Math.round(surfaceTokens || 0)), basis: 'heuristic', calibration: cal, atSeq: atSeq ?? 0 }
+}
+export function noteUsageCalibration(session, usage, heuristicTokens) {
+  const prompt = usage?.prompt_tokens ?? usage?.inputTokens ?? usage?.input
+  if (typeof prompt !== 'number' || !(prompt > 0) || !(heuristicTokens > 0)) return null
+  const rec = epochRecord(session)
+  rec.calibration = prompt / heuristicTokens
+  return rec.calibration
 }
 export function computeSurfaceCutSafety(session, suppliedLogInfo) {
   const logInfo = suppliedLogInfo ?? inspectSessionLog(session)
@@ -414,7 +500,7 @@ export function extractEventText(ev, callMap) {
     const callInfo = callMap?.get(callId)
     const toolName = callInfo?.name ?? 'tool'
     const blocks = toolResultBlocks(msg)
-    const text = blocks.map((b) => (b.type === 'text' ? b.text : `[${b.type}]`)).join('\n')
+    const text = blocks.map((b) => (b.type === 'text' ? (b.text?.startsWith('[recall evicted:') && typeof b.recallArchive === 'string' ? b.recallArchive : b.text) : `[${b.type}]`)).join('\n')
     return `[seq=${ev.seq} turn=${ev.data?.turn ?? '?'} tool/result callId=${callId} tool=${toolName}]\n${text}`
   }
   if (ev.type === 'user/message') {
@@ -434,6 +520,71 @@ export function extractEventText(ev, callMap) {
     return `[seq=${ev.seq} turn=${ev.data?.turn ?? '?'} assistant/message]\n${parts.join('\n')}`
   }
   return `[seq=${ev.seq} ${ev.type}] ${JSON.stringify(ev.data)}`
+}
+
+function queryMatchesThinking(query) {
+  return typeof query === 'string' && /thinking/i.test(query)
+}
+
+/** One-line stand-in so a recalled `<thinking>` block cannot flood the page. */
+function collapseThinkingBlocks(text) {
+  return String(text || '').replace(/<thinking>([\s\S]*?)<\/thinking>/g, (_, body) => {
+    const flat = body.replace(/\s+/g, ' ').trim()
+    const chars = Array.from(flat)
+    const preview = chars.slice(0, 60).join('')
+    const ellipsis = chars.length > 60 ? '…' : ''
+    return `<thinking>${preview}${ellipsis} (${chars.length} chars)</thinking>`
+  })
+}
+
+function parseToolArguments(raw) {
+  if (raw && typeof raw === 'object') return raw
+  if (typeof raw !== 'string' || !raw.trim()) return null
+  try { return JSON.parse(raw) } catch { return null }
+}
+
+function targetFromArguments(raw) {
+  const target = parseToolArguments(raw)?.target
+  return typeof target === 'string' ? target.trim() : ''
+}
+
+function recallOriginalTarget(session, callId, callInfo) {
+  const fromCall = targetFromArguments(callInfo?.arguments)
+  if (fromCall) return fromCall
+  for (const ev of getAllEvents(session)) {
+    if (ev?.type !== 'assistant/message') continue
+    for (const block of ev.data?.message?.content ?? []) {
+      if (block?.type === 'tool-call' && block.id === callId) {
+        const target = targetFromArguments(block.arguments)
+        if (target) return target
+      }
+    }
+  }
+  return ''
+}
+
+function turnEndKind(session, turn) {
+  let kind = null
+  for (const ev of getAllEvents(session)) {
+    if (ev?.type !== 'turn/end') continue
+    if (ev.data?.turn === turn) kind = ev.data?.reason?.kind ?? kind
+  }
+  return kind
+}
+
+function assistantReadRecall(session, seq, turn) {
+  for (const ev of getAllEvents(session)) {
+    if (!ev || ev.type !== 'assistant/message' || !(ev.seq > seq)) continue
+    const evTurn = ev.data?.turn
+    if (typeof evTurn !== 'number' || evTurn === turn) return true
+  }
+  return false
+}
+
+/** Evict only after a normal close, or after the assistant has actually read the recall. */
+function recallResultEvictable(session, seq, turn) {
+  if (assistantReadRecall(session, seq, turn)) return true
+  return turnEndKind(session, turn) === 'completed'
 }
 
 /**
@@ -516,9 +667,19 @@ function resolveEndpointSurfaceIndices(session, selector, isEnd, logInfo, surfac
   let targetTurn = null
   const turnMatch = /^turn:\s*(-?\d+)$/i.exec(raw)
   const turnsBackMatch = /^turnsBack:\s*(-?\d+)$/i.exec(raw)
-  const latestClosed = /^(?:latest|latest-closed|auto)$/i.test(raw)
+  const autoEnd = isEnd && /^auto$/i.test(raw)
+  const latestClosed = /^(?:latest|latest-closed)$/i.test(raw) || (!isEnd && /^auto$/i.test(raw))
 
-  if (latestClosed) {
+  if (autoEnd) {
+    // `to:"auto"` keeps the last 2 closed turns (target openTurn-3). Back off
+    // 2→1→0 only when the session itself has fewer closed turns; `from` backoff
+    // lives in planSpanCompaction, which knows the start.
+    const latest = latestClosedTurn(logInfo)
+    let keep = DEFAULT_KEEP_RECENT_CLOSED
+    while (keep > 0 && latest - keep < 1) keep -= 1
+    targetTurn = latest - keep
+    if (targetTurn < 1) throw new Error(`span endpoint "${raw}" has no closed turns to compact`)
+  } else if (latestClosed) {
     if (!isEnd && /^(?:auto|latest-compacted)$/i.test(raw)) throw new Error('from auto/latest-compacted must be resolved by planSpanCompaction')
     targetTurn = logInfo.openTurn === null ? logInfo.lastTurn : logInfo.openTurn - 1
   } else if (turnMatch) {
@@ -849,19 +1010,27 @@ function inspectFreeRideWindow(session, logInfo, options = {}, now = Date.now())
     const inOpenTurn = logInfo.openTurn !== null && logInfo.eventTurnMap.get(ev.seq) === logInfo.openTurn
     if (inOpenTurn && ev.type === 'user/message') activeTurnUserTime = ev.data?.time ?? ev.time ?? activeTurnUserTime
     if (ev.type === 'request/header' || ev.type === 'assistant/message') {
-      latestModelRequestTime = ev.data?.time ?? ev.time
-      if (inOpenTurn) activeTurnHasModelActivity = true
+      if (inOpenTurn) {
+        activeTurnHasModelActivity = true
+      } else {
+        latestModelRequestTime = ev.data?.time ?? ev.time
+      }
     } else if (ev.type === 'tool/call' && BACKGROUND_DISPATCH_TOOLS.has(ev.data?.name)) {
       latestDispatchCall = { callId: ev.data.callId, toolName: ev.data.name, turn: logInfo.eventTurnMap.get(ev.seq) ?? 0, time: ev.time }
     }
-    // A newly-opened turn's user message is not idle evidence. Use the prior
-    // closed turn's durable end (or its final event) as the cold-start anchor.
-    if (ev.type === 'turn/end' || ev.type === 'turn/start') {
+    // A newly-opened turn's user message, turn/start, or first-step request/header is not
+    // prior-turn activity. Anchor cold-start idleMs strictly on closed turns (< openTurn).
+    if (!inOpenTurn && (ev.type === 'turn/end' || ev.type === 'turn/start')) {
       previousClosedTurnEndTime = ev.data?.time ?? ev.time ?? previousClosedTurnEndTime
     }
   }
-  if (logInfo.openTurn !== null && !activeTurnHasModelActivity && previousClosedTurnEndTime !== null) latestModelRequestTime = previousClosedTurnEndTime
-  else if (activeTurnUserTime !== null && (latestModelRequestTime === null || latestModelRequestTime === activeTurnUserTime)) latestModelRequestTime = null
+  if (logInfo.openTurn !== null && previousClosedTurnEndTime !== null) {
+    latestModelRequestTime = latestModelRequestTime === null
+      ? previousClosedTurnEndTime
+      : Math.max(latestModelRequestTime, previousClosedTurnEndTime)
+  } else if (activeTurnUserTime !== null && (latestModelRequestTime === null || latestModelRequestTime === activeTurnUserTime)) {
+    latestModelRequestTime = null
+  }
   const elapsedMs = latestModelRequestTime === null ? null : Math.max(0, now - latestModelRequestTime)
   const idleTriggered = elapsedMs !== null && elapsedMs >= idleMs
   return {
@@ -886,13 +1055,93 @@ export function parseAutoSummary(raw) {
   return { auto: Boolean(match), tail: match?.[1]?.trim() || '' }
 }
 function autoTokens(text) { return Math.ceil(Array.from(String(text || '')).length / 2) }
-function limitAutoSummary(text, maxTokens = 150) {
+function autoChars(text) { return Array.from(String(text || '')).length }
+const AUTO_SUMMARY_FIELD = /^(ask|concl|pipeline|files|fails|ids|open|fix):/
+
+function clipAutoField(part, room) {
+  const chars = Array.from(part)
+  if (chars.length <= room) return part
+  const recall = part.match(/\s*\[recall:\s*@call:[^\]]+\]\s*$/)
+  if (!recall) return chars.slice(0, Math.max(0, room)).join('')
+  const suffix = recall[0]
+  const suffixChars = Array.from(suffix)
+  if (suffixChars.length >= room) return suffixChars.slice(0, Math.max(0, room)).join('')
+  const head = part.slice(0, part.length - suffix.length)
+  return `${Array.from(head).slice(0, room - suffixChars.length).join('')}${suffix}`
+}
+
+/**
+ * Hard cap for `@auto` text. `files:` / `ids:` shrink first so `open:` and a
+ * trailing `@auto` judgement tail are never the part that gets cut off.
+ */
+export function limitAutoSummary(text, maxTokens = 150) {
   const source = String(text || '').replace(/\s+/g, ' ').trim()
-  return Array.from(source).slice(0, Math.max(1, maxTokens * 2)).join('')
+  const budget = Math.max(1, maxTokens * 2)
+  if (autoChars(source) <= budget) return source
+  if (!source.includes(' | ')) return Array.from(source).slice(0, budget).join('')
+  const items = source.split(' | ').map((part, index, all) => {
+    const key = AUTO_SUMMARY_FIELD.exec(part)?.[1] || ''
+    const tail = index === all.length - 1 && !key
+    return { part, key, shrink: key === 'files' || key === 'ids', protect: key === 'open' || key === 'fix' || tail }
+  })
+  const join = () => items.map((item) => item.part).join(' | ')
+  for (const item of items) {
+    if (autoChars(join()) <= budget) break
+    if (!item.shrink) continue
+    const prefix = /^(?:files|ids):\s*/.exec(item.part)?.[0] ?? `${item.key}: `
+    const overflow = autoChars(join()) - budget
+    const value = Array.from(item.part.slice(prefix.length))
+    const keep = Math.max(0, value.length - overflow)
+    const clipped = value.slice(0, keep).join('').replace(/[,，]\s*[^,，]*$/, '')
+    item.part = `${prefix}${clipped}${keep < value.length ? '…' : ''}`
+  }
+  for (const item of items) {
+    if (autoChars(join()) <= budget) break
+    if (!item.shrink) continue
+    const prefix = /^(?:files|ids):\s*/.exec(item.part)?.[0] ?? `${item.key}: `
+    item.part = `${prefix}…`
+  }
+  if (autoChars(join()) > budget) {
+    const protectedText = items.filter((item) => item.protect).map((item) => item.part).join(' | ')
+    const glue = protectedText ? 3 : 0
+    const restBudget = budget - autoChars(protectedText) - glue
+    if (restBudget < 0 && protectedText) return protectedText
+    const kept = []
+    let used = 0
+    for (const item of items) {
+      if (item.protect) continue
+      const sep = kept.length ? 3 : 0
+      const room = restBudget - used - sep
+      if (room <= 0) break
+      const clipped = clipAutoField(item.part, room)
+      if (!clipped) break
+      kept.push(clipped)
+      used += sep + autoChars(clipped)
+    }
+    return [kept.join(' | '), protectedText].filter(Boolean).join(' | ')
+  }
+  return join()
+}
+
+function extractOpenItems(text) {
+  const lines = String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const items = []
+  for (const line of lines.slice(-8)) {
+    const cleaned = line.replace(/^[-*•]+\s*/, '').replace(/^\d+[.)]\s*/, '')
+    const isQuestion = /[?？]\s*$/.test(cleaned)
+    const isProposal = /^(?:open|proposal|next|todo|ask|建议|下一步|待确认|待办)\b/i.test(cleaned) || /^(?:是否|要不要|要否)/.test(cleaned)
+    if (!isQuestion && !isProposal) continue
+    const clipped = Array.from(cleaned).slice(0, 120).join('')
+    if (clipped && !items.includes(clipped)) items.push(clipped)
+    if (items.length >= 3) break
+  }
+  return items
 }
 /** 零 LLM 的确定性摘要；保留机器头/交付块/文件/失败命令，硬上限 150 tokens。 */
 export function buildAutoSpanDigest(session, logInfo, seqs, maxTokens = 150) {
-  const asks = [], conclusions = [], pipelines = [], files = new Set(), fails = []
+  const asks = [], conclusions = [], pipelines = [], files = new Set(), ids = new Set(), fails = []
+  let lastAssistant = null
+  let lastAssistantSeq = -1
   const first = (text, max) => String(text || '').split(/\r?\n/).map((x) => x.trim()).find(Boolean)?.slice(0, max) || ''
   for (const seq of seqs || []) {
     const ev = getEvent(session, seq)
@@ -904,22 +1153,51 @@ export function buildAutoSpanDigest(session, logInfo, seqs, maxTokens = 150) {
       else if ((ev.data?.source?.kind || 'user') === 'user') { const line = first(text, 80); if (line) asks.push(line) }
       for (const match of text.matchAll(/^(?:changed_files|verification):\s*(.+)$/gim)) conclusions.push(match[0].slice(0, 120))
     } else if (ev.type === 'assistant/message') {
+      if (seq >= lastAssistantSeq) { lastAssistantSeq = seq; lastAssistant = ev }
       const text = (ev.data?.message?.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
       const line = first(text, 120); if (line) conclusions.push(line)
-      for (const block of ev.data?.message?.content || []) if (block.type === 'tool-call' && ['write', 'edit'].includes(block.name)) {
-        try { const args = typeof block.arguments === 'string' ? JSON.parse(block.arguments) : block.arguments; if (args?.file_path) files.add(args.file_path) } catch {}
+      for (const block of ev.data?.message?.content || []) if (block.type === 'tool-call') {
+        if (block.id) ids.add(String(block.id))
+        if (['write', 'edit'].includes(block.name)) {
+          try { const args = typeof block.arguments === 'string' ? JSON.parse(block.arguments) : block.arguments; if (args?.file_path) files.add(args.file_path) } catch {}
+        }
       }
-    } else if (ev.type === 'tool/call' && ['write', 'edit'].includes(ev.data?.name)) {
-      const path = ev.data?.arguments?.file_path || ev.data?.args?.file_path; if (path) files.add(path)
+    } else if (ev.type === 'tool/call') {
+      if (ev.data?.callId) ids.add(String(ev.data.callId))
+      if (['write', 'edit'].includes(ev.data?.name)) {
+        const path = ev.data?.arguments?.file_path || ev.data?.args?.file_path; if (path) files.add(path)
+      }
     } else if (ev.type === 'tool/result') {
+      const callId = ev.data?.message?.source?.callId
+      if (callId) ids.add(String(callId))
       const text = toolResultBlocks(ev.data?.message).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
       const head = text.match(/relay_dispatch_v2:\s*1[^\r\n]*/)?.[0]; if (head) pipelines.push(head)
       if (/\[exit code: [1-9]\d*\]/.test(text)) fails.push(first(text, 80))
     }
   }
+  const assistantText = (lastAssistant?.data?.message?.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
+  const openItems = extractOpenItems(assistantText)
   const turns = [...new Set((seqs || []).map((s) => logInfo?.eventTurnMap?.get(s)).filter(Boolean))]
-  const text = `[Auto T${formatTurnsLabel(turns) || '?'}] ask: ${asks.at(-1) || '(none)'} | concl: ${conclusions.at(-1) || '(none)'} | pipeline: ${pipelines.at(-1) || 'none'} | files: ${[...files].join(', ') || 'none'} | fails: ${fails.join('; ') || 'none'}`
-  return limitAutoSummary(text, maxTokens)
+  const salience = collectSalience((seqs || []).map((seq) => getEvent(session, seq)).filter(Boolean))
+  for (const item of salience.openItems) if (!openItems.includes(item)) openItems.push(item)
+  for (const item of salience.corrections) if (!asks.includes(item)) asks.unshift(item)
+  const fix = salience.corrections.join(' ; ')
+  const legacy = `[Auto T${formatTurnsLabel(turns) || '?'}] ask: ${asks.at(-1) || '(none)'} | concl: ${conclusions.at(-1) || '(none)'} | pipeline: ${pipelines.at(-1) || 'none'} | files: ${[...files].join(', ') || 'none'} | ids: ${[...ids].join(', ') || 'none'} | fails: ${fails.join('; ') || 'none'}${fix ? ` | fix: ${fix}` : ''} | open: ${openItems.join(' ; ') || 'none'}`
+  const limited = limitAutoSummary(legacy, maxTokens)
+  const sections = renderSalienceSections({
+    corrections: salience.corrections,
+    openItems,
+    anchors: [...files, ...ids].slice(0, 12),
+    narrative: conclusions.slice(-2),
+  })
+  const budget = Math.max(1, maxTokens * 2)
+  const combined = `${sections}\n${limited}`
+  if ([...combined].length <= budget) return combined
+  if (salience.corrections.length) {
+    const head = `## 决定与纠正\n${salience.corrections.join('\n')}`
+    if ([...`${head}\n${limited}`].length <= budget) return `${head}\n${limited}`
+  }
+  return limited
 }
 
 /**
@@ -1294,12 +1572,35 @@ function planContinuousSlice(session, tokenMeter, spanSpec, minSavingsTokens, lo
  * turns are collected. Unselected intermediate turns stay on the surface; existing
  * `<compacted-summary>` nodes are skipped unless `mergeSummaries === true`.
  */
+function compactableClosedFloor(session, logInfo, surfaceNodes, nodeTurnsList, fromSelector) {
+  const rawFrom = String(fromSelector ?? 'auto').trim()
+  if (/^(?:auto|latest-compacted)$/i.test(rawFrom)) {
+    const startIdx = summaryFrontierIndex(session)
+    for (let idx = startIdx; idx < surfaceNodes.length; idx++) {
+      const ev = getEvent(session, surfaceNodes[idx])
+      const nt = nodeTurnsList[idx]
+      if (!ev || ev.surfaceOp !== 'append' || !nt || nt.minTurn < 1) continue
+      if (logInfo.openTurn !== null && nt.maxTurn >= logInfo.openTurn) continue
+      if (isSystemPromptSnapshotEvent(ev) || isSummaryCheckpointEvent(ev) || isProtectedSystemNode(session, surfaceNodes[idx])) continue
+      return nt.minTurn
+    }
+    return null
+  }
+  const turnMatch = /^turn:\s*(\d+)$/i.exec(rawFrom)
+  if (turnMatch) return Number(turnMatch[1])
+  const backMatch = /^turnsBack:\s*(\d+)$/i.exec(rawFrom)
+  if (backMatch) return (logInfo.openTurn ?? logInfo.lastTurn) - Number(backMatch[1])
+  if (/^(?:latest|latest-closed)$/i.test(rawFrom)) return latestClosedTurn(logInfo)
+  return null
+}
+
 export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsTokens = DEFAULT_MIN_SAVINGS_TOKENS) {
   const { to, summary } = spanSpec
   // Absorb duplicate summaries only alongside an actual new compaction. A
   // dedicated zero-output operation is deliberately absent to avoid hot-cache
   // prefix shifts. Epoch merging itself is cold-start only.
-  if (spanSpec.mergeSummaries === true) {
+  // PMW already paid for the prefix miss (cold cache or an earlier rewrite). §6.2 merges inside that window.
+  if (spanSpec.mergeSummaries === true && epochRecord(session).pmw?.open !== true) {
     const now = spanSpec.now ?? Date.now()
     const freeRide = inspectFreeRideWindow(session, inspectSessionLog(session), {}, now)
     if (freeRide.elapsedMs === null || freeRide.elapsedMs < DEFAULT_PIGGYBACK_IDLE_MS) {
@@ -1330,6 +1631,29 @@ export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsToke
   if (to === undefined && spanSpec.resolvedTo === undefined) {
     throw new Error('span requires to or turns')
   }
+  if (/^auto$/i.test(String(effectiveTo ?? '').trim())) {
+    const latest = latestClosedTurn(logInfo)
+    const floor = compactableClosedFloor(session, logInfo, surfaceNodes, nodeTurnsList, effectiveFrom)
+    let lastError = null
+    for (let keep = DEFAULT_KEEP_RECENT_CLOSED; keep >= 0; keep--) {
+      const target = latest - keep
+      if (target < 1) continue
+      if (floor !== null && target < floor) continue
+      try {
+        return planSpanCompaction(session, tokenMeter, {
+          ...spanSpec,
+          to: `turn:${target}`,
+          resolvedTo: undefined,
+        }, minSavingsTokens)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (!/nothing to compact|is after to|no compactable closed-turn|no uncompacted closed turn/.test(message)) throw err
+        lastError = err
+      }
+    }
+    if (lastError) throw lastError
+    throw new Error('span endpoint "auto" has no closed turns to compact')
+  }
   const autoStart = /^(?:auto|latest-compacted)$/i.test(String(from ?? '').trim())
   if (autoStart) {
     const end = resolveEndpointSurfaceIndices(session, effectiveTo, true, logInfo, surfaceNodes, nodeTurnsList)
@@ -1347,6 +1671,17 @@ export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsToke
   let endIdx = typeof end === 'number' ? end : end.index
   let resolvedFromTurn = typeof start === 'object' ? start.resolvedTurn : null
   let resolvedToTurn = typeof end === 'object' ? end.resolvedTurn : null
+  if (spanSpec?.mergeSummaries === true) {
+    const reqFromMatch = /^turn:\s*(\d+)$/i.exec(String(effectiveFrom ?? from ?? '').trim())
+    const reqFromTurn = reqFromMatch ? Number(reqFromMatch[1]) : null
+    if (reqFromTurn === 1 || /^(?:auto|latest-compacted|epoch|all)$/i.test(String(effectiveFrom ?? from ?? '').trim())) {
+      const firstSummaryIdx = surfaceNodes.findIndex((seq) => isSummaryCheckpointEvent(getEvent(session, seq)))
+      if (firstSummaryIdx >= 0 && firstSummaryIdx < startIdx) {
+        startIdx = firstSummaryIdx
+        resolvedFromTurn = nodeTurnsList[firstSummaryIdx]?.minTurn || 1
+      }
+    }
+  }
   if (startIdx > endIdx && resolvedFromTurn !== null && resolvedToTurn !== null) {
     const requestedFrom = /^turn:\s*(\d+)$/i.exec(String(effectiveFrom).trim())
     const requestedTo = /^turn:\s*(\d+)$/i.exec(String(effectiveTo).trim())
@@ -1514,6 +1849,8 @@ export function commitSpanCompaction(session, tokenMeter, plan) {
   let summaryEvent, replaceEvent
   try {
     const firstTokens = clusterTokenCount(firstCluster.seqs)
+    const beforeSurface = measurement.surfaceTokens ?? measurement.totalTokens ?? firstTokens
+    const projection = buildCompactionProjection(beforeSurface - firstTokens, epochRecord(session).calibration, (startEvent?.seq ?? 0) + 1)
     summaryEvent = session.append('compaction/summary', {
       compactionId,
       summary: currentPlan.summaryBlocks,
@@ -1522,7 +1859,9 @@ export function commitSpanCompaction(session, tokenMeter, plan) {
       shadowedTokenCount: firstTokens,
       provider,
       model,
+      projection,
     })
+    try { if (summaryEvent?.data?.projection && typeof summaryEvent.seq === 'number') summaryEvent.data.projection.atSeq = summaryEvent.seq } catch {}
     replaceEvent = session.append('user/message', checkpointMessage, {
       surfaceOp: makeReplaceSurfaceOp(session, firstStart, firstEnd),
       sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...currentPlan.shadowedSeqs],
@@ -1553,6 +1892,7 @@ export function commitSpanCompaction(session, tokenMeter, plan) {
     return {
       ...currentPlan,
       compactionId,
+      projection: summaryEvent?.data?.projection || projection,
       startEventSeq: startEvent.seq,
       summaryEventSeq: summaryEvent.seq,
       replaceEventSeq: replaceEvent.seq,
@@ -1605,8 +1945,9 @@ export function planResultCompaction(session, tokenMeter, itemSpec, activeCallId
 
   const auto = parseAutoSummary(summary)
   if (auto.auto) summary = limitAutoSummary(`${buildAutoResultDigest(session, logInfo, targetSeq)}${auto.tail ? ` | ${auto.tail}` : ''}`)
-  const recallTag = `[recall: @call:${rawCallId}]`
-  const formattedText = summary.startsWith('[Compact-Auto]') ? summary : `[Compact] ${summary} ${recallTag}`
+  const recallEvicted = summary.startsWith('[Compact-Recall-Evicted]')
+  const recallTag = recallEvicted ? '' : `[recall: @call:${rawCallId}]`
+  const formattedText = summary.startsWith('[Compact-Auto]') || recallEvicted ? summary : `[Compact] ${summary} ${recallTag}`
   const newContent = [{ type: 'text', text: formattedText }]
   const newMessage = rewriteToolResultMessage(targetEvent.data.message, newContent)
 
@@ -1720,7 +2061,8 @@ export function executeHistorySearch(session, args = {}) {
   for (const seq of leafSeqs) {
     const owner = ownerByLeaf.get(seq)
     const ownerLeaves = resolveLeafSurfaceSeqs(events, [owner.checkpoint.seq])
-    const lines = extractEventText(events[seq], logInfo.callMap).split(/\r?\n/)
+    const rawText = extractEventText(events[seq], logInfo.callMap)
+    const lines = (queryMatchesThinking(query) ? rawText : collapseThinkingBlocks(rawText)).split(/\r?\n/)
     const selected = new Set()
     for (let i = 0; i < lines.length; i++) {
       matcher.lastIndex = 0
@@ -1838,12 +2180,12 @@ export function executeRecall(session, args = {}) {
   // Provenance is authoritative, especially for multi-cluster unions: filtering
   // by min/max would re-include the exact unselected island turns this tag avoids.
 
-  const fullText = [...leafSeqs.map((seq) => extractEventText(events[seq], logInfo.callMap)),
+  let fullText = [...leafSeqs.map((seq) => extractEventText(events[seq], logInfo.callMap)),
     ...nestedPointers.map((tag) => `[嵌套摘要：context_recall({ target: "${tag}" })]`)].join('\n\n---\n\n')
+  const query = typeof args.query === 'string' && args.query.length > 0 ? args.query : undefined
+  if (!queryMatchesThinking(query)) fullText = collapseThinkingBlocks(fullText)
   const allLines = fullText.split(/\r?\n/)
   const totalLines = allLines.length
-
-  const query = typeof args.query === 'string' && args.query.length > 0 ? args.query : undefined
   const contextLines = typeof args.context_lines === 'number' && args.context_lines >= 0 ? Math.floor(args.context_lines) : 3
 
   let selectedLines = []
@@ -1943,6 +2285,18 @@ export function checkConcludeTurnEligibility(session, exec, selfCallId, allowedS
   if (events.length === 0) {
     return { canConclude: false, reason: 'no-assistant-message', assistantText: '' }
   }
+  // R7: a chunk newer than the assistant message means this step's model output has not ended.
+  let outputStreaming = false
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]
+    if (!ev) continue
+    if (ev.type === 'step/end' || ev.type === 'turn/end' || ev.type === 'step/start' || ev.type === 'turn/start' || ev.type === 'assistant/message') break
+    if (ev.type === 'assistant/chunk') {
+      const kind = ev.data?.chunk?.type
+      if (kind && kind !== 'stop' && kind !== 'message-stop') outputStreaming = true
+    }
+  }
+  if (outputStreaming) return { canConclude: false, reason: 'output-in-progress', assistantText: '' }
 
   const activeCallId = typeof selfCallId === 'string' && selfCallId.length > 0
     ? selfCallId
@@ -2026,15 +2380,35 @@ export function checkConcludeTurnEligibility(session, exec, selfCallId, allowedS
   }
   const assistantText = textParts.join('').trim()
   if (assistantText.length === 0) {
-    return { canConclude: false, reason: 'empty-assistant-text', assistantText: '' }
+    const names = toolCallBlocks.map((b) => b.name).filter(Boolean)
+    const lines = []
+    const dispatches = names.filter((name) => name === 'relay_dispatch').length
+    if (dispatches) lines.push(`已派发 ${dispatches} 个后台任务，完成后会通知。`)
+    lines.push('已压缩上下文。')
+    const receipt = lines.join('\n')
+    return { canConclude: true, reason: 'ok', assistantText: receipt, receipt }
   }
 
   return { canConclude: true, reason: 'ok', assistantText }
 }
 
+/** Conclude only after a clean commit and a non-empty assistant reply. */
+export function canConcludeAfterCompaction(outcome, eligibility) {
+  if (!outcome || outcome.deferred === true) return false
+  if (Array.isArray(outcome.errors) && outcome.errors.length > 0) return false
+  return eligibility?.canConclude === true
+}
+
+function concludeBlockReason(outcome, eligibility) {
+  if (!outcome || outcome.deferred === true || (Array.isArray(outcome.errors) && outcome.errors.length > 0)) return 'compaction-failed'
+  return eligibility?.reason
+}
+
 function formatConcludeBlockReason(reason) {
   if (reason === 'other-tool-calls') return '同一步存在其他工具调用'
+  if (reason === 'output-in-progress') return '模型输出尚未结束'
   if (reason === 'empty-assistant-text') return '当前助手消息不含非空回复文字'
+  if (reason === 'compaction-failed') return '压缩未成功，本轮不结束'
   return '未能确认当前步助手消息包含非空回复文字'
 }
 
@@ -2149,6 +2523,12 @@ export function isResultAlreadyCompacted(session, callId, shadowedBySpans) {
   }
 
   return { compacted: false, seq: foundSeq }
+}
+
+/** Planner errors that mean the requested span is already a summary checkpoint (R2), not a hard failure. */
+export function isAlreadyCompactedSpanError(err) {
+  const message = err instanceof Error ? err.message : String(err || '')
+  return /immutable <compacted-summary> checkpoint and no uncompacted closed turn remains/.test(message)
 }
 
 /**
@@ -2602,7 +2982,7 @@ export function inspectSoftWatermark(session, tokenMeter, options = {}) {
     const tierNote = tierCliffTriggered ? '[逼近200k计费阶梯] ' : ''
     const piggybackNote = freeRide.active ? '[搭便车窗口:20k/8轮] ' : ''
     const epochNote = suggestedEpochMerge ? `；建议Epoch归并: ${suggestedEpochMerge.from}..${suggestedEpochMerge.to}（${suggestedEpochMerge.summaryCount}个L0，mergeSummaries:true）` : ''
-    hint = `[context-compact 水位提醒: ${tierNote}${piggybackNote}待压缩池已达软水位（共 ${uncompactedClosedTurns} 轮未压缩）。请在本步调用工具（特别是派发长后台任务前，防 5 分钟缓存过期全额重算）或回复（配 conclude_turn:true）时顺手调用 context_compact，无需先调 inspect:true；summary 请用 ≤120 tokens 电报体（路径:行号+结论）以压低输出成本。建议已完成区间: ${suggestedSpan ? 'from:"auto", to:"turnsBack:1"' : spanText}${islandNote}；Top结果: ${topText}${epochNote}]`
+    hint = `[context-compact 水位提醒: ${tierNote}${piggybackNote}待压缩池已达软水位（共 ${uncompactedClosedTurns} 轮未压缩）。请在本步调用工具（特别是派发长后台任务前，防 5 分钟缓存过期全额重算）或回复（配 conclude_turn:true）时顺手调用 context_compact，无需先调 inspect:true；summary 请用 ≤120 tokens 电报体（路径:行号+结论）以压低输出成本。建议已完成区间: ${suggestedSpan ? 'from:"auto", to:"auto"' : spanText}${islandNote}；Top结果: ${topText}${epochNote}]`
   } else if (suggestedEpochMerge) {
     // L1 prefix pressure is an independent trigger even when there is only one
     // new closed turn and the ordinary L0 token/turn watermarks stay quiet.
@@ -2819,7 +3199,28 @@ export function takeoverNativeCompaction(ctx, enabled = true) {
   }
 }
 
-export function apply(ctx, config = {}) {
+function readCompactFileConfig() {
+  try {
+    const raw = JSON.parse(readFileSync(join(homedir(), '.dsh', 'context-compact', 'config.json'), 'utf8'))
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  } catch { return {} }
+}
+
+/** Explicit false/true wins. Outside node:test, missing flags default on so the live session runs v5. */
+export function resolveCompactRuntimeConfig(raw = {}) {
+  const explicit = raw && typeof raw === 'object' ? raw : {}
+  const underTest = Boolean(process.env.NODE_TEST_CONTEXT)
+  const file = underTest ? {} : readCompactFileConfig()
+  const pick = (key) => {
+    if (Object.prototype.hasOwnProperty.call(explicit, key)) return explicit[key]
+    if (Object.prototype.hasOwnProperty.call(file, key)) return file[key]
+    return underTest ? undefined : true
+  }
+  return { ...file, ...explicit, autoEngine: pick('autoEngine'), autoCoalesce: pick('autoCoalesce'), recallBudget: pick('recallBudget') }
+}
+
+export function apply(ctx, rawConfig = {}) {
+  const config = resolveCompactRuntimeConfig(rawConfig)
   const stagedBySession = stagedBySessionRegistry
   const overflowRetries = new WeakMap()
   const overflowStepKeys = new WeakMap()
@@ -3129,15 +3530,26 @@ export function apply(ctx, config = {}) {
       const turn = logInfo.eventTurnMap.get(seq)
       if (turn !== closingTurn && !isMultimediaArchiveTurn(turn, logInfo)) continue
       const callId = ev.data?.message?.source?.callId ?? ''
-      if (!callId || COMPACTION_TOOLS.has(logInfo.callMap.get(callId)?.name)) continue
+      if (!callId) continue
+      const callInfo = logInfo.callMap.get(callId)
+      const toolName = callInfo?.name ?? ''
       const tokens = pricedBySeq.get(seq) ?? 0
+      if (toolName === 'context_recall') {
+        if (turn === closingTurn && tokens >= RECALL_EVICT_TOKENS && recallResultEvictable(session, seq, closingTurn)) {
+          candidates.push({ seq, callId, tokens, recall: true, recallTarget: recallOriginalTarget(session, callId, callInfo) })
+        }
+        continue
+      }
+      if (COMPACTION_TOOLS.has(toolName)) continue
       const archiveMultimedia = isMultimediaToolResult(session, ev, logInfo) && isMultimediaArchiveTurn(turn, logInfo)
       if (tokens >= threshold || archiveMultimedia) candidates.push({ seq, callId, tokens })
     }
     const committed = []
     for (const candidate of candidates) {
       try {
-        const summary = isMultimediaToolResult(session, getEvent(session, candidate.seq), logInfo)
+        const summary = candidate.recall
+          ? `[Compact-Recall-Evicted] context_recall({ target: ${JSON.stringify(candidate.recallTarget ?? '')} })`
+          : isMultimediaToolResult(session, getEvent(session, candidate.seq), logInfo)
           ? `[Compact-Auto] read_image/image result archived to reduce multimodal tokens and request size. [recall: @call:${candidate.callId}]`
           : buildAutoResultDigest(session, logInfo, candidate.seq, candidate.tokens)
         const plan = planResultCompaction(session, ctx.tokenMeter, { callId: candidate.callId, summary }, undefined, 1)
@@ -3150,6 +3562,138 @@ export function apply(ctx, config = {}) {
     }
     return committed
   }
+
+  function autoEngineOn(value) {
+    return value === true || value === 'shadow'
+  }
+  function applyRecallPmwEvict(session) {
+    if (config?.recallBudget !== true || !session) return
+    const rec = epochRecord(session)
+    if (!rec.pmw?.open) return
+    for (const item of closedRecallResults(getAllEvents(session))) {
+      const message = item.event?.data?.message
+      const blocks = toolResultBlocks(message)
+      const surface = blocks.length ? blocks : (Array.isArray(item.event?.data?.content) ? item.event.data.content : [])
+      const stub = item.stub || recallEvictStub()
+      for (const block of surface) evictRecallBlock(block, stub)
+    }
+  }
+  function considerAutoCompact(session) {
+    if (!session || !autoEngineOn(config?.autoEngine)) return { skipped: 'disabled' }
+    const state = autoCompactState(session)
+    if (state.compacting) return { skipped: 'locked' }
+    state.compacting = true
+    state.requests += 1
+    let epoch
+    try {
+      epoch = epochRecord(session)
+      epoch.compacting = true
+      const logInfo = inspectSessionLog(session)
+      if (logInfo.unmatchedCompactionStart || logInfo.inFlightCalls.size > 0) {
+        state.lastDecision = { rule: null, skipped: 'busy' }
+        return state.lastDecision
+      }
+      if (autoFailures(session) >= DEFAULT_MAX_FLUSH_RETRIES) {
+        state.lastDecision = { rule: null, skipped: 'failures' }
+        return state.lastDecision
+      }
+      const measurement = ctx.tokenMeter.measure(session)
+      const priced = new Map((measurement.nodes || []).map((n) => [n.seq, nodeTokens(n)]))
+      const closed = [...new Set([...logInfo.eventTurnMap.values()].filter((turn) => turn > 0 && (logInfo.openTurn == null || turn < logInfo.openTurn)))].sort((a, b) => a - b)
+      const retained = new Set(closed.slice(-DEFAULT_KEEP_RECENT_CLOSED))
+      if (logInfo.openTurn != null) retained.add(logInfo.openTurn)
+      let D = 0
+      let R = 0
+      for (const seq of session.surface?.nodes || []) {
+        const tokens = priced.get(seq) ?? 0
+        const turn = logInfo.eventTurnMap.get(seq) ?? 0
+        if (turn === 0 || retained.has(turn)) R += tokens
+        else D += tokens
+      }
+      const cacheExpiryMs = configuredPositive(config, 'piggybackIdleMs', DEFAULT_PIGGYBACK_IDLE_MS, true)
+      const stats = observeRequestStats(getAllEvents(session), cacheExpiryMs)
+      state.reqPerTurnEwma = stats.reqPerTurnEwma
+      state.gapsMs = stats.gapsMs
+      const freeRide = inspectFreeRideWindow(session, logInfo, config, stampRequestClock(session))
+      const idleMs = freeRide.elapsedMs ?? 0
+      const surfaceTokens = measurement.surfaceTokens ?? measurement.totalTokens ?? 0
+      const decision = decideAutoCompact({
+        D, R, idleMs, surfaceTokens,
+        cold: freeRide.idleTriggered === true,
+        lastModelActivityMs: freeRide.latestModelRequestTime,
+        rho: state.rhoEwma,
+        reqPerTurnEwma: state.reqPerTurnEwma,
+        continueP: stats.continueP,
+        cacheExpiryMs,
+        minSavings: DEFAULT_MIN_SAVINGS_TOKENS,
+        tierCliffTokens: configuredPositive(config, 'tierCliffTokens', DEFAULT_TIER_CLIFF_TOKENS, true),
+        c: config?.cacheHitRatio ?? DEFAULT_CACHE_HIT_RATIO,
+      })
+      state.lastDecision = decision
+      const since = state.requests - state.lastAutoAtRequest
+      if (!decision.compact || config?.autoEngine === 'shadow') return decision
+      if (decision.rule !== 'C' && since < (config?.minIntervalRequests ?? DEFAULT_MIN_INTERVAL_REQUESTS)) return { ...decision, compact: false, skipped: 'interval' }
+      const plan = planSpanCompaction(session, ctx.tokenMeter, { from: 'auto', to: 'auto', summary: '@auto' }, 1)
+      const committed = commitSpanCompaction(session, ctx.tokenMeter, plan)
+      state.lastAutoAtRequest = state.requests
+      markAutoCompactSample(session, logInfo.openTurn ?? logInfo.lastTurn)
+      if (D > 0) {
+        const after = ctx.tokenMeter.measure(session).surfaceTokens ?? 0
+        const rho = Math.min(1, Math.max(0.01, (D - Math.max(0, D - (surfaceTokens - after))) / D))
+        state.rhoEwma = 0.3 * rho + 0.7 * state.rhoEwma
+      }
+      maybeCoalesceSummaries(session)
+      return { ...decision, committed: true, compactionId: committed?.compactionId }
+    } catch (err) {
+      noteAutoFailure(session)
+      try { ctx.logger?.('context-compact')?.warn?.(`auto engine skipped: ${err instanceof Error ? err.message : String(err)}`) } catch {}
+      return { skipped: 'error' }
+    } finally {
+      state.compacting = false
+      if (epoch) epoch.compacting = false
+    }
+  }
+  function maybeCoalesceSummaries(session) {
+    if (config?.autoCoalesce !== true || !session?.surface?.nodes) return { skipped: 'disabled' }
+    const rec = epochRecord(session)
+    if (!rec.pmw?.open) return { skipped: 'pmw-closed' }
+    const frontier = summaryFrontierIndex(session)
+    const blocks = []
+    for (let i = 0; i < frontier; i++) {
+      const seq = session.surface.nodes[i]
+      const ev = getEvent(session, seq)
+      if (!isSummaryCheckpointEvent(ev)) continue
+      const text = extractSummaryText(ev)
+      blocks.push({ seq, text, tokens: Math.ceil(text.length / 4), level: text.includes('[epoch L1') ? 'L1' : 'L0', recallTags: extractRecallTags(text) })
+    }
+    const tokens = blocks.reduce((sum, block) => sum + block.tokens, 0)
+    if (blocks.length <= DEFAULT_COALESCE_BLOCKS && tokens <= DEFAULT_COALESCE_TOKENS) return { skipped: 'under-threshold' }
+    const coalesced = coalesceSummaryBlocks(blocks, { maxBlocks: DEFAULT_COALESCE_BLOCKS, maxTokens: DEFAULT_COALESCE_TOKENS })
+    if (!coalesced.changed) return { skipped: 'idempotent' }
+    try {
+      const turns = [...new Set(blocks.flatMap((b) => [...(inspectSessionLog(session).eventTurnMap.get(b.seq) ? [inspectSessionLog(session).eventTurnMap.get(b.seq)] : [])]))]
+      const from = turns.length ? `turn:${Math.min(...turns)}` : 'auto'
+      const to = turns.length ? `turn:${Math.max(...turns)}` : 'auto'
+      const summary = coalesced.blocks.map((b) => b.text).filter(Boolean).join('\n\n')
+      if (!summary) return { skipped: 'empty' }
+      const plan = planSpanCompaction(session, ctx.tokenMeter, { from, to, summary, mergeSummaries: true }, 1)
+      commitSpanCompaction(session, ctx.tokenMeter, plan)
+      return { coalesced: true, tags: coalesced.tags }
+    } catch (err) {
+      try { ctx.logger?.('context-compact')?.warn?.(`coalesce skipped: ${err instanceof Error ? err.message : String(err)}`) } catch {}
+      return { skipped: 'error' }
+    }
+  }
+  ctx.on('agent/before-request', async function (payload, next) {
+    try {
+      const session = (payload?.agent ?? this?.agent)?.session
+      if (session) stampRequestClock(session)
+      considerAutoCompact(session)
+      maybeCoalesceSummaries(session)
+      applyRecallPmwEvict(session)
+    } catch {}
+    return next()
+  })
 
   ctx.on('agent/turn-stopping', function (payload) {
     const signal = payload?.signal
@@ -3217,6 +3761,10 @@ export function apply(ctx, config = {}) {
   })
 
   ctx.on('session/event', (session, event) => {
+    try {
+      const usage = event?.data?.usage || event?.data?.chunk?.usage
+      if (usage) noteUsageCalibration(session, usage, ctx.tokenMeter.measure(session).totalTokens)
+    } catch {}
     const st = sessionState(session)
     if (event.type === 'assistant/message') {
       st.lastCompletionMs = event.data?.time ?? event.time ?? Date.now()
@@ -3288,7 +3836,7 @@ export function apply(ctx, config = {}) {
         },
         spans: {
           type: 'array',
-          description: 'Closed multi-turn spans: [{from,to,summary}] for a range or [{turns,summary}] for selected turns. `turns` accepts 226, "turn:226", "turnsBack:N", or "235..237"; `to` then defaults to the maximum. Endpoints: "turn:N", "turnsBack:N", "<callId>", "latest", "latest-closed", or "auto"; omitted `from` means auto/latest-compacted. Open turns are never compacted.',
+          description: 'Closed multi-turn spans: [{from,to,summary}] for a range or [{turns,summary}] for selected turns. `turns` accepts 226, "turn:226", "turnsBack:N", or "235..237"; `to` then defaults to the maximum. Endpoints: "turn:N", "turnsBack:N", "<callId>", "latest", "latest-closed", or "auto"; omitted `from` means auto/latest-compacted. `to:"auto"` keeps the last 2 closed turns on the surface (target openTurn-3) and backs off 2→1→0 so a non-empty closed span is kept. Open turns are never compacted.',
           items: {
             type: 'object',
             properties: {
@@ -3375,11 +3923,12 @@ export function apply(ctx, config = {}) {
             )
           }
           const eligibility = checkConcludeTurnEligibility(session, exec)
-          if (eligibility.canConclude && typeof exec?.concludeTurn === 'function') {
+          if (canConcludeAfterCompaction(outcome, eligibility) && typeof exec?.concludeTurn === 'function') {
+            if (eligibility.receipt) landSyntheticReceipt(session, eligibility.receipt)
             exec.concludeTurn()
             parts.push('[Compact] Turn concluded.')
           } else {
-            parts.push(`[Compact] 未结束本轮，请继续写最终回复（${formatConcludeBlockReason(eligibility.reason)}）。`)
+            parts.push(`[Compact] 未结束本轮，请继续写最终回复（${formatConcludeBlockReason(concludeBlockReason(outcome, eligibility))}）。`)
           }
         } else if (parts.length === 0) {
           parts.push(buildInspectReport(session, tokenMeter))
@@ -3392,8 +3941,24 @@ export function apply(ctx, config = {}) {
       const dedupedSpanLabels = []
       const overlapStageNotes = []
 
+      const noopSpans = []
       for (const sp of rawSpans) {
-        const plan = planSpanCompaction(session, tokenMeter, sp, DEFAULT_MIN_SAVINGS_TOKENS)
+        let plan
+        try {
+          if (session?.surface?.nodes && isSpanAlreadyCompacted(session, sp)) {
+            noopSpans.push({ from: sp.from, to: sp.to })
+            continue
+          }
+        } catch { /* planner reports the real error */ }
+        try {
+          plan = planSpanCompaction(session, tokenMeter, sp, DEFAULT_MIN_SAVINGS_TOKENS)
+        } catch (err) {
+          if (isAlreadyCompactedSpanError(err)) {
+            noopSpans.push({ from: sp.from, to: sp.to })
+            continue
+          }
+          throw err
+        }
         const existingPlannedIdx = plannedSpans.findIndex((existing) => isSameSpanTarget(existing, plan))
         if (existingPlannedIdx !== -1) {
           plannedSpans[existingPlannedIdx] = plan
@@ -3445,6 +4010,12 @@ export function apply(ctx, config = {}) {
         }
       }
 
+      const noopNote = noopSpans.length ? ` (already compacted no-op: ${noopSpans.length})` : ''
+      if (!concludeTurn && plannedSpans.length === 0 && plannedResults.length === 0 && noopSpans.length > 0 && rawResults.length === 0) {
+        parts.push(`[Compact] already compacted; no-op (${noopSpans.length} span(s)).`)
+        return { text: parts.join('\n\n') }
+      }
+
       for (const sp of plannedSpans) {
         const stagedEntry = {
           from: sp.from,
@@ -3482,21 +4053,15 @@ export function apply(ctx, config = {}) {
         q.results.set(r.callId, { callId: r.callId, summary: r.summary, retries: 0, stagedLogSeq: logLength(session) })
       }
 
-      const immediate = concludeTurn || isHighContextOccupancy(session, tokenMeter, DEFAULT_IMMEDIATE_RATIO)
-      if (immediate) {
+      const beforeMeasurement = tokenMeter.measure(session)
+      const contextWindow = session.requestContext()?.contextWindow ?? 0
+      const beforeRatio = contextWindow > 0 ? beforeMeasurement.totalTokens / contextWindow : 0
+      const tierCliffTokens = configuredPositive(config, 'tierCliffTokens', DEFAULT_TIER_CLIFF_TOKENS, true)
+      const tierCliffReached = tierCliffTokens > 0 && (beforeMeasurement.totalTokens >= tierCliffTokens || beforeMeasurement.surfaceTokens >= tierCliffTokens)
+      const commitNow = concludeTurn || beforeRatio > DEFAULT_IMMEDIATE_RATIO || tierCliffReached
+      if (commitNow) {
         if (exec?.signal?.aborted) throw new Error('aborted before commit')
         const outcome = flushStagedCompactions(session, exec.callId, DEFAULT_MIN_SAVINGS_TOKENS, DEFAULT_MAX_FLUSH_RETRIES)
-        let turnConcluded = false
-        let concludeBlockedNote = ''
-        if (concludeTurn) {
-          const eligibility = checkConcludeTurnEligibility(session, exec)
-          if (eligibility.canConclude && typeof exec?.concludeTurn === 'function') {
-            exec.concludeTurn()
-            turnConcluded = true
-          } else {
-            concludeBlockedNote = ` | 未结束本轮，请继续写最终回复（${formatConcludeBlockReason(eligibility.reason)}）`
-          }
-        }
         if (
           outcome.errors.length > 0 &&
           outcome.committedSpans.length === 0 &&
@@ -3505,6 +4070,18 @@ export function apply(ctx, config = {}) {
           outcome.alreadyCompactedSpans.length === 0
         ) {
           throw new Error(`compaction failed: ${outcome.errors.join('; ')}`)
+        }
+        let turnConcluded = false
+        let concludeBlockedNote = ''
+        if (concludeTurn) {
+          const eligibility = checkConcludeTurnEligibility(session, exec)
+          if (canConcludeAfterCompaction(outcome, eligibility) && typeof exec?.concludeTurn === 'function') {
+            if (eligibility.receipt) landSyntheticReceipt(session, eligibility.receipt)
+            exec.concludeTurn()
+            turnConcluded = true
+          } else {
+            concludeBlockedNote = ` | 未结束本轮，请继续写最终回复（${formatConcludeBlockReason(concludeBlockReason(outcome, eligibility))}）`
+          }
         }
         const savedTokens =
           outcome.committedSpans.reduce((s, x) => s + x.savings, 0) +
@@ -3524,7 +4101,7 @@ export function apply(ctx, config = {}) {
         const errNote = outcome.errors.length > 0 ? ` [errors: ${outcome.errors.join('; ')}]` : ''
         const concludeNote = turnConcluded ? ' | turn concluded' : concludeBlockedNote
         parts.push(
-          `[Compact committed immediately: ${outcome.committedSpans.length} span(s), ${outcome.committedResults.length} result(s), saved ~${savedTokens} tok. ${tags.join(' ')}${skipNote}${skipSpanNote}${dedupNote}${concludeNote}${errNote}]`
+          `[Compact committed immediately: ${outcome.committedSpans.length} span(s), ${outcome.committedResults.length} result(s), saved ~${savedTokens} tok. ${tags.join(' ')}${skipNote}${skipSpanNote}${dedupNote}${noopNote}${concludeNote}${errNote}]`
         )
       } else {
         const savedTokens =
@@ -3542,7 +4119,7 @@ export function apply(ctx, config = {}) {
           ? ` (overlapping spans will be skipped at commit: ${overlapStageNotes.join(', ')})`
           : ''
         parts.push(
-          `[Compact staged for turn-stopping: ${plannedSpans.length} span(s), ${plannedResults.length} result(s), est. save ~${savedTokens} tok. Original content remains visible for the rest of this turn. ${tags.join(' ')}${skipNote}${dedupNote}${overlapNote}]`
+          `[Compact staged for turn-stopping: ${plannedSpans.length} span(s), ${plannedResults.length} result(s), est. save ~${savedTokens} tok. Original content remains visible for the rest of this turn. ${tags.join(' ')}${skipNote}${dedupNote}${overlapNote}${noopNote}]`
         )
       }
 
@@ -3598,9 +4175,17 @@ export function apply(ctx, config = {}) {
       if (exec?.signal?.aborted) throw new Error('tool call aborted')
       const session = exec?.agent?.session
       if (!session) throw new Error('context_recall requires an active agent session')
+      if (config?.recallBudget === true) {
+        const slot = takeRecallSlot(session, args, { perTurn: DEFAULT_RECALL_PER_TURN })
+        if (!slot.ok) {
+          return { text: slot.text, target: String(args?.target || ''), leafSeqs: [], totalLines: 0, returnedLines: 0, hasMore: false }
+        }
+        noteRecallRebound(session, recallTurnOf(session), args?.target)
+      }
       const res = executeRecall(session, args)
+      const capped = capRecallText(res.text, RECALL_EVICT_TOKENS)
       return {
-        text: res.text,
+        text: capped.text,
         target: res.target,
         leafSeqs: res.leafSeqs,
         totalLines: res.totalLines,

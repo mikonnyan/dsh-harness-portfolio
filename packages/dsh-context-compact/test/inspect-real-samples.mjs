@@ -2,11 +2,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
-const root = process.env.DSH_TEST_SESSION_ROOT
-if (!root) {
-  console.error('set DSH_TEST_SESSION_ROOT to a session corpus; this script does not guess a home directory')
-  process.exit(0)
-}
+const root = process.env.DSH_TEST_SESSION_ROOT || 'C:/Users/mikon/.dsh/sessions'
 const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 const candidates = []
 for (const ws of fs.readdirSync(root)) {

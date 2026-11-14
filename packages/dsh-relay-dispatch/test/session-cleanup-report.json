@@ -1,0 +1,1045 @@
+{
+  "before": 200,
+  "deleteCount": 0,
+  "after": 200,
+  "deletable": [],
+  "retained": [
+    {
+      "id": "session-00323901-5fe6-424e-9a57-db0c7fd924aa",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-01691938-012e-4a9d-8e14-db7ca5d2bc67",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-04f3eeda-a36c-4de4-8422-aeed6449c739",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-056a9168-43b0-48ac-89b1-8924bfbc1df4",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-0663d622-e662-417b-b7ef-8e406cc35d7c",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-06b00e2d-6a89-4843-8394-867c4c792173",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-0b2dbb0e-ff9e-4cfb-8745-28a963392af7",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-0b4c6443-ed98-4474-b865-cb45a9b1d7e7",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-0ba0cbe6-ee62-46a1-a871-ea6128ba106e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-0c79a0b8-0a70-4ab8-9a1f-e3b811af32b2",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-0e378db9-c0a3-4cb8-8906-ef5ed969a0d7",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-0e8970e8-f100-484a-93a1-b038fac1ed15",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-0f095be9-f4a1-4d2f-a8f3-5adc0dc838d1",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-0fc8c950-1042-4c57-bd33-5b80657cdd0d",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-111aec28-9023-4cc9-999b-7dfdd0b7fd08",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-131b8ce8-6878-4a21-877f-9ff42216da5e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-16f7708c-5b2f-4b83-9809-d116f08f2467",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-17adb83b-46df-4a2a-9c0e-9e0945f5317b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-18ad9cf2-bc1e-4e89-9749-5e53ed13479b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-18b65b17-490e-4d0f-92f8-e60c3f315661",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-19360157-06a6-40fe-a865-171bb95c4bfa",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-19caed0f-40a3-4b45-84ea-cd360e3a20e7",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1a514689-da96-40c5-afa8-8147cf54f74e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1a717e2a-38fd-4967-8a11-34980ee3c22b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1b416099-0c5a-4a52-9436-daf2c8e6d2e9",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1bfd6aba-7613-4720-aded-f9470067941c",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1c7cced0-2e31-4c1c-aaab-e7fd32009b0e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1ce0ef97-4658-4dd2-9157-6453a09eb7bb",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1db91d39-81e2-47d3-b45e-1347da76e06c",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1dbc53bd-9402-4b5c-a637-bc393bc6c020",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1dc4d06c-b9c7-47b0-8083-a6768f8e6f46",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1df90f9c-72e4-4154-ba2f-608571ccb9ab",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1edd44c8-ff49-4209-8a7e-c92d4258aecd",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-1eef17a0-8de2-4955-821b-329a5ce61ed6",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-20e9635d-154d-457c-b875-f742aee22592",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-2202cd8b-8bd6-4fd9-bb00-f2936c6423ae",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-221a9a94-62f0-4bea-b2ce-eb88c3937333",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-23321276-8ad4-439a-8271-f18a39bf148e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-234710eb-6481-470f-8775-a7f2edd7a479",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-236de08e-cc9d-441b-958a-34369d87287c",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-2698ae9f-6394-44d0-97cf-2c073885ae1d",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-2f4aaa66-2301-4dd1-a0bb-2c6b25f90e73",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-2fcbfa3e-9496-4bcc-8853-dd08a99e6032",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-30c01ed0-04b7-4b79-91a5-29d18a339e58",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-30e9e5d0-d1b5-4142-b377-e7d2c26e1e8f",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-31092b9b-b902-4f4e-a57e-d5008e1a0bd8",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-34ff8ab7-fb9c-44e6-b858-982505faa8ba",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-35898a8d-bb8d-4fd3-b34c-40eed81d3a7a",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-37f8c26c-9606-45a3-856e-8656d8243995",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-390d1567-f3fa-4a0b-9d8a-86598bd61021",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-392ffb18-47be-4f46-ab3b-325f349d0d30",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-3a38f3dc-5540-4d48-9db4-9cd56ba99ded",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-3a83c230-54b1-4de2-8e7a-717d0d0aa58c",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-3aad1af2-0816-4208-9330-aaaff9d321b5",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-3ca26096-bea5-43af-bdfa-661c271374b4",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-3cc44877-211a-4839-a665-126f8d70c58f",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-3e452b9a-04a9-48d6-9a75-9adf70a44cb1",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-3e97a5ce-3074-4dc8-b403-d56a164f324b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-3eebdbe7-9c99-44e8-a983-cba32088813e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-4223d15b-1b9b-4e82-a7e0-ccff5cf83fd5",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-423de2d9-f1e7-49b8-9d62-ea232d723e22",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-4523edd8-da67-4176-8cbf-3b0a911c9827",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-488c9c3c-fb9c-4858-ba48-5c7a7f5b6016",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-4a54027e-e9fa-4903-b342-5b353f8c6a90",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-4e0b96fc-1181-4f99-b09e-ec10be9141a4",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-4e9a6d81-5a08-47da-9cb6-3db837563ebc",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-504ab7e8-0e28-443b-b90e-ffcc3bff5b25",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-510de465-b627-4fe6-b5e6-8fe60ee8578c",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-5132bf57-2c97-4e47-be72-3bef8b17b6a7",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-520b54ae-d451-46eb-9a5c-7563fefdd32a",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-53d872ef-4d78-4249-a20e-5f34cdac3c49",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-54b35ac1-6755-42a0-936c-c714d1bd32a8",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-5632a47e-af36-401f-a260-694caf441b34",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-571d4f0c-a26b-4ea7-9d5c-b100522962be",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-575ffe02-6f24-4812-9401-9bd9d131f647",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-58122939-0ad1-47e9-af32-bea499d7924b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-58f462a2-3237-4314-b12a-85c655c67306",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-5aff9622-6b46-4849-8acf-34f2f7f69cbb",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-5bb70c90-0017-4169-b453-f1addec7f4d6",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-5c65130b-cbdc-46f9-904c-7923f3cf1df5",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-5cc49438-c84b-441e-8c69-caf28a27b17c",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-5d62f7bc-c0a9-4a91-a6b3-8ff8543d2dc8",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-5f207a1c-2da4-4ec6-a014-879069c98284",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-61b5bea9-1860-47b0-af18-e9a651b4c370",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-62cb03a2-e5e8-4198-b85b-fb19567481bc",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-62e684d4-706a-4215-9b83-8f781f1b8423",
+      "reason": "main-whitelist",
+      "evidence": []
+    },
+    {
+      "id": "session-64b3d9fe-a51e-4878-b165-ca36ba04d300",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-6654a010-d580-4dce-842f-bd1c815b96c0",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-6754269c-ab3c-4ffa-8662-f6dc44c4e098",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-685f143d-b0e4-40fc-b107-7e74135a97f7",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-69f1f81d-ffbf-474d-b61c-7b7444cc9d2a",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-6b1fc3a5-057a-48ec-9db2-b2bf51c2af5d",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-6c20ba4c-c3ab-4875-bbc5-f9a64c472f06",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-6cad7378-41e7-4eb2-ba94-fe50d865365a",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-6f6a13ad-0863-4974-b35b-0e90a4613a13",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-705cd43e-e5a0-4892-8890-504a78e1b16f",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-718184eb-ebb5-4083-8fec-d75cbb8880d4",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-726531cc-c6c6-4b49-b0b4-6f25a39e96f3",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-7307c3db-8e41-465d-af04-2d25b34446b3",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-74f9dd4a-9cd8-4fc5-b965-47eb632c26ef",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-76a35c58-ac86-492d-90a6-d7d99aa0e6a9",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-78118373-79f8-4a10-8543-c821430e17b3",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-78d782de-dd33-4ee6-81d8-e725909372ab",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-79e8935f-dd26-457e-b028-e620a92dac0b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-7b5c883b-a716-4b86-a53f-3ef078f8c710",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-7bfb59c0-c60d-44b3-a0ed-23728460d7ed",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-7df0cb26-d9d9-4060-9dda-457e7378e51b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-7df8027f-90c4-493e-b39b-9301a7cd4057",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-82515bb6-d374-4568-a8f0-5da85e899876",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-84cb7513-b545-4991-90e6-95ea9a232033",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-87cc1bc5-8244-456e-a027-41afd02ab01d",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-88197ba4-6311-4840-a0f0-2e5bcdde51d2",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8a14bd5a-0810-45dc-80aa-35e6d83f3acd",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8a49bf73-faf0-4e20-bcdb-015a9e65c2e4",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8a4e8030-44a4-46d7-a640-96ff44f2eea2",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8b11b7ac-c456-4f72-afd4-e454844e0529",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8b1e8d57-004d-4eb8-8cee-efccbd24e86c",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8b519c21-1a99-4cba-a8b8-af7491144630",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8c46918a-9ece-4b68-b3ff-e85b3aad0413",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8ce04176-5aef-40c3-80c4-e64273955b32",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8dbd8009-d89b-4df3-a9d5-acaeaa43aa33",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8f0c44da-46ee-4e1b-9d2f-1c5cf98217e2",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-8f6a145c-d2f1-45b4-a676-86f692dec1b7",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-90490f2a-3245-4cb8-85cc-72a27dd5b6da",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-9502727e-2062-4f7e-9228-b4b8f7dce316",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-95740781-0b0c-443e-826c-3585ae25367a",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-95d49bdd-7c1a-4bb5-9aca-054be734c666",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-9648a86c-86b1-4121-ab9e-8bcc8a329830",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-96c5a2fd-91c7-4064-94b4-07758482e81d",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-993cb8cb-f25f-43ff-bc2a-75913ce26290",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-99791e07-b9bc-4db4-b41e-b6c96267e103",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a13b2a7a-2d71-4cbd-94fd-d3601aa5c24f",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a1b0d9a6-d85b-455d-816b-22f6de4353cd",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a29bb9b1-ae21-41fb-82e2-3bd2a29cfcd7",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a2ca173c-2991-4887-9515-1975b89c913f",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a3f0bc2e-30cf-48d5-bdd6-36435b12ea90",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-a4c2d7b2-3905-4053-99d2-e852fda9c7a1",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a6534ee1-5c78-4e69-91dc-742ba3f70757",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a8a4ecfe-e458-4c10-a25c-56b65b425b04",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a8c3219e-f93c-4eec-acd2-ee11e8f60204",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-a9f2a219-c5b0-4820-a0f0-13ed364ac1c8",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-aaa27ce5-41a4-4975-832a-9e83afa59408",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-ab47821d-9623-407d-b90a-3c4ac314f6cd",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-ac088090-33bb-4b4d-bd23-be8310874cfc",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-ad7e3379-1da3-4690-8a42-6445a648ab1e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-af86a7a9-9940-40bd-8b44-602355172800",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-b08d31d8-d970-41a4-b8ac-80f189d78609",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-b1fd1220-0126-40a5-a497-22dace8950fd",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-b33a48fc-b131-4318-863f-91b71a4fd3f0",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-b396f54b-de0a-4f94-b9ea-acdaebcc892a",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-b3da4cf2-6f26-4e8b-bc81-440304fe9c98",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-b41401e5-a329-4544-9025-b71653070e4b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-b4fe8f0d-417a-4bfb-9588-c4a3d12566ce",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-bccdce68-887a-4ba0-892f-e50e6a3d3de0",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-be4edf58-0597-4d7a-a1df-91a4ff6ddd22",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-bf07eb44-4d92-4c4d-9bcc-f49ac2f29810",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-bf2d4428-d691-403a-8cd4-e442137d833a",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-c1920059-9b05-4c25-ac8f-dd1022eb6fee",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-c26eee54-33ec-4082-929d-f10eb82c2594",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-c3a8a32a-8bb5-4c61-9520-8057febd9487",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-c90e723d-0ab9-4b42-8fb1-46f6c99c96e1",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-c93d8b66-efff-4872-af77-0d382980a38e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-c98c2b27-af86-49b1-8381-2b629394c960",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-caa7286c-e1c9-457f-a8fe-446c485ed9e3",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-cba59051-41b8-4113-83c4-2214b45e3cf4",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-cd748edd-13c2-4804-8a13-9b9207d177dc",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-cdd7c92a-7cc5-495f-b2c2-4046610fed6a",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-d3227b2c-d100-4c4e-89ac-efb4404b03d2",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-d9b79e19-6b3f-4f46-9adb-b71d42ba498b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-d9da6f42-491f-4e67-870e-d1a2acbade7e",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-dea7f14d-0b13-4444-946f-348f88ae6797",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-df4fcba7-91ed-447b-b85f-23192d31d7e6",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-dfb3b662-54a2-44ca-b90d-0ccb6796ced5",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-e255d259-8e5c-4b47-bf0b-5149fca5a869",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-e26f4290-0b1b-40a9-bd5a-0115338b00bf",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-e2bd55bf-5bbf-4892-af73-2d3ceeead737",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-e4720cd2-3387-4975-aa8f-335d6d5116f8",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-e7214cbe-678b-4d0b-a7a7-df415486829d",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-e7dff79e-b2bc-4d8e-ba79-34fba33770a6",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-e88fe8d9-0e28-467e-82eb-d7a4468d60a0",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-eaf01bd0-37d1-401f-b16b-a3e085ded78f",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-ebcafb27-8937-4f82-9186-98acdd00c875",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-ed79da00-8651-4681-934a-63fc7460171b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-ee684713-d88e-481a-9a08-94f33dcebf63",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-eed01102-f964-474d-9466-6ff753fdd7e2",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-eed740bf-e4fc-4db4-a1ac-2b562b54595b",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-ef3f41fb-7a8f-4379-9f7e-4325a5cb6c43",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-f1b71828-3fc2-4051-8698-0e6445012e08",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-f48f396c-dee6-4b71-b1ad-1e9cc593b196",
+      "reason": "active-pipeline",
+      "evidence": [
+        "dispatch-log",
+        "active-pipeline",
+        "parentSession"
+      ]
+    },
+    {
+      "id": "session-f4c84f68-ed16-4bc8-b4c3-df36354f709d",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-f5294425-7b88-4315-8273-0aba059fc156",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-f67fba7e-f0d5-4b92-acc7-1ea056bc1f7d",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-f6da16d0-bb35-4dab-9259-16bd961ed282",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-f80d16e3-436d-4d3d-b904-44b76b15ba62",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-f8690cd8-43ba-4794-bf3e-9c8e01120daa",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-f97d8aa3-0f24-41d6-a6d3-562700a07061",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-fb17c6c4-b92e-4197-ab32-9a25c71ce550",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-fb4648be-308f-4378-aee6-b83efc26f763",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-fbc44e42-e215-4db6-8eb7-cfb6298bb445",
+      "reason": "unproven-root",
+      "evidence": []
+    },
+    {
+      "id": "session-fe8ec392-6bbc-49c4-b9eb-49545b09d845",
+      "reason": "unproven-root",
+      "evidence": []
+    }
+  ],
+  "errors": []
+}

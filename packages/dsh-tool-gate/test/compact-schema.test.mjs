@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { COMPACT_MAP_VERSION, COMPACT_TOOL_DESCRIPTIONS, projectTools, stripHiddenBuiltinPromptSections } from '../lib/index.js'
+import { COMPACT_MAP_VERSION, COMPACT_TOOL_DESCRIPTIONS, COMPACT_MAPS_BY_VERSION, projectTools, stripHiddenBuiltinPromptSections } from '../lib/index.js'
 
 const clone = (x) => JSON.parse(JSON.stringify(x))
 const withoutDescriptions = (x) => {
@@ -15,9 +15,9 @@ for (const [name, map] of Object.entries(COMPACT_TOOL_DESCRIPTIONS)) {
   test(`${name}: deterministic, frozen-safe and schema invariant`, () => {
     const input = freeze([clone(tool)])
     const a = projectTools(input), b = projectTools(input)
-    assert.equal(COMPACT_MAP_VERSION, 2)
+    assert.equal(COMPACT_MAP_VERSION, 3)
     assert.equal(JSON.stringify(a), JSON.stringify(b))
-    if (name === 'ask_user_question') assert.equal(a[0], input[0])
+    if (name === 'ask_user_question' || name === 'todo_write') assert.equal(a[0], input[0])
     else assert.notEqual(a[0], input[0])
     assert.deepEqual(withoutDescriptions(a), withoutDescriptions(input))
     assert.equal(projectTools(input, false), input)
@@ -31,7 +31,7 @@ test('edit/read/write preserve tool descriptions and never mutate frozen long sc
     const tool = freeze({ name, description: 'keep tool description', parameters: { type: 'object', properties: Object.fromEntries(map.expectParams.map((key) => [key, { type: 'string', description: long }])), required: [] } })
     const out = projectTools([tool])[0]
     assert.equal(out.description, 'keep tool description')
-    assert.equal(out.parameters.properties.file_path.description, map.params.file_path)
+    assert.equal(out.parameters.properties.file_path.description, COMPACT_MAPS_BY_VERSION[3][name].params.file_path)
     assert.notEqual(out.parameters.properties, tool.parameters.properties)
     assert.deepEqual(withoutDescriptions(out), withoutDescriptions(tool))
   }
@@ -42,7 +42,7 @@ test('parameter drift returns the original tool and logs', () => {
   const logs = []
   assert.equal(projectTools([tool], true, (s) => logs.push(s))[0], tool)
   assert.equal(logs.length, 1)
-  assert.match(logs[0], /compact schema v2 fallback/)
+  assert.match(logs[0], /compact schema v\d+ fallback/)
 })
 
 test('read/edit/write require the real parameter names and drift fails open', () => {

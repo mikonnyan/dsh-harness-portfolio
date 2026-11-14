@@ -31,7 +31,7 @@ test('same-process real plugins + v4 SessionStore: append-only keeps exact tools
   compact.commitSpanCompaction(s,h.tokenMeter,compact.planSpanCompaction(s,h.tokenMeter,{turns:[1,3],summary:'cross append'},1))
   assert.equal(JSON.stringify(toolsFor(s)),before,'append compaction must not relock/mutate tools schema')
   activity(s,12);assert.equal(JSON.stringify(toolsFor(s)),before)
-  const recentActivity=(typeof s.snapshotEvents==='function'?s.snapshotEvents():s.events).filter(e=>e.type==='assistant/message').at(-1)?.time??NOW
+  const recentActivity=s.snapshotEvents().filter(e=>e.type==='assistant/message').at(-1)?.time??NOW
   const cold=gate.filterTools(catalog,s,gate.DEFAULT_CONFIG,{},recentActivity+300001)
   assert.ok(!cold.some(t=>t.name==='dev_reload_package'),'cold cache closes candidate')
   unlock(s,13);activity(s,14);activity(s,15);activity(s,16);activity(s,17)
@@ -39,13 +39,12 @@ test('same-process real plugins + v4 SessionStore: append-only keeps exact tools
   assert.ok(!toolsFor(s).some(t=>t.name==='dev_reload_package'),'rewrite immediately closes')
   unlock(s,18);activity(s,19);activity(s,20);activity(s,21);activity(s,22)
   const toolHeader=s.append('request/header',{header:{config:{provider:'x',model:'y'},tools:[{name:'dev_new',description:'test',parameters:{type:'object'}}]},reason:'series',startsSeries:true})
-  s.append('developer/message',{headerSeq:toolHeader.seq,message:{id:'d',role:'developer',source:{kind:'tool-addition'},content:[{type:'tool-addition',toolName:'dev_new'}]}})
+  s.append('developer/message',{headerSeq:toolHeader.seq,message:{id:'d',role:'developer',source:{kind:'tool-addition'},content:[{type:'tool-addition',toolName:'dev_new'}]}},{surfaceOp:'append'})
   compact.commitSpanCompaction(s,h.tokenMeter,compact.planSpanCompaction(s,h.tokenMeter,{from:'auto',to:'turn:6',summary:'rebase'},1))
-  assert.equal(gate.isV4Session(s), false, 'installed SessionStore is the events-array dialect')
-  assert.ok(toolsFor(s).some(t=>t.name==='dev_reload_package'), 'v4 rebase stays off without snapshotEvents/eventAt')
+  assert.ok(!toolsFor(s).some(t=>t.name==='dev_reload_package'),'v4 rebase immediately closes')
   assert.equal(typeof h.ctx.systemPrompt,'object')
   const assembled=await assembledTools(h.ctx,catalog,{session:s})
-  assert.equal(assembled.some(t=>t.name==='dev_reload_package'), toolsFor(s).some(t=>t.name==='dev_reload_package'), 'real assemble hook applies same tools schema')
+  assert.ok(!assembled.some(t=>t.name==='dev_reload_package'),'real assemble hook applies same tools schema')
 })
 
 test('same-process real plugins + v3 SessionStore: hard cap and once have exact timing',async()=>{
@@ -53,17 +52,19 @@ test('same-process real plugins + v3 SessionStore: hard cap and once have exact 
   const tools=new Map();ctx.provide('tools',{register(d){tools.set(d.name,d);return()=>tools.delete(d.name)}})
   ctx.provide('systemPrompt',{section(){return()=>{}},context(){return()=>{}}})
   commands(ctx);compact.apply(ctx);gate.apply(ctx)
-  const s=sessions.prepare('cross-real-v3',{meta:{cwd:'C:/work/workspace'}})
+  const s=sessions.prepare('cross-real-v3',{meta:{cwd:'C:/Users/mikon/workspace'}})
   for(let n=1;n<=5;n++){
     s.append('turn/start',{turn:n});s.append('user/message',{id:`u${n}`,role:'user',source:{kind:'human'},content:[{type:'text',text:'cache history '.repeat(500)}]},{surfaceOp:'append'});s.append('turn/end',{turn:n,reason:{kind:'completed'}})
   }
   unlock(s,6);for(let n=7;n<=17;n++)activity(s,n)
   assert.ok(toolsFor(s).some(t=>t.name==='dev_reload_package'))
-  activity(s,18);assert.ok(!toolsFor(s).some(t=>t.name==='dev_reload_package'))
+  activity(s,18);assert.ok(toolsFor(s).some(t=>t.name==='dev_reload_package'),'hot cache keeps the idle group until PMW')
+  assert.ok(!gate.filterTools(catalog,s,gate.DEFAULT_CONFIG,{},NOW+gate.DEFAULT_CONFIG.cacheExpiryMs+1).some(t=>t.name==='dev_reload_package'))
   s.append('turn/start',{turn:19});s.append('tool/call',{turn:19,name:'tool_unlock',arguments:JSON.stringify({groups:['dev'],action:'once'})});s.append('turn/end',{turn:19,reason:{kind:'completed'}})
   assert.ok(toolsFor(s).some(t=>t.name==='dev_reload_package'))
   activity(s,20)
   compact.commitSpanCompaction(s,meter,compact.planSpanCompaction(s,meter,{from:'turn:1',to:'turn:5',summary:'v3 append'},1))
-  assert.ok(!toolsFor(s).some(t=>t.name==='dev_reload_package'))
+  assert.ok(toolsFor(s).some(t=>t.name==='dev_reload_package'),'once waits for PMW while cache is hot')
+  assert.ok(!gate.filterTools(catalog,s,gate.DEFAULT_CONFIG,{},NOW+gate.DEFAULT_CONFIG.cacheExpiryMs+1).some(t=>t.name==='dev_reload_package'))
   assert.ok(tools.has('tool_unlock')&&tools.has('context_compact'))
 })

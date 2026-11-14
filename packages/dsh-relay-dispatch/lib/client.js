@@ -23,12 +23,188 @@ window.__ModuleLoader__.load({
 			return { cached, uncached, output, cacheWrite, inputRate, cacheRate, outputRate,
 				cacheCost: cached * cacheRate / 1e6, inputCost: (uncached + cacheWrite) * inputRate / 1e6, outputCost: output * outputRate / 1e6 };
 		}
+		// 空间占用只表示窗口容量；账单仅使用 provider 上报的 usage，绝不按窗口 Token 估算。
+		// 「本轮」= 最近一条用户消息（user/message）/turn/start 之后的所有 LLM 步 usage；多步工具回合逐条求和。
+		function usageOfEvent(e) {
+			const data = e && e.data;
+			if (!data) return undefined;
+			if (e.type === "assistant/chunk" && data.chunk && data.chunk.type === "usage") return data.chunk.usage;
+			if (e.type === "assistant/message") return data.usage;
+			return undefined;
+		}
+		function turnUsageEvents(sessionsSvc, sessionId) {
+			const events = sessionEvents(sessionsSvc, sessionId);
+			let start = -1;
+			for (let i = events.length - 1; i >= 0; i--) {
+				const e = events[i];
+				if (!e) continue;
+				if (e.type === "user/message" || e.type === "turn/start") { start = i; break; }
+			}
+			const list = [];
+			for (let i = start + 1; i < events.length; i++) {
+				const u = usageOfEvent(events[i]);
+				if (u && typeof u === "object") list.push(u);
+			}
+			return list;
+		}
+		// 把本轮多步 usage 逐条分桶再求和（各步独立套价，避免长上下文档位被平均）。
+		function sumBillingBuckets(usages) {
+			const list = (Array.isArray(usages) ? usages : []).map(billingBuckets).filter(Boolean);
+			if (!list.length) return null;
+			const sum = { cached: 0, uncached: 0, output: 0, cacheWrite: 0, cacheCost: 0, inputCost: 0, outputCost: 0, steps: list.length };
+			for (const b of list) {
+				sum.cached += b.cached; sum.uncached += b.uncached; sum.output += b.output; sum.cacheWrite += b.cacheWrite;
+				sum.cacheCost += b.cacheCost; sum.inputCost += b.inputCost; sum.outputCost += b.outputCost;
+			}
+			return sum;
+		}
 		function formatTokensCompact(n) {
 			const scaled = (v) => v >= 100 ? String(Math.round(v)) : String(Math.round(v * 10) / 10);
 			return n < 1000 ? String(Math.round(n)) : n < 1e6 ? scaled(n / 1e3) + "K" : scaled(n / 1e6) + "M";
 		}
+		function compactionSavedAfterUsage(events) {
+			const list = Array.isArray(events) ? events : [];
+			let lastUsageSeq = -1;
+			for (let i = 0; i < list.length; i++) {
+				const e = list[i], data = e && e.data;
+				const u = e && e.type === "assistant/chunk" && data && data.chunk && data.chunk.type === "usage"
+					? data.chunk.usage : e && e.type === "assistant/message" && data ? data.usage : undefined;
+				if (u && typeof u === "object") lastUsageSeq = typeof e.seq === "number" ? e.seq : i;
+			}
+			let saved = 0, compactSeq = -1, claim = null;
+			for (let i = 0; i < list.length; i++) {
+				const e = list[i];
+				const seq = e && typeof e.seq === "number" ? e.seq : i;
+				if (e && (e.type === "compaction/summary" || e.type === "compaction/prune")) {
+					const range = e.data && e.data.shadowedRange;
+					const tokens = e.data && e.data.shadowedTokenCount;
+					claim = range && typeof tokens === "number" ? { start: range.start, end: range.end, tokens } : null;
+					continue;
+				}
+				const op = e && e.surfaceOp;
+				const start = op && typeof op === "object" ? (op.start != null ? op.start : op.startSeq) : undefined;
+				const end = op && typeof op === "object" ? (op.end != null ? op.end : op.endSeq) : undefined;
+				if (claim && start === claim.start && end === claim.end) {
+					if (seq > lastUsageSeq) {
+						const msg = e.type === "tool/result" ? e.data && e.data.message : e.data;
+						let text = "";
+						try { text = JSON.stringify(msg || ""); } catch { text = ""; }
+						const delta = claim.tokens - Math.max(1, Math.ceil(text.length / 4));
+						if (delta > 0) { saved += delta; compactSeq = seq; }
+					}
+					claim = null;
+					continue;
+				}
+				if (claim) claim = null;
+			}
+			return { saved, compactSeq, lastUsageSeq };
+		}
+		function compactProjectionTokens(events) {
+			const list = Array.isArray(events) ? events : [];
+			let usageSeq = -1, projection = null;
+			for (let i = 0; i < list.length; i++) {
+				const e = list[i];
+				const seq = e && typeof e.seq === "number" ? e.seq : i;
+				const data = e && e.data;
+				const u = e && e.type === "assistant/chunk" && data && data.chunk && data.chunk.type === "usage"
+					? data.chunk.usage : e && e.type === "assistant/message" && data ? data.usage : undefined;
+				if (u && typeof (u.prompt_tokens ?? u.inputTokens ?? u.input) === "number") usageSeq = seq;
+				const p = data && data.projection;
+				if (p && p.basis === "heuristic" && typeof p.surfaceTokens === "number" && (e.type === "session/compact" || e.type === "compaction/summary" || e.type === "compaction/end")) {
+					const atSeq = typeof p.atSeq === "number" ? p.atSeq : seq;
+					if (!projection || atSeq >= projection.atSeq) projection = { surfaceTokens: p.surfaceTokens, calibration: typeof p.calibration === "number" && p.calibration > 0 ? p.calibration : 1, atSeq };
+				}
+			}
+			if (!projection || usageSeq >= projection.atSeq) return null;
+			return Math.round(projection.surfaceTokens * projection.calibration);
+		}
+		function adjustedRingTokens(pressureTokens, projectedTokens, lag) {
+			const saved = lag && lag.saved > 0 && lag.compactSeq > lag.lastUsageSeq ? lag.saved : 0;
+			if (!(saved > 0)) return typeof projectedTokens === "number" ? projectedTokens : pressureTokens;
+			if (typeof pressureTokens === "number" && typeof projectedTokens === "number" && pressureTokens - projectedTokens >= saved * 0.5) return projectedTokens;
+			const base = typeof pressureTokens === "number" ? pressureTokens : projectedTokens;
+			return typeof base === "number" ? Math.max(0, base - saved) : base;
+		}
+		function sessionEvents(sessionsSvc, sessionId) {
+			if (!sessionsSvc || !sessionId) return [];
+			let session = null;
+			try {
+				const binding = typeof sessionsSvc.binding === "function" ? sessionsSvc.binding(sessionId) : null;
+				session = (binding && binding.session) || (typeof sessionsSvc.sessionOf === "function" ? sessionsSvc.sessionOf(sessionId) : null);
+			} catch { session = null; }
+			return eventsOf(session);
+		}
+		function applyRingReading(tokens, contextWindow) {
+			if (typeof tokens !== "number" || typeof contextWindow !== "number" || contextWindow <= 0 || typeof document === "undefined") return;
+			const percent = Math.min(100, Math.round(tokens / contextWindow * 100));
+			const figuresText = "~" + formatTokensCompact(tokens) + " / " + formatTokensCompact(contextWindow);
+			const dash = (2 * Math.PI * 5.5 * percent / 100) + " " + (2 * Math.PI * 5.5);
+			document.querySelectorAll(".JObwrW_root").forEach((root) => {
+				const btn = root.querySelector('button[aria-haspopup="dialog"]');
+				const label = (btn && btn.getAttribute("aria-label")) || "";
+				if (btn && /上下文已用|of context used/.test(label)) {
+					const next = /of context used/.test(label) ? (percent + "% of context used") : ("上下文已用 " + percent + "%");
+					if (label !== next) btn.setAttribute("aria-label", next);
+					const circle = btn.querySelector("circle.JObwrW_fill");
+					if (circle && circle.getAttribute("stroke-dasharray") !== dash) circle.setAttribute("stroke-dasharray", dash);
+				}
+				const pct = root.querySelector(".JObwrW_percent");
+				if (pct && pct.textContent !== percent + "%") pct.textContent = percent + "%";
+				root.querySelectorAll(".JObwrW_figures").forEach((el) => {
+					if ((el.textContent || "").trim() !== figuresText) el.textContent = figuresText;
+				});
+			});
+		}
 		function billingUsd(n) { return n < 0.01 ? n.toFixed(4) : n < 1 ? n.toFixed(3) : n.toFixed(2); }
 		function billingTotal(b) { return b ? b.cacheCost + b.inputCost + b.outputCost : 0; }
+		function hasSidebarRelations(ids, byId) {
+			const related = (id) => {
+				const p = byId[id] && byId[id].parentId;
+				return p && p !== id && byId[p] && byId[p].origin !== "subagent" ? p : undefined;
+			};
+			for (const id of ids) {
+				if (related(id)) return true;
+				for (const candidate of Object.values(byId)) if (candidate && candidate.parentId === id) return true;
+			}
+			return false;
+		}
+		function expandTruncatedSidebarGroups(rows, byId, idOf, wrapperOf, expandedGroups) {
+			const groups = new Map();
+			for (const el of rows) {
+				const id = idOf(el);
+				const g = wrapperOf(el).parentElement;
+				if (!id || !g) continue;
+				const rec = groups.get(g) || { ids: [], expand: null };
+				rec.ids.push(id);
+				for (const node of g.children) {
+					if (/^Expand\s+\d+/i.test((node.textContent || "").trim())) rec.expand = node;
+				}
+				groups.set(g, rec);
+			}
+			let expanded = false;
+			for (const [g, rec] of groups) {
+				if (!rec.expand || expandedGroups.has(g) || !hasSidebarRelations(rec.ids, byId)) continue;
+				// Expand only once per group. The following tree pass immediately hides collapsed children.
+				expandedGroups.add(g);
+				try { rec.expand.click(); expanded = true; } catch {}
+			}
+			return expanded;
+		}
+		function buildSidebarTree(ids, parentOf, open) {
+			const kids = new Map();
+			for (const id of ids) {
+				const p = parentOf(id);
+				if (p) (kids.get(p) || kids.set(p, []).get(p)).push(id);
+			}
+			const childIds = new Set([...kids.values()].flat());
+			const hidden = new Set();
+			for (const id of childIds) {
+				for (let p = parentOf(id), n = 0; p && n < 20; p = parentOf(p), n++) {
+					if (kids.has(p) && !open.has(p)) { hidden.add(id); break; }
+				}
+			}
+			return { kids, childIds, hidden };
+		}
 		function apply(ctx) {
 			try { ctx.effect(() => ctx.slots.inject("shell.overlay", () => ctx.slots.register({ name: "shell.overlay", id: "dsh-relay-dispatch-sidebar-tree", order: 900, label: () => "relay-tree" }, () => null)), "relay-dispatch: overlay anchor"); } catch {}
 			try {
@@ -50,6 +226,7 @@ window.__ModuleLoader__.load({
 				};
 				loadOpen();
 				const save = () => { try { localStorage.setItem(LS, JSON.stringify([...open])); } catch {} };
+				const expandedGroups = new WeakSet();
 				const style = document.createElement("style");
 				style.dataset.rdtStyle = "1";
 				style.textContent = CSS;
@@ -74,6 +251,7 @@ window.__ModuleLoader__.load({
 						const snap = store.getSnapshot();
 						const byId = (snap && snap.byId) || {};
 						const rows = [...document.body.querySelectorAll('[role="treeitem"][aria-selected]')];
+						if (expandTruncatedSidebarGroups(rows, byId, idOf, U, expandedGroups)) { if (mo) mo.takeRecords(); return; }
 						const rowOf = new Map();
 						for (const el of rows) {
 							if (el.style.position === "absolute" || el.style.transform) continue; // virtualized: leave flat
@@ -320,23 +498,6 @@ window.__ModuleLoader__.load({
 					const v = Number(raw);
 					return Number.isFinite(v) ? v : null;
 				};
-				// 空间占用只表示窗口容量；账单仅使用 provider 上报的 usage，绝不按窗口 Token 估算。
-				function latestUsageEvent(sessionsSvc, sessionId) {
-					if (!sessionsSvc || !sessionId) return null;
-					let session = null;
-					try {
-						const binding = typeof sessionsSvc.binding === "function" ? sessionsSvc.binding(sessionId) : null;
-						session = (binding && binding.session) || (typeof sessionsSvc.sessionOf === "function" ? sessionsSvc.sessionOf(sessionId) : null);
-					} catch {}
-					const events = eventsOf(session);
-					for (let i = events.length - 1; i >= 0; i--) {
-						const e = events[i], data = e && e.data;
-						const u = e && e.type === "assistant/chunk" && data && data.chunk && data.chunk.type === "usage"
-							? data.chunk.usage : e && e.type === "assistant/message" && data ? data.usage : undefined;
-						if (u && typeof u === "object") return u;
-					}
-					return null;
-				}
 				function addBillingRow(panel, label, value, total) {
 					const row = document.createElement("div");
 					row.className = "rdt-billing-row" + (total ? " rdt-billing-total" : "");
@@ -355,9 +516,9 @@ window.__ModuleLoader__.load({
 					addBillingRow(box, "缓存命中 (1折)", `~${formatTokensCompact(primary.cached)} (${percent}%) · $${billingUsd(primary.cacheCost)}`);
 					addBillingRow(box, "新增输入", `~${formatTokensCompact(primary.uncached + primary.cacheWrite)} · $${billingUsd(primary.inputCost)}`);
 					addBillingRow(box, "模型输出", `~${formatTokensCompact(primary.output)} · $${billingUsd(primary.outputCost)}`);
-					const turnLabel = latest ? `本轮 $${billingUsd(billingTotal(latest))}` : "";
+					const turnLabel = latest ? `本轮${latest.steps > 1 ? `（${latest.steps}步）` : ""} $${billingUsd(billingTotal(latest))}` : "";
 					const cumLabel = cumulative ? `累计 $${billingUsd(billingTotal(cumulative))}` : "";
-					addBillingRow(box, latest ? "本轮实付 / 累计实付" : "累计实付", [turnLabel, cumLabel].filter(Boolean).join(" · "), true);
+					addBillingRow(box, latest ? (latest.steps > 1 ? `本轮实付(${latest.steps}步) / 累计实付` : "本轮实付 / 累计实付") : "累计实付", [turnLabel, cumLabel].filter(Boolean).join(" · "), true);
 				}
 				const fiberEntryId = (el) => {
 					try {
@@ -381,16 +542,28 @@ window.__ModuleLoader__.load({
 					const cur = snap.current && byId[snap.current];
 					const pv = (cur && cur.projectionValues) || {};
 					const usage = pv.tokenUsage;
-					const latestUsage = latestUsageEvent(ctx.sessions, snap.current);
-					const latestBill = billingBuckets(latestUsage), cumulativeBill = billingBuckets(usage);
+					const turnUsages = turnUsageEvents(ctx.sessions, snap.current);
+					const latestBill = sumBillingBuckets(turnUsages), cumulativeBill = billingBuckets(usage);
+					const turnSteps = latestBill ? latestBill.steps : 0;
 					const turnCost = latestBill ? "$" + billingUsd(billingTotal(latestBill)) : "";
 					const actualCumCost = cumulativeBill ? "$" + billingUsd(billingTotal(cumulativeBill)) : "";
 					const pressure = pv.contextPressure;
-					const used = pressure && (typeof pressure.projectedTokens === "number" ? pressure.projectedTokens : pressure.pressureTokens);
+					const hostUsed = pressure && (typeof pressure.projectedTokens === "number" ? pressure.projectedTokens : pressure.pressureTokens);
+					const ringEvents = sessionEvents(ctx.sessions, snap.current);
+					const projectedRing = compactProjectionTokens(ringEvents);
+					const ringLag = compactionSavedAfterUsage(ringEvents);
+					const ringUsed = adjustedRingTokens(pressure && pressure.pressureTokens, typeof hostUsed === "number" ? hostUsed : null, ringLag);
+					const used = typeof projectedRing === "number" ? projectedRing : (typeof ringUsed === "number" ? ringUsed : hostUsed);
+					if (typeof projectedRing === "number" && pressure && typeof pressure.contextWindow === "number") {
+						applyRingReading(projectedRing, pressure.contextWindow);
+					} else if (typeof hostUsed === "number" && typeof used === "number" && used + 256 < hostUsed && pressure && typeof pressure.contextWindow === "number") {
+						applyRingReading(used, pressure.contextWindow);
+					}
 					const ctxCost = typeof used === "number" ? formatGeminiArgonCost(used) : "";
 					const cumCost = usage ? formatGeminiArgonCost(usage) : "";
 					const ctxTier = typeof used === "number" ? used : 0;
-					const ringBadge = turnCost ? " · 本轮 " + turnCost : actualCumCost ? " · 累计 " + actualCumCost : dot(ctxCost);
+					const turnLabelShort = turnSteps > 1 ? " · 本轮(" + turnSteps + "步) " + turnCost : turnCost ? " · 本轮 " + turnCost : "";
+					const ringBadge = turnCost ? turnLabelShort : actualCumCost ? " · 累计 " + actualCumCost : dot(ctxCost);
 					const roots = new Set(document.querySelectorAll(".JObwrW_root"));
 					document.querySelectorAll('button[aria-haspopup="dialog"]').forEach((btn) => {
 						const label = btn.getAttribute("aria-label") || "";
@@ -400,7 +573,7 @@ window.__ModuleLoader__.load({
 					});
 					roots.forEach((el) => {
 						setCost(el, ringBadge);
-						setHint(el, turnCost ? "本轮实付 " + turnCost + (actualCumCost ? " · 累计实付 " + actualCumCost : "") : (actualCumCost ? "累计实付 " + actualCumCost : ""));
+						setHint(el, turnCost ? "本轮实付 " + turnCost + (turnSteps > 1 ? "（" + turnSteps + " 步合计）" : "") + (actualCumCost ? " · 累计实付 " + actualCumCost : "") : (actualCumCost ? "累计实付 " + actualCumCost : ""));
 					});
 					const figures = new Set(document.querySelectorAll(".JObwrW_figures"));
 					roots.forEach((root) => {
@@ -412,7 +585,7 @@ window.__ModuleLoader__.load({
 					});
 					figures.forEach((el) => {
 						const parts = [];
-						if (turnCost) parts.push("本轮 " + turnCost);
+						if (turnCost) parts.push(turnSteps > 1 ? "本轮(" + turnSteps + "步) " + turnCost : "本轮 " + turnCost);
 						if (actualCumCost) parts.push("累计 " + actualCumCost);
 						setCost(el, parts.length ? " · " + parts.join(" · ") : "");
 					});
@@ -460,7 +633,7 @@ window.__ModuleLoader__.load({
 					document.querySelectorAll('[role="tooltip"]').forEach((el) => {
 						const t = el.textContent || "";
 						let extra = "";
-						if (/上下文已用|of context used/.test(t)) extra = turnCost ? " · 本轮 " + turnCost : "";
+						if (/上下文已用|of context used/.test(t)) extra = turnCost ? (turnSteps > 1 ? " · 本轮(" + turnSteps + "步) " + turnCost : " · 本轮 " + turnCost) : "";
 						else if (/\btok\b/.test(t) && !/tok\/s/.test(t) && /输入|输出|Input|Output/.test(t)) extra = dot(cumCost);
 						setCost(el, extra);
 					});
@@ -540,12 +713,167 @@ window.__ModuleLoader__.load({
 				run();
 				if (ctx.effect) ctx.effect(() => dispose, "relay-dispatch: sidebar tree");
 			} catch (e) { /* 静默 */ }
+			// 视觉兜底：relay_dispatch 无可见 assistant 正文时在工具胶囊下方渲染 📋 派发说明卡片。
+			try { applyDispatchBubbles(ctx); } catch { /* 静默 */ }
+		}
+
+		/* rdt-dispatch-bubble: 视觉兜底——当某轮只有折叠的 Tool call · relay_dispatch 胶囊而没有可见 assistant 正文气泡时，
+		   从会话事件里该 tool/call 的 arguments.summary（或结果 📋 / OUT 📋 行）提取摘要，插在折叠胶囊的外侧。
+		   同轮已有任意 assistant 正文气泡时不重复渲染。 */
+		const BUBBLE_CSS = ".rdt-dispatch-card{display:flex;gap:8px;align-items:flex-start;margin:2px 0 6px;padding:8px 12px;border-radius:10px;background:var(--dsw-alias-fill-secondary,rgba(127,127,127,.08));border:1px solid var(--dsw-alias-border-l3,rgba(127,127,127,.18));font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary,inherit);max-width:min(680px,100%)}.rdt-dispatch-card[data-rdt-emoji]{flex:none;font-size:14px;line-height:20px}";
+		/** 当前打开的轮（最近 user/message 或 turn/start 之后）的事件切片。 */
+		function openTurnEvents(events) {
+			const list = Array.isArray(events) ? events : [];
+			let start = -1;
+			for (let i = list.length - 1; i >= 0; i--) {
+				if (list[i] && (list[i].type === "user/message" || list[i].type === "turn/start")) { start = i; break; }
+			}
+			return list.slice(start + 1);
+		}
+		/** 本轮 relay 派发说明集合：tool/call 参数 summary + assistant 兜底消息 + tool/result OUT 📋 行。 */
+		function relayDispatchSummaries(events) {
+			const slice = openTurnEvents(events);
+			const summaries = [];
+			const assistantTexts = [];
+			for (const e of slice) {
+				if (!e) continue;
+				if (e.type === "tool/call" && e.data && e.data.name === "relay_dispatch") {
+					let args = e.data.arguments;
+					if (typeof args === "string") { try { args = JSON.parse(args); } catch { args = null; } }
+					if (args && typeof args.summary === "string" && args.summary.trim()) summaries.push(args.summary.trim());
+				}
+				if (e.type === "assistant/message") {
+					const content = (e.data && e.data.message && e.data.message.content) || e.data && e.data.content || [];
+					if (Array.isArray(content)) for (const b of content) if (b && b.type === "text" && typeof b.text === "string" && b.text.trim()) assistantTexts.push(b.text.trim());
+				}
+				if (e.type === "tool/result" && e.data && e.data.message && e.data.message.name === "relay_dispatch") {
+					const content = e.data.message.content || [];
+					if (Array.isArray(content)) for (const b of content) {
+						const raw = blockPlainText(b);
+						const m = raw.match(/(?:^|\n)(?:OUT\s+)?📋\s*([^\n]+)/);
+						if (m) summaries.push(m[1].trim());
+					}
+				}
+			}
+			// 同轮已有任意可见 assistant 正文时，不再在折叠胶囊外补 📋 卡片。
+			if (assistantTexts.length) return [];
+			const need = [];
+			for (const s of summaries) if (s && !need.includes(s)) need.push(s);
+			return need;
+		}
+		function blockPlainText(block) {
+			if (!block || typeof block !== "object") return "";
+			if (typeof block.text === "string") return block.text;
+			if (typeof block.content === "string") return block.content;
+			return "";
+		}
+		/** 折叠控件本身（details/summary）继续向外走到消息行，卡片插在折叠框后面。 */
+		function toolCallRow(headerEl) {
+			let node = headerEl;
+			while (node && node.parentElement && node.parentElement !== document.body) {
+				const parent = node.parentElement;
+				if (parent.tagName === "DETAILS" || node.tagName === "SUMMARY") { node = parent; continue; }
+				const siblings = [...parent.children];
+				const extra = siblings.filter((n) => n !== node && (n.textContent || "").trim().length > 24);
+				if (siblings.length >= 2 && extra.length >= 1) return node;
+				node = parent;
+			}
+			return node || headerEl;
+		}
+		/** 找到渲染锚点：包含 relay_dispatch 工具胶囊的消息行（不进入折叠体内部）。 */
+		function relayCapsuleRows() {
+			const rows = new Map();
+			if (typeof document === "undefined" || !document.body) return rows;
+			const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+			const seen = new Set();
+			let node;
+			while ((node = walker.nextNode())) {
+				const text = node.nodeValue || "";
+				if (!/relay_dispatch/.test(text) || !/Tool call/i.test(text)) continue;
+				let el = node.parentElement;
+				for (let i = 0; el && i < 12; i++, el = el.parentElement) {
+					if (seen.has(el)) break;
+					const t = (el.textContent || "");
+					if (/Tool call/i.test(t) && /relay_dispatch/.test(t) && t.length <= 400) {
+						const row = toolCallRow(el);
+						seen.add(el);
+						seen.add(row);
+						rows.set(row, true);
+						break;
+					}
+				}
+			}
+			return [...rows.keys()];
+		}
+		function paintDispatchBubbles(summaries) {
+			if (typeof document === "undefined" || !document.body) return;
+			for (const el of [...document.querySelectorAll(".rdt-dispatch-card")]) el.remove();
+			if (!summaries.length) return;
+			const capsules = relayCapsuleRows();
+			if (!capsules.length) return;
+			const host = capsules[0].parentElement || document.body;
+			let anchor = capsules[capsules.length - 1].nextElementSibling;
+			for (const text of summaries.slice(0, 3)) {
+				const card = document.createElement("div");
+				card.className = "rdt-dispatch-card";
+				const emoji = document.createElement("span");
+				emoji.textContent = "📋";
+				emoji.setAttribute("data-rdt-emoji", "1");
+				const body = document.createElement("span");
+				body.textContent = text;
+				card.append(emoji, body);
+				host.insertBefore(card, anchor);
+				anchor = card.nextElementSibling;
+			}
+		}
+		function applyDispatchBubbles(ctx) {
+			if (typeof document === "undefined" || !document.body) return;
+			if (window.__rdtDispatchBubble === false) return;
+			if (typeof window.__rdtDispatchBubble === "function") { try { window.__rdtDispatchBubble(); } catch {} return; }
+			const store = ctx.sessions && ctx.sessions.list;
+			if (!store || typeof store.getSnapshot !== "function") return;
+			let style = document.querySelector("style[data-rdt-dispatch-style]");
+			if (!style) {
+				style = document.createElement("style");
+				style.dataset.rdtDispatchStyle = "1";
+				style.textContent = BUBBLE_CSS;
+				document.head.appendChild(style);
+			}
+			let bubbleRaf = 0;
+			const paint = () => {
+				bubbleRaf = 0;
+				try {
+					const snap = store.getSnapshot() || {};
+					const events = sessionEvents(ctx.sessions, snap.current);
+					paintDispatchBubbles(relayDispatchSummaries(events));
+				} catch { /* 静默 */ }
+			};
+			const schedule = () => { if (!bubbleRaf) bubbleRaf = requestAnimationFrame(paint); };
+			const moBubble = new MutationObserver(schedule);
+			moBubble.observe(document.body, { childList: true, subtree: true });
+			const unsubBubble = store.subscribe ? store.subscribe(schedule) : undefined;
+			const disposeBubble = () => {
+				try {
+					if (bubbleRaf) cancelAnimationFrame(bubbleRaf);
+					moBubble.disconnect();
+					unsubBubble && unsubBubble();
+					style && style.remove();
+					for (const el of document.querySelectorAll(".rdt-dispatch-card")) el.remove();
+					if (window.__rdtDispatchBubble === disposeBubble) window.__rdtDispatchBubble = false;
+				} catch {}
+			};
+			window.__rdtDispatchBubble = disposeBubble;
+			schedule();
+			if (ctx.effect) ctx.effect(() => disposeBubble, "relay-dispatch: dispatch bubbles");
 		}
 		exports.apply = apply;
 		exports.inject = inject;
 		// 纯计费函数供无 DOM 单测复用；不参与插件注入协议。
-		exports.billingInternals = { billingBuckets, billingTotal, billingUsd, formatTokensCompact };
-		exports.sidebarInternals = { eventsOf };
+		exports.billingInternals = { billingBuckets, billingTotal, billingUsd, formatTokensCompact, sumBillingBuckets, turnUsageEvents, usageOfEvent };
+		exports.meterInternals = { compactionSavedAfterUsage, adjustedRingTokens };
+		exports.sidebarInternals = { eventsOf, hasSidebarRelations, expandTruncatedSidebarGroups, buildSidebarTree };
+		// 派发说明兜底气泡的纯逻辑部分，供无 DOM 单测复用。
+		exports.dispatchBubbleInternals = { openTurnEvents, relayDispatchSummaries };
 		return module.exports;
 	}
 });

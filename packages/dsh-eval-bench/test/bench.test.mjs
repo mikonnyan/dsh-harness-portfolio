@@ -40,13 +40,14 @@ test('2. Tool-gate suite verifies ghost context stripping (filterContexts) and z
   const res = await evaluateToolGateSuite()
   assert.equal(res.ghostContext.beforeCount, 3)
   assert.equal(res.ghostContext.afterClosedCount, 2)
-  assert.equal(res.ghostContext.afterDevOpenCount, 3)
+  assert.equal(res.ghostContext.afterDevOpenCount, 2)
   assert.equal(res.ghostContext.strippedWhenClosed, true)
 
   assert.equal(res.autoUnlock.decisionKind, 'allow')
   assert.equal(res.autoUnlock.autoUnlockedGroup, 'dev')
-  assert.equal(res.autoUnlock.replaySource, '自动放行')
-  assert.equal(res.autoUnlock.visibleToolsAfterDevUnlock, 22 + 17)
+  // v5 BYPASS: one direct call does not open the group or mutate tools[].
+  assert.equal(res.autoUnlock.replaySource, null)
+  assert.equal(res.autoUnlock.visibleToolsAfterDevUnlock, 22)
   assert.equal(res.autoUnlock.internalRelayCallBypassed, true)
 })
 

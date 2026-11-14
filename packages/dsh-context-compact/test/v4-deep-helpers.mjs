@@ -10,15 +10,15 @@ export const runtime = path.join(os.tmpdir(), `dsh-deep-v4-runtime-${process.pid
 const scoped = path.join(runtime, 'node_modules', '@deepseek-ai')
 rmSync(runtime, { recursive: true, force: true })
 mkdirSync(scoped, { recursive: true })
-for (const name of readdirSync(OLD)) {
-  if (name.startsWith('dsh-')) cpSync(path.join(OLD, name), path.join(scoped, name), { recursive: true })
+for (const name of readdirSync('C:/Users/mikon/Desktop/asd/dsh-latest/packages')) {
+  if (name.startsWith('dsh-')) cpSync(`C:/Users/mikon/Desktop/asd/dsh-latest/packages/${name}`, path.join(scoped, name), { recursive: true })
 }
 const brandDir = path.join(scoped, 'dsh-brand'); mkdirSync(brandDir, { recursive: true })
 writeFileSync(path.join(brandDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-brand', type: 'module', exports: './index.js' }))
 writeFileSync(path.join(brandDir, 'index.js'), `export const brandNumber = (x) => x; export const brandString = (x) => x`)
 const llmDir = path.join(scoped, 'dsh-llm'); mkdirSync(path.join(llmDir, 'lib'), { recursive: true })
 writeFileSync(path.join(llmDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-llm', type: 'module', exports: './lib/index.js' }))
-writeFileSync(path.join(llmDir, 'lib', 'index.js'), `import { randomUUID } from 'node:crypto'\nexport function CallId(id) { return id }\nexport function MessageId(id) { return id }\nexport function assertNever(x) { throw new Error('unexpected ' + x) }\nexport function deepFreeze(x) { return x }\nexport class BlockAssembler { constructor() {} push() { return null } get() { return null } }\nexport function freezeMessage(m) { return m }\nexport function createUserMessage(m) { return { ...m, id: randomUUID(), role: 'user' } }\nexport function createSystemMessage(text) { return { id: randomUUID(), role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text }] } }\nexport function assembleAssistantStream() { return null }\nexport function lastAssistantStreamChunk() { return null }\nexport function callConfigEquals(a,b) { return JSON.stringify(a) === JSON.stringify(b) }`)
+writeFileSync(path.join(llmDir, 'lib', 'index.js'), `import { randomUUID } from 'node:crypto'\nexport function freezeMessage(m) { return m }\nexport function createUserMessage(m) { return { ...m, id: randomUUID(), role: 'user' } }\nexport function createSystemMessage(text) { return { id: randomUUID(), role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text }] } }\nexport function assembleAssistantStream() { return null }\nexport function lastAssistantStreamChunk() { return null }\nexport function callConfigEquals(a,b) { return JSON.stringify(a) === JSON.stringify(b) }`)
 for (const name of readdirSync(OLD)) {
   if (name === 'dsh-util-values' || name === 'dsh-util-crypto' || name === 'dsh-session' || name === 'dsh-token-meter' || name === 'dsh-llm') continue
   const dest = path.join(scoped, name)
@@ -63,8 +63,8 @@ export async function harness(withCompact = false) {
   return { ctx, sessions, tokenMeter, registeredTools, promptContexts, promptSections }
 }
 export function makeSession(sessions, id = `deep-${Math.random()}`) {
-  const s = sessions.create(id, { meta: { cwd: 'C:/work/workspace' } })
-  s.append('system/message', { message: { id: 'sys', role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text: 'immutable system' }] } })
+  const s = sessions.create(id, { meta: { cwd: 'C:/Users/mikon/workspace' } })
+  s.append('system/message', { message: { id: 'sys', role: 'system', source: { kind: 'system-prompt' }, content: [{ type: 'text', text: 'immutable system' }] } }, { surfaceOp: 'append' })
   return s
 }
 export function turn(s, n, marker, { calls = 1, bytes = 6000, omitResult = false } = {}) {

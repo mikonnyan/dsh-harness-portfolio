@@ -2,4 +2,7 @@
 - insert:
     - id: context-compact
       name: '@dsh-external/dsh-context-compact'
-      config: {}
+      config:
+        autoEngine: true
+        autoCoalesce: true
+        recallBudget: true

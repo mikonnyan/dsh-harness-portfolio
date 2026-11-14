@@ -8,6 +8,8 @@ jspm_packages/
 *.tmp
 *.swp
 *~
+.bak-trash/
+.backup-*/
 
 # Logs
 logs/

@@ -1,0 +1,15 @@
+{
+  "source": "recorded from spec §2.2 native tool:* section descriptions (installed @deepseek-ai/dsh-tool-* packages not readable at fixture-record time; re-record live in Round 3)",
+  "sections": {
+    "tool:read": "Use the read tool — not shell commands like cat — to inspect text files. Results include line numbers. Use offset and limit to continue reading large files.",
+    "tool:grep": "Use the grep tool — not shell grep or rg — to search file contents. Returns matching lines with line numbers, grouped by file. Use read on a matched file when you need surrounding context.",
+    "tool:glob": "Use the glob tool — not shell find — to discover files by path pattern. Results are files only, never directories. A pattern with no separator matches basenames at any depth.",
+    "tool:write": "Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first. Prefer edit for targeted changes.",
+    "tool:edit": "Use edit for targeted changes to an existing UTF-8 text file. It replaces literal old_string with new_string; old_string must appear exactly once unless replace_all is set. Read the file first unless you just created or edited it in this session.",
+    "tool:pwsh": "Execute a PowerShell command (pwsh -Command) and return its stdout/stderr. Each call runs in a fresh pwsh process: no cwd, variables or functions persist between calls — pass workdir instead of using cd. Non-zero exits are reported as [exit code: N] markers. Not for reading or searching files — use read/grep/glob.",
+    "tool:bash": "Execute a bash command and return its stdout/stderr. Each call runs in a fresh process: no state persists between calls. Not for reading or searching files — use read/grep/glob.",
+    "tool:job_output": "Read a background job by the job id returned by the tool that started it. Reads are non-blocking unless wait is true. Do not busy-poll or sleep on a job.",
+    "tool:subagent": "Delegate a self-contained task to a subagent working in its own context. Give it a complete standalone prompt: it does not see this conversation. The subagent returns its result, not its intermediate steps.",
+    "tool:web_search": "Search the web for current information. Returns an optional summary answer and a list of source URLs. Cite the relevant URLs as markdown links."
+  }
+}

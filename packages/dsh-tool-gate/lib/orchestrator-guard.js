@@ -2,6 +2,8 @@ import { appendFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { isChildSession, normalizeCommand, pathWithin } from './permission-guard.js'
+import { classifySession, ARCHETYPE_RANK as ARCHETYPE_RANK_FOR_GUARD, manifestOf } from './session-archetype.js'
+import { readPin } from './pin-store.js'
 
 export const SELF_FIX = 'DSH_E_ORCHESTRATOR_SELF_FIX'
 export const SHELL_BUDGET = 'DSH_E_ORCHESTRATOR_SHELL_BUDGET'
@@ -117,4 +119,146 @@ export function orchestratorDecision(toolName, args = {}, session, cfg = ORCHEST
 export function appendEscapeAudit(audit, deps = {}) {
   const dir = deps.pipelineDir || join(homedir(), '.dsh', 'relay-pipelines')
   mkdirSync(dir, { recursive: true }); appendFileSync(join(dir, 'escape-audit.jsonl'), JSON.stringify(audit) + '\n')
+}
+
+export const DELEGATE_REQUIRED = 'DSH_E_DELEGATE_REQUIRED'
+const CODE_EXT = /\.(?:js|mjs|cjs|ts|tsx|jsx|py|ps1|sh)$/i
+const READ_ONLY_SHELL = /^(?:git\s+(?:status|log|rev-parse|diff(?:\s+--stat\b.*)?)\b|Get-Content\b[\s\S]*-Tail\b|Get-NetTCPConnection\b|Test-NetConnection\b|netstat\b)/i
+
+/** v2 wrapper over classifySession (kept for pre-v2 importers). */
+export function isRpSession(session) {
+  return classifySession(session, null, {}).archetype === 'SPECIALIZED'
+}
+
+/** Main orchestrator: depth 0, no parent, not RP. Delegated and RP stay unrestricted. */
+export function isMainOrchestratorSession(session) {
+  if (!session) return false
+  if (manifestOf(session)) return false
+  const header = session.header || {}
+  if (header.parentSession || session.parentSession || session.meta?.parentSession) return false
+  if ((header.delegationDepth ?? 0) > 0) return false
+  if (isRpSession(session)) return false
+  // A2: expired/removed late evidence must not turn a pinned worker back into an orchestrator.
+  return (ARCHETYPE_RANK_FOR_GUARD[readPin(session.header?.id)?.archetype] ?? 0) < 2
+}
+
+export function readLineBudget(args = {}) {
+  if (typeof args.limit === 'number' && args.limit >= 0) return args.limit
+  if (typeof args.max_lines === 'number' && args.max_lines >= 0) return args.max_lines
+  if (typeof args.start_line === 'number' && typeof args.end_line === 'number') return Math.max(0, args.end_line - args.start_line + 1)
+  return 200
+}
+
+export function isReadOnlyShell(command) {
+  return READ_ONLY_SHELL.test(String(command || '').trim())
+}
+
+function protectedWrite(args = {}) {
+  const target = String(args.file_path || args.path || '')
+  if (!target) return false
+  if (/\.md$/i.test(target)) return false
+  const norm = target.replace(/\\/g, '/').toLowerCase()
+  if (norm.includes('/.dsh/plugins/') || norm.includes('/.dsh/plugins')) return true
+  return CODE_EXT.test(target)
+}
+
+function budgetText(state) {
+  return `已用 read ${state.reads || 0}/2（${state.readLines || 0}/200 行），搜索 ${state.searches || 0}/2，只读 pwsh ${state.shells || 0}/1。`
+}
+
+function delegateDeny(toolName, args, state, why) {
+  state.denied = (state.denied || 0) + 1
+  const task = `主会话预算拒绝 ${toolName}: ${why}\n${budgetText(state)}\n参数: ${JSON.stringify(args || {}).slice(0, 500)}`
+  const skeleton = { mode: 'implement', startArgs: { task } }
+  const readOverflow = String(why || '').includes('read 超出')
+  const stop = state.denied >= 3
+    ? '停止尝试，直接派发。'
+    : (readOverflow
+      ? 'read 已超预算。立即要摘要：subagent({ run_in_background: false, prompt })；并行调查：subagent({ run_in_background: true, prompt })，不要轮询，等通知。写代码或重验证仍走 relay_dispatch。'
+      : '请改用 relay_dispatch(mode:\'implement\') 或 subagent。')
+  const message = `主会话不直接改源码/深读。${budgetText(state)} ${stop}`
+  const hint = { suggestedMode: 'implement', suggestedTask: task, relay_dispatch: skeleton }
+  if (readOverflow) {
+    hint.subagent = {
+      immediate: { run_in_background: false, prompt: '<阅读摘要任务>' },
+      parallel: { run_in_background: true, prompt: '<并行调查任务>' },
+      note: 'subagent 现已免费，成本为零。不要轮询后台任务，等通知。relay_dispatch 仍用于写代码或重验证。',
+    }
+  }
+  const error = { ok: false, code: DELEGATE_REQUIRED, message, hint }
+  return { kind: 'deny', decision: 'DENY_LOCAL', error, reason: message }
+}
+
+function seedBudget(session, state, callId) {
+  const turn = turnOf(eventsOf(session))
+  if (state.turn === turn && state.seeded) return
+  const replay = { reads: 0, readLines: 0, searches: 0, shells: 0 }
+  for (const ev of eventsOf(session)) {
+    if (ev?.type !== 'tool/call') continue
+    if (callId && (ev.data?.callId === callId || ev.callId === callId)) continue
+    const evTurn = ev.data?.turn ?? ev.turn
+    if (evTurn !== turn) continue
+    const name = String(ev.data?.name || '').toLowerCase()
+    let args = {}
+    try { args = JSON.parse(ev.data?.arguments || '{}') } catch {}
+    if (name === 'read') { replay.reads++; replay.readLines += readLineBudget(args) }
+    else if (name === 'grep' || name === 'glob') replay.searches++
+    else if (['pwsh', 'bash', 'shell'].includes(name) && isReadOnlyShell(args.command)) replay.shells++
+  }
+  state.turn = turn
+  state.reads = replay.reads
+  state.readLines = replay.readLines
+  state.searches = replay.searches
+  state.shells = replay.shells
+  state.denied = 0
+  state.seeded = true
+}
+
+/**
+ * Per-turn budgets applied synchronously before execution (R6).
+ * strict !== true|'shadow' → allow. Delegated / RP → allow (I-G1).
+ * shadow records the denial and still allows.
+ */
+export function strictTurnDecision(toolName, args = {}, session, state = {}, options = {}) {
+  const mode = options.strict
+  if (mode !== true && mode !== 'shadow') return { kind: 'allow', skipped: true }
+  if (!isMainOrchestratorSession(session)) return { kind: 'allow', role: 'unrestricted' }
+  try {
+    seedBudget(session, state, options.callId)
+    const name = String(toolName || '').toLowerCase()
+    if (['relay_dispatch', 'todo_write', 'ask_user_question', 'context_compact', 'context_recall', 'tool_unlock'].includes(name) || name.startsWith('subagent')) {
+      return { kind: 'allow', role: 'orchestrator' }
+    }
+    const deny = (why) => {
+      const decision = delegateDeny(name, args, state, why)
+      if (mode === 'shadow') return { kind: 'allow', role: 'orchestrator', shadow: true, notice: decision.reason, error: decision.error }
+      return decision
+    }
+    if (name.startsWith('dev_')) return deny('dev_* 变更只能由派发任务的 reloadPlugins 完成')
+    if (name === 'edit' || name === 'write') {
+      if (protectedWrite(args)) return deny(`路径 ${args.file_path || args.path || ''} 在源码/插件目录`)
+      return { kind: 'allow', role: 'orchestrator' }
+    }
+    if (name === 'read') {
+      const lines = readLineBudget(args)
+      if ((state.reads || 0) >= 2 || (state.readLines || 0) + lines > 200) return deny('read 超出每轮 2 次或 200 行')
+      state.reads = (state.reads || 0) + 1
+      state.readLines = (state.readLines || 0) + lines
+      return { kind: 'allow', role: 'orchestrator' }
+    }
+    if (name === 'grep' || name === 'glob') {
+      if ((state.searches || 0) >= 2) return deny('grep+glob 超出每轮 2 次')
+      state.searches = (state.searches || 0) + 1
+      return { kind: 'allow', role: 'orchestrator' }
+    }
+    if (['pwsh', 'bash', 'shell'].includes(name)) {
+      if (!isReadOnlyShell(args.command)) return deny('pwsh 不是只读状态检查')
+      if ((state.shells || 0) >= 1) return deny('只读 pwsh 超出每轮 1 次')
+      state.shells = (state.shells || 0) + 1
+      return { kind: 'allow', role: 'orchestrator' }
+    }
+    return { kind: 'allow', role: 'orchestrator' }
+  } catch (err) {
+    return { kind: 'allow', role: 'fail-open', notice: String(err?.message || err).slice(0, 120) }
+  }
 }

@@ -1,0 +1,376 @@
+{
+ "tools": [
+  {
+   "name": "edit",
+   "params": [
+    "file_path",
+    "justification",
+    "new_string",
+    "old_string",
+    "replace_all",
+    "sandbox_permissions"
+   ],
+   "description": "Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. "
+  },
+  {
+   "name": "write",
+   "params": [
+    "content",
+    "file_path",
+    "justification",
+    "sandbox_permissions"
+   ],
+   "description": "Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. "
+  },
+  {
+   "name": "read",
+   "params": [
+    "file_path",
+    "limit",
+    "offset"
+   ],
+   "description": "Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. "
+  },
+  {
+   "name": "pwsh",
+   "params": [
+    "command",
+    "description",
+    "justification",
+    "run_in_background",
+    "sandbox_permissions",
+    "timeoutMs",
+    "workdir"
+   ],
+   "description": "Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. "
+  },
+  {
+   "name": "subagent",
+   "params": [
+    "description",
+    "prompt",
+    "run_in_background"
+   ],
+   "description": "Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. Native long description for subagent. "
+  },
+  {
+   "name": "subagent_fork",
+   "params": [
+    "description",
+    "prompt",
+    "run_in_background"
+   ],
+   "description": "Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. Native long description for subagent_fork. "
+  },
+  {
+   "name": "list_agents",
+   "params": [
+    "scope"
+   ],
+   "description": "Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. Native long description for list_agents. "
+  },
+  {
+   "name": "send_message",
+   "params": [
+    "message",
+    "subagent_id"
+   ],
+   "description": "Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. Native long description for send_message. "
+  },
+  {
+   "name": "interrupt_agent",
+   "params": [
+    "agent_id"
+   ],
+   "description": "Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. Native long description for interrupt_agent. "
+  },
+  {
+   "name": "job_output",
+   "params": [
+    "job_id",
+    "timeout_ms",
+    "wait"
+   ],
+   "description": "Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. Native long description for job_output. "
+  },
+  {
+   "name": "glob",
+   "params": [
+    "path",
+    "pattern"
+   ],
+   "description": "Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. Native long description for glob. "
+  },
+  {
+   "name": "grep",
+   "params": [
+    "include",
+    "path",
+    "pattern"
+   ],
+   "description": "Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. Native long description for grep. "
+  },
+  {
+   "name": "todo_write",
+   "params": [
+    "todos"
+   ],
+   "description": "Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. Native long description for todo_write. "
+  },
+  {
+   "name": "skill_search",
+   "params": [
+    "query"
+   ],
+   "description": "Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. Native long description for skill_search. "
+  },
+  {
+   "name": "ask_user_question",
+   "params": [
+    "questions"
+   ],
+   "description": "Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. "
+  }
+ ],
+ "expected": [
+  {
+   "description": "Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. Native long description for edit. ",
+   "properties": {
+    "file_path": {
+     "type": "string",
+     "description": "Path to edit."
+    },
+    "justification": {
+     "type": "string",
+     "description": "与 sandbox_permissions 同时必填：一句简体中文，说明为何需要更宽权限。"
+    },
+    "new_string": {
+     "type": "string",
+     "description": "Literal replacement; empty string deletes."
+    },
+    "old_string": {
+     "type": "string",
+     "description": "Literal text to replace; must match exactly."
+    },
+    "replace_all": {
+     "type": "string",
+     "description": "Replace all matches. Default false: old_string must be unique."
+    },
+    "sandbox_permissions": {
+     "type": "string",
+     "description": "Wider mode for a one-shot retry of an operation the sandbox just denied."
+    }
+   }
+  },
+  {
+   "description": "Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. Native long description for write. ",
+   "properties": {
+    "content": {
+     "type": "string",
+     "description": "Full UTF-8 content."
+    },
+    "file_path": {
+     "type": "string",
+     "description": "Path to write."
+    },
+    "justification": {
+     "type": "string",
+     "description": "与 sandbox_permissions 同时必填：一句简体中文，说明为何需要更宽权限。"
+    },
+    "sandbox_permissions": {
+     "type": "string",
+     "description": "Wider mode for a one-shot retry of an operation the sandbox just denied."
+    }
+   }
+  },
+  {
+   "description": "Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. Native long description for read. ",
+   "properties": {
+    "file_path": {
+     "type": "string",
+     "description": "Path to read."
+    },
+    "limit": {
+     "type": "string",
+     "description": "Max lines. Default 2000."
+    },
+    "offset": {
+     "type": "string",
+     "description": "1-based first line. Default 1."
+    }
+   }
+  },
+  {
+   "description": "Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. Native long description for pwsh. ",
+   "properties": {
+    "command": {
+     "type": "string",
+     "description": "Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command Native long description for pwsh.command "
+    },
+    "description": {
+     "type": "string",
+     "description": "简体中文主动语态 5-10 字，说明命令作用（UI 展示）。"
+    },
+    "justification": {
+     "type": "string",
+     "description": "与 sandbox_permissions 同时必填：一句简体中文，说明为何需要更宽权限。"
+    },
+    "run_in_background": {
+     "type": "string",
+     "description": "Return a job id immediately; no timeout applies."
+    },
+    "sandbox_permissions": {
+     "type": "string",
+     "description": "Wider mode for a one-shot retry of a command the sandbox just denied."
+    },
+    "timeoutMs": {
+     "type": "string",
+     "description": "Timeout in ms; the command is killed on expiry."
+    },
+    "workdir": {
+     "type": "string",
+     "description": "Working directory; defaults to the session workspace."
+    }
+   }
+  },
+  {
+   "description": "Delegate a self-contained task to a subagent with its own context. It does NOT see this conversation: give a complete standalone prompt. Returns only its final result. Runs in the background by default and returns a durable subagent id; you are notified when it settles; `send_message` continues the same child. Set `run_in_background: false` only when your next action depends on the result.",
+   "properties": {
+    "description": {
+     "type": "string",
+     "description": "Short (3-5 word) display label."
+    },
+    "prompt": {
+     "type": "string",
+     "description": "Complete, self-contained task; include everything the subagent needs."
+    },
+    "run_in_background": {
+     "type": "string",
+     "description": "Default true."
+    }
+   }
+  },
+  {
+   "description": "Like `subagent`, but the child inherits all completed turns of this conversation (not the current in-flight turn). Use when the subtask builds on existing context. Same background/notification/`send_message` behaviour as `subagent`.",
+   "properties": {
+    "description": {
+     "type": "string",
+     "description": "Short (3-5 word) display label."
+    },
+    "prompt": {
+     "type": "string",
+     "description": "The task; state only what is new."
+    },
+    "run_in_background": {
+     "type": "string",
+     "description": "Default true."
+    }
+   }
+  },
+  {
+   "description": "List your background subagents (id, label, status) to recall what you started — not to poll; you are notified on completion. Status: running = working now; idle = between turns; ready = stored only, resumable. The snapshot does not guarantee delivery; `send_message` does the real check. `send_message` works only for direct children (depth 1); deeper agents can only be targeted by `interrupt_agent`.",
+   "properties": {
+    "scope": {
+     "type": "string",
+     "description": "`children` (default) or `descendants` (whole tree)."
+    }
+   }
+  },
+  {
+   "description": "Send a message to a background subagent; it becomes its next turn. If the subagent is busy the message waits, so it cannot redirect work already underway. Returns only delivery confirmation, never the subagent's answer. A failure means it was NOT delivered.",
+   "properties": {
+    "message": {
+     "type": "string",
+     "description": "Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message Native long description for send_message.message "
+    },
+    "subagent_id": {
+     "type": "string",
+     "description": "Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id Native long description for send_message.subagent_id "
+    }
+   }
+  },
+  {
+   "description": "Cancel the current turn of a background agent (direct child or deeper). Only that turn stops: queued messages stay parked, its own children keep running, and it stays available. Returns as soon as the request is accepted; interrupting a finished agent is a no-op.",
+   "properties": {
+    "agent_id": {
+     "type": "string",
+     "description": "Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id Native long description for interrupt_agent.agent_id "
+    }
+   }
+  },
+  {
+   "description": "Read a background job. Stream jobs return only output since the last read; final-output jobs return their result once settled. Ends with `[status: ...]`. Non-blocking unless `wait: true`; a timed-out wait returns `[status: running]` and leaves the job alive.",
+   "properties": {
+    "job_id": {
+     "type": "string",
+     "description": "Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id Native long description for job_output.job_id "
+    },
+    "timeout_ms": {
+     "type": "string",
+     "description": "Max wait in ms (only with wait: true)."
+    },
+    "wait": {
+     "type": "string",
+     "description": "Block until terminal status or timeout."
+    }
+   }
+  },
+  {
+   "description": "Find files by glob. Returns file paths only — never directories — including hidden and ignored files, newest first, max 100 (overflow is saved to a file). A pattern without \"/\" matches basenames at any depth; include a separator to anchor depth.",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Directory to search; defaults to the workspace."
+    },
+    "pattern": {
+     "type": "string",
+     "description": "Glob, e.g. \"**/*.ts\", \"src/**/*.test.js\"."
+    }
+   }
+  },
+  {
+   "description": "Search file contents with a ripgrep regex. Returns matching lines with line numbers grouped by file; first 250 matches inline, the rest saved to a file.",
+   "properties": {
+    "include": {
+     "type": "string",
+     "description": "One glob filter (e.g. \"*.{js,jsx}\"); not a list, no negation."
+    },
+    "path": {
+     "type": "string",
+     "description": "File or directory; defaults to the workspace."
+    },
+    "pattern": {
+     "type": "string",
+     "description": "Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern Native long description for grep.pattern "
+    }
+   }
+  },
+  {
+   "description": "Record the task list for multi-step work. Send the ENTIRE list every call — it replaces the previous one. Statuses: pending | in_progress | completed. Keep at least one `in_progress` while work remains; mark `completed` immediately when done. Skip for trivial single-step tasks.",
+   "properties": {
+    "todos": {
+     "type": "string",
+     "description": "The complete list."
+    }
+   }
+  },
+  {
+   "description": "Search available skills by keyword (Chinese supported; empty or * lists all). No skill catalog is in the prompt: if a task may match a skill, search first, then `skill_load`. Never guess skill names.",
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Keywords."
+    }
+   }
+  },
+  {
+   "description": "Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. Native long description for ask_user_question. ",
+   "properties": {
+    "questions": {
+     "type": "string",
+     "description": "Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions Native long description for ask_user_question.questions "
+    }
+   }
+  }
+ ]
+}

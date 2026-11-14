@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { sessionRole, classifyOrchestratorOp, orchestratorDecision, SELF_FIX, SHELL_BUDGET, ORCHESTRATOR_DEFAULTS, filterTools, DEFAULT_CONFIG } from '../lib/index.js'
 const NOW = Date.now()
-const cfg = { ...ORCHESTRATOR_DEFAULTS, mode: 'enforce' }
+const cfg = { ...ORCHESTRATOR_DEFAULTS, mode: 'enforce', strictOrchestratorGuard: true }
 const sid = 'parent'
 const session = (events = [], extra = {}) => ({ header: { id: sid, cwd: 'C:\\work' }, events, ...extra })
 const dispatch = { type: 'tool/call', data: { name: 'relay_dispatch', completed: true }, turn: 1 }

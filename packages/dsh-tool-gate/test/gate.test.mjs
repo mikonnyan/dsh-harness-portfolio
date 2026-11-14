@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { filterContexts, filterTools, gateDecision, groupOf, DEFAULT_CONFIG as cfg } from '../lib/index.js'
+import { filterContexts, filterTools, gateDecision, groupOf, apply, maskWindowsPaths, DEFAULT_CONFIG as cfg } from '../lib/index.js'
 
 const names = ['bash', 'dev_reload_package', 'dev_mode_set', 'mcp__harness_relay__get_run', 'relay_dispatch', 'mcp_connector_status', 'mcp__chrome-devtools__click', 'tool_unlock']
 const tools = names.map((name) => ({ name }))
@@ -58,13 +58,15 @@ test('plugin-internal calls bypass gate', () => {
   assert.equal(isInternalCall({ callId: 'call_abc', parent: {} }), true)
 })
 
-test('replay: hidden-group call unlocks; off then call re-unlocks; RP empty stays empty', () => {
+test('bypass direct call does not unlock dev; tool_unlock still does; RP empty stays empty', () => {
   const c = { type: 'tool/call', data: { name: 'dev_mode_set', arguments: '{}' } }
   const s = sess([c])
-  assert.ok(vis(filterTools(tools, s, cfg, {})).includes('dev_mode_set'))
+  assert.ok(!vis(filterTools(tools, s, cfg, {})).includes('dev_mode_set'))
   s.events.push(call({ groups: ['dev'], action: 'off' }))
   assert.ok(!vis(filterTools(tools, s, cfg, {})).includes('dev_mode_set'))
   s.events.push(c)
+  assert.ok(!vis(filterTools(tools, s, cfg, {})).includes('dev_mode_set'))
+  s.events.push(call({ groups: ['dev'] }))
   assert.ok(vis(filterTools(tools, s, cfg, {})).includes('dev_mode_set'))
   assert.deepEqual(filterTools([], s, cfg, {}), [])
 })
@@ -111,6 +113,35 @@ test('extras implicit direct call stays allowed without changing warm tools[]', 
   assert.equal(openSources(s, cfg, {}).extras?.src, '直调放行(缓存不变)')
   s.events.push(call({ groups: ['extras'] }))
   assert.ok(vis(filterTools(catalog, s, cfg, {})).includes('workflow'))
+})
+test('strict orchestrator guard defaults off; delegated sessions stay unrestricted', async () => {
+  assert.equal(cfg.strictOrchestratorGuard, false)
+  const delegated = sess([{ type: 'tool/result', data: { name: 'relay_dispatch', turn: 1 } }], { delegationDepth: 1 })
+  let hook
+  const ctx = {
+    effect: (fn) => fn(), tools: { register: () => {} }, commands: { register: () => {} },
+    on: (name, fn) => { if (name === 'tools/pre-execute') hook = fn },
+    logger: () => ({ info: () => {} }),
+  }
+  apply(ctx)
+  for (const exec of [
+    { name: 'pwsh', arguments: { command: 'node -e "console.log(1)"' } },
+    { name: 'edit', arguments: { file_path: 'C:\\work\\a.js' } },
+    { name: 'write', arguments: { file_path: 'C:\\work\\a.js' } },
+  ]) {
+    for (let i = 0; i < 5; i++) {
+      const result = await hook({ ...exec, agent: { session: delegated } }, async () => ({ kind: 'allow' }))
+      assert.equal(result.kind, 'allow')
+    }
+  }
+  const main = sess([])
+  const denied = await hook({ name: 'edit', arguments: { file_path: 'C:\\work\\a.js' }, agent: { session: main } }, async () => ({ kind: 'allow' }))
+  if (denied.kind === 'deny') assert.equal(denied.error.code, 'DSH_E_DELEGATE_REQUIRED')
+  for (const command of ['node -e "fetch(\'https://example.com/a\')"', 'pwsh -Command "ws://localhost/socket"']) {
+    assert.equal(maskWindowsPaths(command).includes('s:/'), false)
+    assert.equal(maskWindowsPaths(command).includes('p:/'), false)
+  }
+  assert.equal(maskWindowsPaths('Get-Item C:\\work\\a.js').includes('C:'), false)
 })
 test('contexts: super-injector text gated by dev group', () => {
   const ctxs = [{ text: '沙箱策略' }, { text: '本环境装有 dsh-super-injector（dev_* 工具）：x' }, '审批策略']

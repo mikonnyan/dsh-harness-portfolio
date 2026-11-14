@@ -16,6 +16,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 export const inject = ['tools']
 export const PREPARE_SYM = Symbol.for('relay-dispatch.prepare')
 export const API_HANDLER_SYM = Symbol.for('relay-dispatch.apiHandler')
+export const SUBAGENT_CREATE_SYM = Symbol.for('relay-dispatch.subagentCreate')
 export const PARENT_LOG_PATH = join(homedir(), '.dsh', 'relay-dispatch-parent.log')
 
 const DEFAULTS = {
@@ -37,10 +38,11 @@ const DEFAULTS = {
   maxConcurrentTasks: 4, // v2 聚合派发的同时运行子任务上限
   resumeDelayMs: 2500, // 启动后延时接管最近 4 小时内分离的 v2 流水线
   resumeWindowMs: 4 * 60 * 60 * 1000,
+  parentWakeWindowMs: 120000, // 自重载后补唤醒已完成/失败流水线的时间窗
   manifestDir: undefined, // v2 清单目录；缺省 ~/.dsh/relay-pipelines，测试可覆盖
   llmTitle: false, // v2 默认只做确定性标题，不额外调用 LLM
-  defaultProvider: 'copilot',
-  defaultModel: 'claude-sonnet-5.5',
+  defaultProvider: 'cursor',
+  defaultModel: 'grok-4.7-fast',
   defaultAgentPreset: undefined, // 默认不设，沿用官方 preset；重启测试 standard-lean 后可配置为 'standard-lean'
   defaultSessionMode: 'fresh',
 }
@@ -201,13 +203,10 @@ export function summarize(snap, maxChars) {
   return lines.join('\n')
 }
 
-/** 各 Provider 的默认主力模型映射（当只指定 provider 未指定 model 时优先匹配，防止拼出 kimi/claude-sonnet-5.5 等跨厂假模型）。 */
+/** 各 Provider 的默认主力模型映射（当只指定 provider 未指定 model 时优先匹配，避免把别家模型拼到错误 provider 上）。 */
 export const PROVIDER_DEFAULT_MODELS = {
   kimi: 'kimi-k3.1-pro',
   cursor: 'grok-4.7-fast',
-  copilot: 'claude-fable-5.2',
-  'google-vertex': 'gemini-4-argon',
-  google: 'gemini-3.8-flash',
 }
 
 /** 判断 targetPath 是否位于 workspace 目录内（或就是 workspace 本身）。 */
@@ -226,9 +225,61 @@ export function isPathInsideWorkspace(workspace, targetPath) {
   return tpKey.startsWith(wsPrefix)
 }
 
+/**
+ * Single exit for start_run/start_review args.
+ * sessionId means resume; it must never travel with sessionMode.
+ */
+export function normalizeStartArgs(input, config = DEFAULTS) {
+  const a = { ...(input || {}) }
+  if (a.sessionId != null && String(a.sessionId).length > 0) delete a.sessionMode
+  else if (a.sessionMode == null && config.defaultSessionMode) a.sessionMode = config.defaultSessionMode
+  if (a.sessionId != null && String(a.sessionId).length > 0 && a.sessionMode != null) {
+    throw new Error('sessionId and sessionMode cannot be supplied together')
+  }
+  return a
+}
+
+function listedWriteScope(value) {
+  if (typeof value === 'string' && value.trim()) return [value.trim()]
+  if (!Array.isArray(value)) return []
+  return value.filter((p) => typeof p === 'string' && p.trim())
+}
+
+/** 只读任务正文是否明确要求改代码。单纯提到「审查修复」不算。 */
+export function taskNeedsCodeFix(task) {
+  const intent = String(task || '')
+    .replace(/(?:不要|严禁|禁止|不得|不许|勿)(?:写入|修改|同步到|复制到|修复|改动|改代码)/g, '')
+    .replace(/(?:不|未)(?:写入|修改|同步到|复制到|修复)/g, '')
+  return /(?:(?:请|顺手|需要|去|并)修复|修复(?:代码|失败|这个|问题|报错|错误)|修改代码|改代码|写入|同步到|复制到)/.test(intent)
+}
+
+/**
+ * start_run 在 permissionPreset=read-only 时拒绝非空 writeScope。
+ * review / 纯核对：删掉 writeScope。verify 等只读预设若同时声明了 writeScope 且正文要求改代码，则升到 workspace-write。
+ */
+export function reconcileReadOnlyWriteScope(args, { review = false } = {}) {
+  if (!args || typeof args !== 'object') return args
+  const writes = listedWriteScope(args.writeScope)
+  if (review) {
+    delete args.writeScope
+    return args
+  }
+  if (args.permissionPreset !== 'read-only') return args
+  if (!writes.length || !taskNeedsCodeFix(args.task)) {
+    delete args.writeScope
+    return args
+  }
+  args.permissionPreset = 'workspace-write'
+  args.writeScope = writes
+  if (args.workspace && writes.some((p) => !isPathInsideWorkspace(args.workspace, p))) args.permissionPreset = 'danger-full-access'
+  return args
+}
+
 /** 补全 startArgs 默认值（纯函数，便于测试）。显式传入的字段永不覆盖。 */
 export function fillStartArgs(input, config = DEFAULTS, review = false) {
   const a = { ...(input || {}) }
+  if (a.sessionId != null) delete a.sessionMode
+  if (typeof a.writeScope === 'string') a.writeScope = [a.writeScope]
   const ws = a.workspace
   if (a.provider == null && config.defaultProvider) a.provider = config.defaultProvider
   if (a.model == null) {
@@ -236,12 +287,13 @@ export function fillStartArgs(input, config = DEFAULTS, review = false) {
     const defaultProvKey = typeof config.defaultProvider === 'string' ? config.defaultProvider.trim().toLowerCase() : ''
     if (provKey && provKey !== defaultProvKey && PROVIDER_DEFAULT_MODELS[provKey]) {
       a.model = PROVIDER_DEFAULT_MODELS[provKey]
-    } else if (config.defaultModel) {
+    } else if ((!provKey || provKey === defaultProvKey) && config.defaultModel) {
       a.model = config.defaultModel
     } else if (provKey && PROVIDER_DEFAULT_MODELS[provKey]) {
       a.model = PROVIDER_DEFAULT_MODELS[provKey]
     }
   }
+  if (a.model === 'grok-4.7-fast' && a.reasoningEffort == null) a.reasoningEffort = 'xhigh'
   if (a.authorizationBasis == null) a.authorizationBasis = 'explicit-user-request'
   if (a.sessionMode == null && a.sessionId == null && config.defaultSessionMode) a.sessionMode = config.defaultSessionMode
   if (!review && a.agentPreset == null && config.defaultAgentPreset) a.agentPreset = config.defaultAgentPreset
@@ -261,8 +313,9 @@ export function fillStartArgs(input, config = DEFAULTS, review = false) {
     else a.contextReadScope = a.contextReadScope.filter((p) => isPathInsideWorkspace(ws, p))
     if (!a.contextReadScope.length) a.contextReadScope = [ws]
   }
+  reconcileReadOnlyWriteScope(a, { review })
   if (!review && a.permissionPreset === 'danger-full-access' && a.confirmedDangerousPermission == null) a.confirmedDangerousPermission = true
-  return a
+  return normalizeStartArgs(a, config)
 }
 
 /** Only the host-facing relay payload is narrowed; the immutable capability manifest is compiled first. */
@@ -270,7 +323,7 @@ export function sanitizeStartRunArgs(input, review = false) {
   const a = { ...(input || {}) }
   const ws = a.workspace
   if (!ws) return a
-  if (!review && [a.writeScope, a.contextReadScope].some((scope) => Array.isArray(scope) && scope.some((p) => !isPathInsideWorkspace(ws, p)))) {
+  if (!review && a.permissionPreset !== 'read-only' && [a.writeScope, a.contextReadScope].some((scope) => Array.isArray(scope) && scope.some((p) => !isPathInsideWorkspace(ws, p)))) {
     a.permissionPreset = 'danger-full-access'
     a.confirmedDangerousPermission = true
   }
@@ -282,6 +335,7 @@ export function sanitizeStartRunArgs(input, review = false) {
     a.contextReadScope = a.contextReadScope.filter((p) => isPathInsideWorkspace(ws, p))
     if (!a.contextReadScope.length) a.contextReadScope = [ws]
   }
+  if (review || a.permissionPreset === 'read-only') delete a.writeScope
   return a
 }
 
@@ -368,11 +422,11 @@ export function loadModes(path = MODES_PATH, readFn = readFileSync) {
 const PREFIX = '通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。\n'
 const DELIV = '交付格式（尽量短；summary 先给结论，证据路径只列关键 3~5 条）：\nstatus: done | blocked\nchanged_files: [...]\nverification: …\nrisks: …\nrollback: …\nsummary: ≤10 行\n'
 export const BUILTIN_MODES = {
-  investigate: { permission: 'read-only', models: ['cursor/grok-4.7-fast', 'google/gemini-3.8-flash'], taskPrefix: PREFIX, deliverable: '交付格式：summary 先给结论；证据路径只列关键 3~5 条。\n' },
-  implement: { permission: 'danger-full-access', models: ['copilot/claude-sonnet-5.5', 'cursor/claude-opus-5-5'], taskPrefix: PREFIX, deliverable: DELIV },
-  verify: { permission: 'read-only', models: ['copilot/claude-sonnet-5.5', 'cursor/grok-4.7-fast'], taskPrefix: PREFIX, deliverable: '交付格式：summary 先给结论；通过/不通过清单，证据路径只列关键 3~5 条。\n' },
-  review: { permission: 'read-only', models: ['cursor/claude-opus-5-5', 'copilot/claude-opus-5.5'], taskPrefix: PREFIX, deliverable: '交付格式：summary 先给结论；问题按严重度列出，证据路径只列关键 3~5 条。\n' },
-  heavy: { permission: 'danger-full-access', checkpoint: true, models: ['cursor/claude-opus-5-5', 'copilot/claude-opus-5.5'], taskPrefix: PREFIX, deliverable: DELIV },
+  investigate: { permission: 'read-only', models: ['cursor/grok-4.7-fast', 'kimi/kimi-k3.1-pro', 'kimi/glm-5.3', 'strata/qwen3.8-flash-next-iq3_s', 'kimi/deepseek-v4.1-flash'], taskPrefix: PREFIX, deliverable: '交付格式：summary 先给结论；证据路径只列关键 3~5 条。\n' },
+  implement: { permission: 'danger-full-access', models: ['kimi/kimi-k3.1-pro', 'cursor/grok-4.7-fast', 'kimi/glm-5.3', 'strata/qwen3.8-flash-next-iq3_s'], taskPrefix: PREFIX, deliverable: DELIV },
+  verify: { permission: 'read-only', models: ['kimi/kimi-k3.1-pro', 'cursor/grok-4.7-fast', 'kimi/glm-5.3', 'strata/qwen3.8-flash-next-iq3_s', 'kimi/deepseek-v4.1-flash'], taskPrefix: PREFIX, deliverable: '交付格式：summary 先给结论；通过/不通过清单，证据路径只列关键 3~5 条。\n' },
+  review: { permission: 'read-only', models: ['kimi/kimi-k3.1-pro', 'cursor/grok-4.7-fast', 'kimi/glm-5.3', 'strata/qwen3.8-flash-next-iq3_s'], taskPrefix: PREFIX, deliverable: '交付格式：summary 先给结论；问题按严重度列出，证据路径只列关键 3~5 条。\n' },
+  heavy: { permission: 'danger-full-access', checkpoint: true, models: ['kimi/kimi-k3.1-pro', 'cursor/grok-4.7-fast', 'kimi/glm-5.3', 'strata/qwen3.8-flash-next-iq3_s'], taskPrefix: PREFIX, deliverable: DELIV },
   rp: { permission: 'read-only', workspace: join(homedir(), 'xiaoshuo'), models: ['cursor/grok-4.7', 'strata/qwen3.8-flash-next-iq3_s'], taskPrefix: '', deliverable: '' },
 }
 
@@ -533,6 +587,328 @@ export function evaluateRelayPrepare(id, opts, s, ctxInfo = {}) {
 
 export function isRelayPrepare(id, opts, s, ctxInfo = {}) {
   return evaluateRelayPrepare(id, opts, s, ctxInfo).ok
+}
+
+const SUBAGENT_UNHEALTHY_MS = 60_000
+const SENSITIVE_SUBAGENT_RE = /dsh-rp-guardian|mac-v4-sync|(?:^|[\\/\s])xiaoshuo(?:[\\/\s]|$)|苏晚晴/i
+const subagentUnhealthyUntil = new Map()
+const subagentCreateStack = []
+/** 路由审计：origin=subagent-free。会话头 origin 仍须是 DSH 接受的 "subagent"。 */
+export const subagentFreeAudit = new Map()
+
+/** 免费子代理池：默认 cursor/grok-4.7-fast + xhigh；kimi 只在 grok 不健康时兜底。 */
+export function subagentFreePool() {
+  return [
+    { provider: 'cursor', model: PROVIDER_DEFAULT_MODELS.cursor, reasoningEffort: 'xhigh' },
+    { provider: 'kimi', model: PROVIDER_DEFAULT_MODELS.kimi },
+  ]
+}
+
+export function resetSubagentFreeRouting() {
+  subagentUnhealthyUntil.clear()
+  subagentFreeAudit.clear()
+  subagentCreateStack.length = 0
+}
+
+function subagentKey(candidate) {
+  return `${candidate?.provider || ''}/${candidate?.model || ''}`
+}
+
+export function markSubagentCandidateUnhealthy(candidate, now = Date.now()) {
+  if (!candidate?.provider || !candidate?.model) return
+  subagentUnhealthyUntil.set(subagentKey(candidate), now + SUBAGENT_UNHEALTHY_MS)
+}
+
+export function subagentCandidateHealthy(candidate, now = Date.now(), ctxInfo = {}) {
+  if (!candidate?.provider || !candidate?.model) return false
+  const until = subagentUnhealthyUntil.get(subagentKey(candidate)) || 0
+  if (until > now) return false
+  if (candidate.provider === 'kimi' && ctxInfo.kimiBridgeUp === false) return false
+  return true
+}
+
+function mergeRouteCtx(route, ctxInfo) {
+  const ctx = { ...(route?.ctxInfo || {}) }
+  if (!ctxInfo || typeof ctxInfo !== 'object') return ctx
+  if (ctxInfo.kimiBridgeUp === true || ctxInfo.kimiBridgeUp === false) ctx.kimiBridgeUp = ctxInfo.kimiBridgeUp
+  if (ctxInfo.rpGuardianActive === true || ctxInfo.rpGuardian === true || ctxInfo.sensitive === true) ctx.rpGuardianActive = true
+  return ctx
+}
+
+function rememberSubagentRoute(id, route, ctxInfo) {
+  const key = String(id)
+  const prev = subagentFreeAudit.get(key)
+  if (prev?.failedKey && !route.failedKey) route.failedKey = prev.failedKey
+  route.ctxInfo = mergeRouteCtx(prev, ctxInfo)
+  if (subagentFreeAudit.size > 400) subagentFreeAudit.delete(subagentFreeAudit.keys().next().value)
+  subagentFreeAudit.set(key, route)
+}
+
+export function readSubagentFreeAudit(id) {
+  return subagentFreeAudit.get(String(id))
+}
+
+function metaOf(opts) {
+  return opts && typeof opts.meta === 'object' && opts.meta ? opts.meta : {}
+}
+
+function depthOf(opts, ctxInfo = {}) {
+  const meta = metaOf(opts)
+  const header = (opts && opts.header) || ctxInfo.header || {}
+  const raw = meta.delegationDepth ?? header.delegationDepth ?? opts?.delegationDepth ?? ctxInfo.delegationDepth
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : 0
+}
+
+function isForkPrepare(opts) {
+  const meta = metaOf(opts)
+  const header = opts?.header || {}
+  return Boolean(opts && opts.seed !== undefined) || meta.seedLength !== undefined || header.seedLength !== undefined || meta.origin === 'fork' || header.origin === 'fork' || opts?.origin === 'fork'
+}
+
+function parentOfPrepare(opts, ctxInfo = {}) {
+  const meta = metaOf(opts)
+  const header = opts?.header || ctxInfo.header || {}
+  return meta.parentSession || header.parentSession || ctxInfo.parentSession || ctxInfo.parentId || undefined
+}
+
+function sensitiveBlob(opts, ctxInfo = {}) {
+  const meta = metaOf(opts)
+  const header = opts?.header || ctxInfo.header || {}
+  return [
+    meta.cwd, meta.workspace, meta.prompt, meta.title, meta.project,
+    opts?.prompt, opts?.task, opts?.cwd, opts?.workspace,
+    header.cwd, header.title, header.workspace,
+    ctxInfo.cwd, ctxInfo.workspace, ctxInfo.prompt, ctxInfo.title,
+    ...(Array.isArray(ctxInfo.plugins) ? ctxInfo.plugins : []),
+  ].filter(Boolean).join(' ')
+}
+
+export function isSensitiveSubagentContext(opts, ctxInfo = {}) {
+  if (ctxInfo.rpGuardianActive === true || ctxInfo.rpGuardian === true || ctxInfo.sensitive === true) return true
+  const meta = metaOf(opts)
+  const header = opts?.header || ctxInfo.header || {}
+  if (meta.rp === true || header.rp === true || meta.kind === 'rp' || header.kind === 'rp') return true
+  return SENSITIVE_SUBAGENT_RE.test(sensitiveBlob(opts, ctxInfo))
+}
+
+function grokRoute() {
+  return { provider: 'cursor', model: PROVIDER_DEFAULT_MODELS.cursor, reasoningEffort: 'xhigh' }
+}
+
+const SUBAGENT_AUDIT_ORIGINS = new Set(['subagent', 'subagent-free'])
+
+function relayClaim(id, opts, ctxInfo = {}) {
+  const meta0 = metaOf(opts)
+  const origin = meta0.origin || opts?.origin || ''
+  if (origin === 'relay-dispatch') return 'relay-dispatch'
+  const slot = ctxInfo.slot
+  if (!slot) return null
+  const direct = evaluateRelayPrepare(id, opts, slot, ctxInfo)
+  if (direct.ok) return 'relay-slot'
+  // origin=subagent / subagent-free is free-routing bookkeeping, not a relay source.
+  // A live slot still wins: strip that bookkeeping and match the explicit model.
+  const soft = new Set(['has_parentSession', 'has_origin', 'has_seed_or_delegation'])
+  if (!soft.has(direct.reason)) return null
+  if (origin && !SUBAGENT_AUDIT_ORIGINS.has(origin)) return null
+  if (!origin && direct.reason !== 'has_seed_or_delegation') return null
+  if (meta0.parentSession && slot.parent && String(meta0.parentSession) !== String(slot.parent)) return null
+  const meta = { ...meta0 }
+  delete meta.delegationDepth
+  delete meta.seedLength
+  if (SUBAGENT_AUDIT_ORIGINS.has(meta.origin)) delete meta.origin
+  delete meta.freeOrigin
+  if (direct.reason === 'has_parentSession' || SUBAGENT_AUDIT_ORIGINS.has(origin)) delete meta.parentSession
+  return evaluateRelayPrepare(id, { ...opts, meta }, slot, ctxInfo).ok ? 'relay-slot' : null
+}
+
+function healthyFreeCandidates(now, ctxInfo) {
+  return subagentFreePool().filter((candidate) => subagentCandidateHealthy(candidate, now, ctxInfo))
+}
+
+function isGrokCandidate(candidate) {
+  return candidate?.provider === 'cursor' && candidate?.model === PROVIDER_DEFAULT_MODELS.cursor
+}
+
+/** 健康池里优先 grok；grok 不在池中时用剩余的第一个（kimi）。 */
+function primaryFreeCandidate(healthy) {
+  const picked = healthy.find((candidate) => isGrokCandidate(candidate)) || healthy[0]
+  if (!picked) return null
+  if (isGrokCandidate(picked)) return { ...picked, reasoningEffort: 'xhigh' }
+  return { provider: picked.provider, model: picked.model }
+}
+
+/**
+ * sessions.prepare 上的子代理分流。敏感会话最先短路。
+ * 普通 subagent 默认 cursor/grok-4.7-fast + xhigh；仅当 grok 不健康时改走 kimi。
+ * rewrite 才改 provider/model；fork 与 relay 显式派单保持原样。
+ */
+export function evaluateSubagentPrepare(id, opts, ctxInfo = {}) {
+  const now = ctxInfo.now ?? Date.now()
+  const sensitive = isSensitiveSubagentContext(opts, ctxInfo)
+  const base = {
+    id,
+    sensitive,
+    fork: isForkPrepare(opts),
+    depth: depthOf(opts, ctxInfo),
+    parentSession: parentOfPrepare(opts, ctxInfo),
+    origin: metaOf(opts).origin || null,
+  }
+  if (sensitive) {
+    const verdict = { ...base, action: 'rewrite', reason: 'sensitive', candidate: grokRoute(), originAudit: 'subagent-free' }
+    rememberSubagentRoute(id, { ...verdict, retries: 0 }, ctxInfo)
+    return verdict
+  }
+  if (base.fork) return { ...base, action: 'keep', reason: 'fork' }
+  const claim = relayClaim(id, opts, ctxInfo)
+  if (claim) return { ...base, action: 'keep', reason: claim }
+  if (base.depth < 1) return { ...base, action: 'keep', reason: 'not-subagent' }
+  const pinned = ctxInfo.pinnedCandidate
+  const pinAllowed = pinned && subagentCandidateHealthy(pinned, now, ctxInfo)
+    && subagentFreePool().some((item) => item.provider === pinned.provider && item.model === pinned.model)
+    && !/claude-fable-5-2/.test(String(pinned.model || ''))
+  if (pinAllowed) {
+    const candidate = pinned.model === PROVIDER_DEFAULT_MODELS.cursor ? { ...pinned, reasoningEffort: 'xhigh' } : { provider: pinned.provider, model: pinned.model }
+    const verdict = { ...base, action: 'rewrite', reason: 'failover', candidate, originAudit: 'subagent-free' }
+    rememberSubagentRoute(id, { ...verdict, retries: 1 }, ctxInfo)
+    return verdict
+  }
+  const healthy = healthyFreeCandidates(now, ctxInfo)
+  if (!healthy.length) {
+    const verdict = { ...base, action: 'fail-open', reason: 'all-unhealthy', originAudit: null }
+    rememberSubagentRoute(id, { ...verdict, retries: 0 }, ctxInfo)
+    return verdict
+  }
+  const candidate = primaryFreeCandidate(healthy)
+  const verdict = { ...base, action: 'rewrite', reason: isGrokCandidate(candidate) ? 'primary' : 'fallback', candidate, originAudit: 'subagent-free' }
+  rememberSubagentRoute(id, { ...verdict, retries: 0 }, ctxInfo)
+  return verdict
+}
+
+function writeCandidate(target, candidate) {
+  if (!target || typeof target !== 'object' || !candidate) return
+  target.provider = candidate.provider
+  target.model = candidate.model
+  if (candidate.model === PROVIDER_DEFAULT_MODELS.cursor) target.reasoningEffort = 'xhigh'
+  else if (target.reasoningEffort === 'xhigh') delete target.reasoningEffort
+}
+
+/** 把免费路由写进 prepare opts 与 agentOptions。成功改写时 meta.origin 记 subagent-free。 */
+export function applySubagentRoute(opts, verdict, agentOptions) {
+  if (!opts || !verdict || verdict.action !== 'rewrite' || !verdict.candidate) return opts
+  let candidate = { ...verdict.candidate }
+  if (verdict.sensitive || candidate.provider === 'kimi' && verdict.sensitive || /claude-fable-5-2/.test(String(candidate.model || ''))) {
+    if (verdict.sensitive || /claude-fable-5-2/.test(String(candidate.model || ''))) candidate = grokRoute()
+  }
+  if (candidate.model === PROVIDER_DEFAULT_MODELS.cursor) candidate.reasoningEffort = 'xhigh'
+  writeCandidate(opts, candidate)
+  writeCandidate(opts.agentOptions, candidate)
+  writeCandidate(agentOptions, candidate)
+  const meta = metaOf(opts)
+  if (!opts.meta) opts.meta = meta
+  if (verdict.parentSession) opts.meta.parentSession = verdict.parentSession
+  opts.meta.origin = 'subagent-free'
+  opts.meta.freeOrigin = 'subagent-free'
+  return opts
+}
+
+/** A refused retry must not keep a same-instant fuse of the failover model; that empties the pool for the original 60s window. */
+function releaseSameInstantFailover(route, now) {
+  const key = subagentKey(route.candidate)
+  if (!key || !route.failedKey || key === route.failedKey) return
+  if ((subagentUnhealthyUntil.get(key) || 0) === now + SUBAGENT_UNHEALTHY_MS) subagentUnhealthyUntil.delete(key)
+}
+
+/**
+ * 启动期模型错误：同步熔断 60s，并给出下一健康候选。参数/权限类错误不熔断、不重试。
+ * 非敏感任务 grok 失败后只重试一次 kimi。敏感会话的重试仍是 cursor/grok-4.7-fast + xhigh。
+ * ctxInfo 只覆盖已记录的健康上下文（如 kimiBridgeUp），不主动探测网络。
+ */
+export function noteSubagentStartFailure(sessionId, err, now = Date.now(), ctxInfo) {
+  const msg = String(err?.message || err || '')
+  if (!isModelError(msg)) return { retry: false, fused: false, reason: 'not-model-error' }
+  const route = subagentFreeAudit.get(String(sessionId))
+  if (!route || route.action !== 'rewrite' || !route.candidate) return { retry: false, fused: false, reason: 'no-route' }
+  const ctx = mergeRouteCtx(route, ctxInfo)
+  route.ctxInfo = ctx
+  if ((route.retries || 0) >= 1) {
+    releaseSameInstantFailover(route, now)
+    return { retry: false, fused: true, reason: 'retry-spent' }
+  }
+  const failedKey = subagentKey(route.candidate)
+  markSubagentCandidateUnhealthy(route.candidate, now)
+  route.failedKey = failedKey
+  if (route.sensitive || ctx.rpGuardianActive) {
+    const candidate = grokRoute()
+    route.retries = 1
+    route.candidate = candidate
+    return { retry: true, fused: true, candidate, reason: 'failover' }
+  }
+  const healthy = healthyFreeCandidates(now, ctx).filter((candidate) => subagentKey(candidate) !== failedKey)
+  const candidate = primaryFreeCandidate(healthy)
+  if (!candidate) return { retry: false, fused: true, reason: 'none-healthy' }
+  route.retries = 1
+  route.candidate = candidate
+  return { retry: true, fused: true, candidate, reason: 'failover' }
+}
+
+function applyFreeRouteToRequest(resolved, route) {
+  const candidate = route.sensitive ? grokRoute() : (route.candidate || grokRoute())
+  const out = { ...(resolved || {}), provider: candidate.provider, model: candidate.model }
+  if (candidate.model === PROVIDER_DEFAULT_MODELS.cursor) out.reasoningEffort = 'xhigh'
+  if (route.sensitive || /claude-fable-5-2/.test(String(out.model || ''))) {
+    out.provider = 'cursor'
+    out.model = PROVIDER_DEFAULT_MODELS.cursor
+    out.reasoningEffort = 'xhigh'
+  }
+  if (out.model !== PROVIDER_DEFAULT_MODELS.cursor && out.reasoningEffort === 'xhigh') delete out.reasoningEffort
+  return out
+}
+
+function armSubagentRequestGuard(agentCtx, sessionId) {
+  if (!agentCtx || typeof agentCtx.on !== 'function' || sessionId == null) return
+  const bind = () => {
+    try {
+      agentCtx.on('agent/request', async (_payload, next) => {
+        const resolved = await next()
+        const route = subagentFreeAudit.get(String(sessionId))
+        if (!route || route.action !== 'rewrite' || !route.candidate) return resolved
+        return applyFreeRouteToRequest(resolved, route)
+      })
+    } catch {}
+  }
+  bind()
+  queueMicrotask(bind)
+}
+
+function pushSubagentCreate(options) {
+  subagentCreateStack.push(options || null)
+}
+
+function popSubagentCreate() {
+  subagentCreateStack.pop()
+}
+
+function peekSubagentCreate() {
+  return subagentCreateStack[subagentCreateStack.length - 1] || null
+}
+
+function detectRpGuardian(ctx) {
+  if (!ctx || typeof ctx.get !== 'function') return false
+  for (const key of ['loader', 'plugins', 'packages']) {
+    let svc
+    try { svc = ctx.get(key) } catch { continue }
+    if (!svc) continue
+    try {
+      const list = typeof svc.list === 'function' ? svc.list() : (svc.plugins || svc.entries || [])
+      const items = Array.isArray(list) ? list : []
+      for (const item of items) {
+        const name = typeof item === 'string' ? item : (item?.name || item?.id || item?.packageName || '')
+        if (String(name).includes('dsh-rp-guardian')) return true
+      }
+    } catch {}
+  }
+  return false
 }
 
 function withLocalTimeout(promise, ms, label = 'timeout') {
@@ -987,6 +1363,13 @@ export function expandTargets(input, modesInfo = {}) {
 }
 
 /** v3 sessions keep a live `events` array; DSH 0.2.2-rc.2 Session v4 only has `snapshotEvents()`. */
+function prefixEpochCompacting(session) {
+  if (!session) return false
+  try {
+    return globalThis[Symbol.for('@dsh-external/prefix-epoch')]?.bySession?.get(session)?.compacting === true
+  } catch { return false }
+}
+
 export function sessionEvents(s) {
   if (!s) return []
   if (typeof s.snapshotEvents === 'function') {
@@ -1015,63 +1398,350 @@ function toolResultCallId(event) {
   return data.callId || data.id || message.callId || message.source?.callId || message.toolCallId || message.id || null
 }
 
+function messageIndex(events, message) {
+  if (!Array.isArray(events) || !message) return -1
+  const direct = events.lastIndexOf(message)
+  if (direct >= 0) return direct
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]?.type === 'assistant/message' && message.seq != null && events[i].seq === message.seq) return i
+  }
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i]?.type === 'assistant/message') return i
+  }
+  return -1
+}
+
+function compactResultFailed(event) {
+  const data = event?.data?.message ?? event?.data ?? {}
+  const text = (Array.isArray(data.content) ? data.content : []).map((b) => b?.text || '').join('\n')
+  return data.status === 'error' || data.isError === true || /^(?:Error:|Invalid)/.test(String(text || '').trim())
+}
+
+/** Only the current step's context_compact callId can close the wait. A stale success with another id stays pending. */
+function selectCompactResult(events, message, assistantWantsCompact) {
+  const list = Array.isArray(events) ? events : []
+  const msgAt = messageIndex(list, message)
+  const compact = []
+  let lastCallAt = -1
+  for (let i = msgAt + 1; i < list.length; i++) {
+    const e = list[i]
+    if (e?.type !== 'tool/call' || e.data?.name !== 'context_compact') continue
+    const id = e.data.callId || e.data.id
+    if (id) compact.push(id)
+    lastCallAt = i
+  }
+  if (!assistantWantsCompact && lastCallAt < 0) return { applicable: false, result: null }
+  const byId = new Map()
+  const nameless = []
+  const namelessAfter = lastCallAt >= 0 ? lastCallAt : msgAt
+  for (let i = msgAt + 1; i < list.length; i++) {
+    const e = list[i]
+    if (e?.type !== 'tool/result') continue
+    const callId = toolResultCallId(e)
+    if (callId && compact.includes(callId)) byId.set(callId, e)
+    else if (i > namelessAfter && e.data?.name === 'context_compact' && (!callId || compact.length === 0)) nameless.push(e)
+  }
+  const paired = compact.map((id) => byId.get(id)).filter(Boolean)
+  const failed = [...paired, ...nameless].find(compactResultFailed)
+  if (failed) return { applicable: true, result: failed }
+  if (compact.length) {
+    const missing = compact.filter((id) => !byId.has(id))
+    if (!missing.length) return { applicable: true, result: byId.get(compact[compact.length - 1]) }
+    if (nameless.length >= missing.length) return { applicable: true, result: nameless[nameless.length - 1] }
+    return { applicable: true, result: null }
+  }
+  return { applicable: true, result: nameless.length ? nameless[nameless.length - 1] : null }
+}
+
 export function concludeRequested(exec) {
   const events = sessionEventsOf(exec?.agent?.session)
   if (!Array.isArray(events) || exec?.signal?.aborted) return { ok: false, reason: exec?.signal?.aborted ? 'C6 已取消' : 'C3 无会话事件' }
   let message
+  let streaming = false
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]
     if (['step/end', 'turn/end', 'step/start', 'turn/start'].includes(e?.type)) break
+    if (!message && e?.type === 'assistant/chunk') {
+      const kind = e.data?.chunk?.type
+      if (kind && kind !== 'stop' && kind !== 'message-stop') streaming = true
+    }
     if (e?.type === 'assistant/message') { message = e; break }
   }
+  if (streaming) return { ok: false, reason: 'C3 模型输出尚未结束' }
   if (!message) return { ok: false, reason: 'C3 当前步无助手消息' }
   const phase = exec.agent?.phase
   if ((message.turn != null && phase?.turn != null && message.turn !== phase.turn) || (message.step != null && phase?.step != null && message.step !== phase.step)) return { ok: false, reason: 'C3 消息不属于当前步' }
   const content = message.data?.message?.content ?? message.content ?? message.data?.content ?? []
-  if (!Array.isArray(content) || !content.some((b) => b?.type === 'text' && String(b.text || '').trim())) return { ok: false, reason: 'C3 助手文字为空' }
+  const hasText = Array.isArray(content) && content.some((b) => b?.type === 'text' && String(b.text || '').trim())
+  if (!hasText) {
+    const hasTool = Array.isArray(content) && content.some((b) => b?.type === 'tool-call')
+    if (!hasTool) return { ok: false, reason: 'C3 助手文字为空' }
+    const dispatches = content.filter((b) => b?.type === 'tool-call' && b.name === 'relay_dispatch').length
+    const receipt = dispatches ? `已派发 ${dispatches} 个后台任务，完成后会通知。` : '已压缩上下文。'
+    return { ok: true, content, events, message, receipt }
+  }
   const sibling = [...content.filter((b) => b?.type === 'tool-call').map((b) => b.name), ...events.filter((e) => e?.type === 'tool/call' && e.seq > (message.seq ?? -1)).map((e) => e.data?.name)]
     .filter((n) => n && !['relay_dispatch', 'context_compact'].includes(n))
   if (sibling.length) return { ok: false, reason: `C4 非白名单工具：${[...new Set(sibling)].join(',')}` }
   return { ok: true, content, events, message }
 }
 
+const concludeInflight = new WeakMap()
+
 export async function finishConclude(exec, notes = [], options = {}) {
+  if (options?.failed === true || options?.error) return 'C1 派发失败，不结束本轮'
   if (notes.length) return 'C5 有派发警告'
+  if (!exec || typeof exec !== 'object') return finishConcludeUnlocked(exec, options)
+  const pending = concludeInflight.get(exec)
+  if (pending) return pending
+  let settle
+  let fail
+  const gate = new Promise((resolve, reject) => { settle = resolve; fail = reject })
+  concludeInflight.set(exec, gate)
+  finishConcludeUnlocked(exec, options).then(settle, fail).finally(() => { if (concludeInflight.get(exec) === gate) concludeInflight.delete(exec) })
+  return gate
+}
+
+async function finishConcludeUnlocked(exec, options = {}) {
   const state = concludeRequested(exec)
   if (!state.ok) return state.reason
   const names = state.content.filter((b) => b?.type === 'tool-call').map((b) => b.name)
   const compactIds = (events) => events.filter((e) => e?.type === 'tool/call' && e.data?.name === 'context_compact').map((e) => e.data?.callId || e.data?.id).filter(Boolean)
   if (names.includes('context_compact') || compactIds(state.events).length) {
     const deadline = Date.now() + (options.timeoutMs ?? 50)
+    const assistantWantsCompact = names.includes('context_compact')
     let result
+    let applicable = false
     while (Date.now() <= deadline) {
       const events = sessionEventsOf(exec?.agent?.session) || state.events
-      const compact = compactIds(events)
-      result = [...events].reverse().find((e) => {
-        if (e?.type !== 'tool/result') return false
-        if (e.data?.name === 'context_compact') return true
-        const callId = toolResultCallId(e)
-        return Boolean(callId && compact.includes(callId))
-      })
-      if (result) break
+      const found = selectCompactResult(events, state.message, assistantWantsCompact)
+      applicable = found.applicable
+      result = found.result
+      if (!applicable || result) break
       await new Promise((r) => setTimeout(r, options.intervalMs ?? 5))
     }
-    if (!result) return 'C4 context_compact 超时未完成'
-    const data = result.data?.message ?? result.data ?? {}
-    const text = (Array.isArray(data.content) ? data.content : []).map((b) => b?.text || '').join('\n')
-    if (data.status === 'error' || data.isError || /^(?:Error:|Invalid)/.test(text.trim())) return 'C4 context_compact 执行失败'
+    if (applicable && !result) return 'C4 context_compact 超时未完成'
+    if (result && compactResultFailed(result)) return 'C4 context_compact 执行失败'
   }
   if (exec?.signal?.aborted) return 'C6 已取消'
+  const allEvents = sessionEventsOf(exec?.agent?.session) || []
+  let stepAt = 0
+  for (let i = allEvents.length - 1; i >= 0; i--) {
+    if (allEvents[i]?.type === 'step/start' || allEvents[i]?.type === 'turn/start') { stepAt = i; break }
+  }
+  const stepEvents = allEvents.slice(stepAt)
+  const otherToolError = stepEvents.some((e) => {
+    if (e?.type !== 'tool/result') return false
+    const name = e.data?.name || e.data?.message?.toolName
+    if (name === 'context_compact') return false
+    return e.data?.isError === true || e.data?.message?.isError === true || e.data?.status === 'error'
+  })
+  if (otherToolError) return 'C1 工具报错，不结束本轮'
   if (typeof exec?.concludeTurn !== 'function') return '宿主不支持 concludeTurn'
-  exec.concludeTurn()
+  try { if (state.receipt) landRelayReceipt(exec?.agent?.session, state.receipt) } catch {}
+  try { exec.concludeTurn?.() } catch (err) {
+    if (!/not extensible/i.test(String(err?.message || err))) throw err
+  }
   return ''
+}
+
+export function buildAutoDispatchSummary(args = {}) {
+  const clip = (value) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 48)
+  const labels = []
+  const push = (value) => { const text = clip(value); if (text) labels.push(text) }
+  if (Array.isArray(args.tasks)) {
+    for (const task of args.tasks) push(task?.label || task?.task || task?.startArgs?.task || task?.mode)
+  }
+  if (!labels.length) push(args.startArgs?.task || args.mode || (args.followUp ? '续修' : '') || (Array.isArray(args.targets) ? args.targets.filter((x) => typeof x === 'string').join('、') : ''))
+  const taskLabels = labels.length ? labels.slice(0, 4).join('、') : '后台任务'
+  return `已派发后台流水线（${taskLabels}），完成后自动汇报。`
+}
+
+/** User summary, or a one-line fallback when conclude needs a visible explanation. */
+export function explainDispatchText(args) {
+  if (!args || typeof args !== 'object') return ''
+  const summary = typeof args.summary === 'string' ? args.summary.trim() : ''
+  if (summary) return summary
+  if (args.conclude === true) return buildAutoDispatchSummary(args)
+  return ''
+}
+
+function assistantTextBlocks(event) {
+  const content = event?.data?.message?.content ?? event?.content ?? event?.data?.content ?? []
+  return Array.isArray(content) ? content : []
+}
+
+/** True when the current open turn already has visible assistant text. */
+export function openTurnHasVisibleAssistantText(session) {
+  const events = sessionEventsOf(session) || []
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (['turn/end', 'step/end', 'turn/start', 'step/start'].includes(event?.type)) break
+    if (event?.type !== 'assistant/message') continue
+    if (assistantTextBlocks(event).some((block) => block?.type === 'text' && String(block.text || '').trim())) return true
+  }
+  return false
+}
+
+/**
+ * Append a visible assistant message. Session v4's `append()` REQUIRES
+ * `surfaceOp: "append"` on every surface-eligible event (assistant/message),
+ * exactly like dsh-agent-loop's step(): without the marker the append throws
+ * ("is surface-eligible and requires a surfaceOp marker") and the message
+ * never lands — the root cause of the invisible conclude summary bubble.
+ * `sourceEventSeqs` may be omitted for assistant/message (session validates
+ * empty arrays only for that type); when known we cite the relay tool/call seq.
+ * Reload (`Session` seed) also requires message.id plus source.kind=model with
+ * provider/model; a bare `{role, content}` event is accepted live and then
+ * rejected as `lacks an identified message` / `must have model source`.
+ */
+function modelSourceForExplanation(session) {
+  const events = sessionEventsOf(session) || []
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    const src = event?.data?.message?.source
+    if (event?.type === 'assistant/message' && src?.kind === 'model' && src.provider && src.model) {
+      return { kind: 'model', provider: String(src.provider), model: String(src.model) }
+    }
+    const config = event?.data?.header?.config || event?.data?.config
+    if (event?.type === 'request/header' && config?.provider && config?.model) {
+      return { kind: 'model', provider: String(config.provider), model: String(config.model) }
+    }
+  }
+  try {
+    const config = session?.requestHeader?.()?.config
+    if (config?.provider && config?.model) return { kind: 'model', provider: String(config.provider), model: String(config.model) }
+  } catch { /* header fold is optional */ }
+  return { kind: 'model', provider: 'relay-dispatch', model: 'dispatch-summary' }
+}
+
+function explanationSourceSeqs(sourceSeqs) {
+  const list = Array.isArray(sourceSeqs) ? sourceSeqs : (Number.isSafeInteger(sourceSeqs) ? [sourceSeqs] : [])
+  const seqs = list.filter((s) => Number.isSafeInteger(s) && s >= 0)
+  return seqs.length && seqs.length === list.length ? seqs : undefined
+}
+
+export function injectAssistantExplanation(session, text, phase, sourceSeqs) {
+  if (!session || typeof text !== 'string' || !text.trim()) return false
+  const turn = phase?.turn
+  const step = phase?.step
+  const data = {
+    ...(turn != null ? { turn } : {}),
+    ...(step != null ? { step } : {}),
+    message: {
+      id: randomUUID(),
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      source: modelSourceForExplanation(session),
+    },
+  }
+  const seqs = explanationSourceSeqs(sourceSeqs)
+  if (typeof session.append === 'function') {
+    try { session.append('assistant/message', data, { surfaceOp: 'append', ...(seqs ? { sourceEventSeqs: seqs } : {}) }); return true } catch { /* fall through to record/events */ }
+  }
+  if (typeof session.record === 'function') {
+    try { session.record('assistant/message', data); return true } catch { /* try events */ }
+  }
+  if (Array.isArray(session.events)) {
+    const event = { type: 'assistant/message', data, ...(turn != null ? { turn } : {}), ...(step != null ? { step } : {}), surfaceOp: 'append' }
+    if (Object.isExtensible(session.events)) {
+      try { session.events.push(event); return true } catch { /* replace below */ }
+    }
+    try {
+      const next = session.events.concat([event])
+      session.events = Object.isFrozen(session.events) ? Object.freeze(next) : next
+      return true
+    } catch { return false }
+  }
+  return false
+}
+
+/** Last relay_dispatch tool/call event seq in the current open turn, to cite as the explanation's source. */
+export function lastRelayToolCallSeq(session) {
+  const events = sessionEventsOf(session) || []
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]
+    if (['turn/start', 'turn/end'].includes(e?.type) && i < events.length - 1) break
+    if (e?.type === 'tool/call' && (e.data?.name === 'relay_dispatch' || e.data?.name === 'context_compact') && Number.isSafeInteger(e.seq)) return e.seq
+  }
+  return undefined
+}
+
+/**
+ * Fold explanation text into the open tool-call assistant message.
+ * 'attached' means the text is on that message (or it already had text).
+ * 'blocked' means the message is frozen and must not be followed by a new one.
+ * 'absent' means this step has no tool-call message, so a new message is safe.
+ * A new assistant message while the tool call is unanswered lands between the
+ * call and its result. Gemini then returns 400 invalid_tool_call_format.
+ */
+function attachExplanationToOpenToolCall(session, text) {
+  if (!session || typeof text !== 'string' || !text.trim()) return 'absent'
+  const events = sessionEventsOf(session) || []
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (['turn/end', 'step/end', 'turn/start', 'step/start'].includes(event?.type)) break
+    if (event?.type !== 'assistant/message') continue
+    const content = event?.data?.message?.content
+    if (!Array.isArray(content)) continue
+    const hasText = content.some((block) => block?.type === 'text' && String(block.text || '').trim())
+    const hasTool = content.some((block) => block?.type === 'tool-call' || block?.type === 'toolCall')
+    if (!hasTool) continue
+    if (hasText) return 'attached'
+    try {
+      content.unshift({ type: 'text', text })
+      return 'attached'
+    } catch {
+      return 'blocked'
+    }
+  }
+  return 'absent'
+}
+
+export function applyDispatchExplanation(args, exec, value = {}) {
+  const explainText = explainDispatchText(args)
+  if (!explainText) return value
+  if (args?.conclude === true && !openTurnHasVisibleAssistantText(exec?.agent?.session)) {
+    const session = exec?.agent?.session
+    if (attachExplanationToOpenToolCall(session, explainText) === 'absent') {
+      injectAssistantExplanation(session, explainText, exec?.agent?.phase, lastRelayToolCallSeq(session))
+    }
+  }
+  return { ...value, explainText }
+}
+
+export function renderDispatchText(value = {}) {
+  const head = value?.explainText ? `📋 ${value.explainText}\n` : ''
+  const body = value?.pipelineId
+    ? `OK pipelineId=${value.pipelineId} jobId=${value.jobId}${value.concludeReason ? ` conclude skipped: ${value.concludeReason}` : ''}`
+    : `OK runId=${value.runId} jobId=${value.jobId}${value.concludeReason ? ` conclude skipped: ${value.concludeReason}` : ''}`
+  return head + body
+}
+
+function landRelayReceipt(session, text) {
+  if (attachExplanationToOpenToolCall(session, text) !== 'absent') return
+  const data = { source: { kind: 'synthetic-receipt' }, message: { role: 'assistant', content: [{ type: 'text', text }] } }
+  try {
+    if (typeof session?.record === 'function') {
+      session.record('assistant/message', data)
+      return
+    }
+  } catch {}
+  if (typeof session?.append === 'function') {
+    try { session.append('assistant/message', data) } catch {}
+    return
+  }
+  const events = session?.events
+  if (!Array.isArray(events) || !Object.isExtensible(events)) return
+  try { events.push({ type: 'assistant/message', data }) } catch {}
 }
 
 function sensitivePath(path) { return /(?:^|[\\/])(?:\.env(?:\..*)?|\.credentials\.yaml|secrets?)(?:[\\/]|$)/i.test(path) }
 
 /** Infer external read roots from literal paths; sensitive paths are never propagated. */
 export function inferScopes(text, checks = [], ctx = {}) {
-  const sources = [text, ...(Array.isArray(checks) ? checks : []).map((c) => c?.cmd || '')]
+  const rawSources = [text, ...(Array.isArray(checks) ? checks : []).map((c) => c?.cmd || '')].map(String)
+  const sources = rawSources.map((source) => source.replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'`<>)]+/g, ' '))
   const readRoots = [], notes = []
   const add = (raw) => {
     let value = String(raw || '').trim().replace(/^["'`([{]+|["'`),;，。、；：\]）}]+$/g, '').replace(/\\/g, '/')
@@ -1087,7 +1757,11 @@ export function inferScopes(text, checks = [], ctx = {}) {
       else return
     }
     if (!isAbsolute(value)) return
-    if (/^[A-Za-z]:\/?$/.test(value) || sameDir(value, homedir())) throw Object.assign(new Error(`DSH_E_SCOPE_INFER_TOO_BROAD: ${value}`), { code: 'DSH_E_SCOPE_INFER_TOO_BROAD' })
+    if (/^[A-Za-z]:\/?$/.test(value) || sameDir(value, homedir())) {
+      notes.push(`dropped_too_broad: ${value}`)
+      if (ctx.strictScopeInfer === true) throw Object.assign(new Error(`DSH_E_SCOPE_INFER_TOO_BROAD: ${value}`), { code: 'DSH_E_SCOPE_INFER_TOO_BROAD' })
+      return
+    }
     let root = value
     try { if (existsSync(value) && statSync(value).isFile()) root = dirname(value) } catch {}
     if (/\.[A-Za-z0-9]+$/.test(value)) root = dirname(value)
@@ -1095,8 +1769,7 @@ export function inferScopes(text, checks = [], ctx = {}) {
   }
   for (const source of sources) for (const match of String(source || '').matchAll(/(?:\$env:USERPROFILE|%USERPROFILE%|~)[\\/][^\s'"`，。、；：]+|@[\w-]+\/[^\s'"`，。、；：]+|(?<![A-Za-z])[A-Za-z]:(?:\\|\/(?!\/))[^\s'"`]*|(?:^|[\s=(])\/(?:Users|home)\/[^\s'"`，。、；：]+/g)) add(match[0].replace(/^[\s=(]/, ''))
   const hosts = new Set(), loopbackPorts = new Set()
-  for (const source of sources) {
-    const text = String(source || '')
+  for (const text of rawSources) {
     for (const match of text.matchAll(/\b(?:ssh|scp)\s+(?:-[^\s]+\s+)*(?:([\w.-]+)@)?([\w.-]+\.[\w.-]+)/gi)) hosts.add(match[2])
     for (const match of text.matchAll(/\b(?:127\.0\.0\.1|localhost):(\d{1,5})\b/gi)) loopbackPorts.add(Number(match[1]))
   }
@@ -1128,12 +1801,12 @@ export function lintMechanicalChecks(checks, ctx = {}) {
       if ((ctx.writeScopes || []).some((p) => isPathInsideWorkspace(p, dir))) check.cmdDeferredGlob = true
       else check.cmdResolved = ['node', '--test', ...files.map((f) => JSON.stringify(f))].join(' ')
     }
-    if (check.minTests != null && !(/^node(?:\.exe)?$/i.test(tokens[0]) && tokens[1] === '--test') && !(/^npm(?:\.cmd)?$/i.test(tokens[0]) && ((tokens[1] === 'test') || (tokens[1] === '--prefix' && tokens[3] === 'test')))) gateError('DSH_E_GATE_MINTESTS_UNPARSEABLE', index, 'minTests 仅支持 node --test 或 npm test')
     return check
   })
 }
 function normalizePathList(value, roots, workspace, field, write = false) {
   if (value == null) return value
+  if (field === 'writeScope' && typeof value === 'string') value = [value]
   if (!Array.isArray(value)) throw new Error(`${field} 必须是路径数组`)
   return value.map((p) => {
     const out = expandPathMacro(p, roots, workspace)
@@ -1154,9 +1827,9 @@ function validateGate(gate) {
   }
   if (normalizedCriteria != null && (typeof normalizedCriteria !== 'string' || !normalizedCriteria.trim())) throw new Error('gate.criteria 必须是非空字符串或非空字符串数组')
   if (normalizedCriteria == null && !(Array.isArray(gate.checks) && gate.checks.length)) throw new Error('gate.criteria 缺省时必须提供 gate.checks')
-  if (gate.checks != null && (!Array.isArray(gate.checks) || gate.checks.some((x) => !isPlainObject(x) || Object.keys(x).some((k) => !['sha', 'gitClean', 'noDiff', 'allowAdded', 'cmd', 'exit', 'minTests', 'timeoutMs', 'exists', 'exports'].includes(k))))) throw new Error('gate.checks 含未知检查类型或字段')
+  if (gate.checks != null && (!Array.isArray(gate.checks) || gate.checks.some((x) => !isPlainObject(x)))) throw new Error('gate.checks 必须是检查对象数组')
   if (gate.llm != null && !['auto', 'never'].includes(gate.llm)) throw new Error("gate.llm 仅支持 'auto' 或 'never'")
-  if (gate.llm === 'never' && normalizedCriteria?.trim()) throw new Error("gate.llm='never' 时不能提供语义 criteria")
+  if (gate.llm === 'never') normalizedCriteria = ''
   if (gate.mode != null && gate.mode !== 'verify') throw new Error("gate.mode 目前仅支持 'verify'")
   if (gate.commands != null && (!Array.isArray(gate.commands) || gate.commands.some((x) => typeof x !== 'string' || !x.trim()))) {
     throw new Error('gate.commands 必须是非空字符串组成的数组')
@@ -1223,7 +1896,7 @@ export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes
     for (const field of ['writeScope', 'contextReadScope', 'reviewTargets']) if (merged[field] != null) merged[field] = normalizePathList(merged[field], roots, merged.workspace, field, field === 'writeScope')
     if (merged.task != null) merged.task = expandTextMacros(merged.task, roots, merged.workspace)
     const rawTask = merged.task
-    const inferredScope = inferScopes(rawTask, gate?.checks, { roots })
+    const inferredScope = inferScopes(rawTask, gate?.checks, { roots, strictScopeInfer: args.strictScopeInfer === true || item?.strictScopeInfer === true })
     const knownHosts = new Set(Object.values(modesInfo.hosts || {}).map(String))
     for (const host of inferredScope.hosts) {
       if (!knownHosts.has(host) && merged.permissionPreset !== 'danger-full-access') scopeErrors.push(Object.assign(new Error(`tasks[${index}] DSH_E_SCOPE_HOST_UNDECLARED: ${host}；请在 dispatch-modes.yaml hosts 声明或显式使用 danger-full-access`), { code: 'DSH_E_SCOPE_HOST_UNDECLARED' }))
@@ -1344,7 +2017,7 @@ export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes
     const root = x.root ? expandPathMacro(x.root, roots, tasks[0]?.workspace) : undefined
     const source = expandPathMacro(x.source, roots, tasks[0]?.workspace)
     const target = expandPathMacro(x.target, roots, tasks[0]?.workspace)
-    return { source, target, root: root || (x.target.startsWith('@plugins/') ? join(homedir(), '.dsh', 'plugins') : x.target.startsWith('@pf/') ? roots.pf : dirname(target)), mode: x.mode || 'verify' }
+    return { source, target, root: root || (x.target.startsWith('@plugins/') ? join(homedir(), '.dsh', 'plugins') : x.target.startsWith('@pf/') ? roots.pf : dirname(target)), mode: x.mode || 'copy' }
   }).filter((x, i, all) => all.findIndex((y) => sameDir(y.source, x.source) && sameDir(y.target, x.target)) === i)
   if (syncTargets.some((x) => x.mode !== 'copy' && x.mode !== 'verify')) throw new Error('syncTargets.mode 仅支持 copy 或 verify')
   if (gate) {
@@ -1361,6 +2034,7 @@ export function preflightDispatchV2(args, config = DEFAULTS, modesInfo = { modes
       for (const key of ['sha', 'exists', 'gitClean']) if (out[key] != null) out[key] = Array.isArray(out[key]) ? out[key].map((p) => expandPathMacro(p, roots, ws)) : expandPathMacro(out[key], roots, ws)
       if (out.exports) out.exports = { ...out.exports, file: expandPathMacro(out.exports.file, roots, ws) }
       if (out.cmd) out.cmd = expandTextMacros(out.cmd, roots, ws)
+      for (const key of ['cwd', 'dir', 'workdir']) if (typeof out[key] === 'string') out[key] = expandPathMacro(out[key], roots, ws)
       return out
     })
   }
@@ -1415,7 +2089,9 @@ export function preflightFollowUp(followUp, config = DEFAULTS, modesInfo = {}) {
   const sessionId = items.find((i) => i.index === index && i.kind !== 'gate')?.sessionId
   const failed = items.find((i) => i.kind === 'gate')?.output || items.find((i) => i.kind !== 'gate' && i.status !== 'succeeded')?.error || ''
   const nextTasks = plan.tasks.map((t) => ({ ...t, candidates: Array.isArray(t.candidates) ? t.candidates : [], dependsOn: new Set(t.dependsOn || []) }))
-  nextTasks[index] = { ...task, dependsOn: new Set(), rawTask: patchTask, baseArgs: { ...task.baseArgs, task: `${patchTask}\n上次失败明细：\n${String(failed).slice(-500)}`, ...(sessionId ? { sessionId, sessionMode: 'latest-idle' } : { sessionMode: 'fresh' }) } }
+  const followUpBaseArgs = normalizeStartArgs({ ...task.baseArgs, task: `${patchTask}\n上次失败明细：\n${String(failed).slice(-500)}`, ...(sessionId ? { sessionId } : { sessionMode: 'fresh' }) }, config)
+  const followUpPreviewArgs = normalizeStartArgs({ ...task.previewArgs, ...followUpBaseArgs }, config)
+  nextTasks[index] = { ...task, dependsOn: new Set(), rawTask: patchTask, baseArgs: followUpBaseArgs, previewArgs: followUpPreviewArgs }
   const nextPlan = { ...plan, tasks: nextTasks, gate: nextTasks[index].followUpGate || plan.gate, followUpOf: followUp.pipelineId, followUpTarget: index }
   if (followUp.patchGate != null) {
     if (!isPlainObject(followUp.patchGate)) throw new Error('patchGate 必须是对象')
@@ -1591,7 +2267,7 @@ function execGit(workspace, args, env = {}, timeoutMs = 30000) {
     const fullArgs = ['-c', 'core.quotepath=off', ...args]
     execFile('git', fullArgs, {
       cwd: workspace,
-      env: { ...process.env, ...env },
+      env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_CONFIG'))), ...env },
       windowsHide: true,
       timeout: timeoutMs,
       maxBuffer: 16 * 1024 * 1024,
@@ -1692,7 +2368,19 @@ function globRegex(glob) {
 function allowedMechCommand(command, prefixes) {
   if ((prefixes || []).some((prefix) => command === prefix || command.startsWith(`${prefix} `))) return true
   const tokens = parseMechanicalCommand(command)
-  if (/^node(?:\.exe)?$/i.test(tokens[0] || '') && tokens[1] && /(?:^|[\\/])test[\\/][\w.-]+\.(?:m?js|cjs)$/i.test(tokens[1])) return true
+  const executable = String(tokens[0] || '').replace(/\.(?:exe|cmd)$/i, '').toLowerCase()
+  const args = tokens.slice(1)
+  if (executable === 'node') {
+    if (args[0] === '--check' && args.length === 2) return true
+    if (args[0] === '--test') return true
+    if (args.length === 1 && /(?:^|[\\/])(?:test[\\/][\w.-]+|[^\\/]+\.test)\.(?:m?js|cjs)$/i.test(args[0])) return true
+  }
+  if (['npm', 'pnpm'].includes(executable)) {
+    if (args[0] === 'test' || args[0] === '--prefix' && args[2] === 'test') return true
+    if (args[0] === 'run' && args.length === 2 && /^(?:test(?::[\w-]+)?|check(?::[\w-]+)?|lint|typecheck|type-check|validate)$/i.test(args[1])) return true
+    if (executable === 'pnpm' && ['exec', 'dlx'].includes(args[0]) && /^(?:vitest|jest|tsc|eslint)$/i.test(args[1] || '')) return true
+  }
+  if (executable === 'git') return ['diff', 'status', 'show', 'log', 'rev-parse', 'fsck', 'ls-files'].includes(args[0])
   return false
 }
 export function parseMechanicalCommand(command) {
@@ -1712,19 +2400,31 @@ function execCheck(command, cwd, timeoutMs = 120000) {
     const useNodeCli = Boolean(npmCli && existsSync(npmCli))
     // Node 22 blocks direct .cmd execution without a shell on Windows.
     const useCmd = isWinCmd && !useNodeCli
-    const executable = useNodeCli ? process.execPath : useCmd ? (process.env.ComSpec || 'cmd.exe') : rawExecutable
-    const finalArgs = useNodeCli
-      ? [npmCli, ...args]
-      : useCmd
-        ? ['/d', '/s', '/c', [rawExecutable, ...args].map((arg) => `"${String(arg).replace(/"/g, '""')}"`).join(' ')]
-        : args
+    // Bare `node` is a PATH lookup. The DSH host often has no node on PATH, so
+    // execFile returns ENOENT in a few milliseconds and minTests stays unknown.
+    const isNode = /^node(?:\.exe)?$/i.test(rawExecutable)
+    const executable = (isNode || useNodeCli) ? process.execPath : useCmd ? (process.env.ComSpec || 'cmd.exe') : rawExecutable
+    const finalArgs = isNode
+      ? args
+      : useNodeCli
+        ? [npmCli, ...args]
+        : useCmd
+          ? ['/d', '/s', '/c', [rawExecutable, ...args].map((arg) => `"${String(arg).replace(/"/g, '""')}"`).join(' ')]
+          : args
     // A gate often runs inside `node --test`. Inheriting NODE_TEST_CONTEXT makes the
     // child `node --test` treat itself as recursive and skip the file, so minTests sees no count.
     const env = { ...process.env }
     for (const key of Object.keys(env)) {
       if (key === 'NODE_CHANNEL_FD' || key === 'NODE_CHANNEL_SERIALIZATION_MODE' || key.startsWith('NODE_TEST_')) delete env[key]
     }
-    execFile(executable, finalArgs, { cwd, env, windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => resolve({ code: error?.code ?? 0, output: `${stdout || ''}${stderr || ''}` }))
+    if (cwd && !existsSync(cwd)) {
+      resolve({ code: 'ENOENT', output: `ENOENT: cwd not found: ${cwd}` })
+      return
+    }
+    execFile(executable, finalArgs, { cwd, env, windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      const note = error && typeof error.code !== 'number' ? `\n${error.code}: ${error.message}` : ''
+      resolve({ code: error?.code ?? 0, output: `${stdout || ''}${stderr || ''}${note}` })
+    })
   })
 }
 export async function runMechanicalChecks(checks, ctx = {}) {
@@ -1749,10 +2449,13 @@ export async function runMechanicalChecks(checks, ctx = {}) {
         if (!allowedMechCommand(check.cmd, ctx.mechCommands)) throw new Error(`机械命令不在白名单：${check.cmd}`)
         let command = check.cmdResolved || check.cmd
         if (check.cmdDeferredGlob) command = lintMechanicalChecks([{ ...check, cmdDeferredGlob: false }], { ...ctx, writeScopes: [] })[0].cmdResolved
-        const run = await execCheck(command, ctx.workspace, check.timeoutMs)
+        const run = await execCheck(command, check.cwd || check.dir || check.workdir || ctx.workspace, check.timeoutMs)
         const matches = [...run.output.matchAll(/tests\s+(\d+)\s*$/gim)]
         const tests = matches.length ? matches.reduce((sum, m) => sum + Number(m[1]), 0) : null
-        ok = run.code === (check.exit ?? 0) && (check.minTests == null || (tests != null && tests >= check.minTests))
+        const failures = [...run.output.matchAll(/(?:^|\s)(?:fail|failed|failures)\s+(\d+)\s*$/gim)]
+        const explicitFailure = failures.some((m) => Number(m[1]) > 0)
+        const enoughTests = check.minTests == null || (run.code === 0 && !explicitFailure && tests == null) || (tests != null && tests >= check.minTests)
+        ok = run.code === (check.exit ?? 0) && !explicitFailure && enoughTests
         detail = `exit=${run.code} tests=${tests ?? 'unknown'} ${run.output.slice(-500)}`
       } else if (check.exists) {
         kind = 'exists'; const paths = Array.isArray(check.exists) ? check.exists : [check.exists]; const missing = paths.filter((p) => !existsSync(p)); ok = !missing.length; detail = missing.length ? `不存在：${missing.join(', ')}` : '全部存在'
@@ -1948,6 +2651,124 @@ export async function reconcileStrayChildSessions(ctx, config = {}) {
   } catch {}
 }
 
+function clientPkgMatches(entryName, raw) {
+  const name = String(entryName || '')
+  const token = String(raw || '').trim()
+  if (!name || !token) return false
+  const short = token.includes('/') ? token.split('/').pop() : token
+  return name === token || name === short || name.endsWith(`/${short}`)
+}
+
+const clientRevivePending = new Set()
+
+function scheduleClientRevive(ctx, raw, entries) {
+  if (!raw || clientRevivePending.has(raw)) return
+  clientRevivePending.add(raw)
+  Promise.resolve().then(async () => {
+    try {
+      const ghost = ctx && ctx.fiber
+      const linked = entries.some((entry) => entry && entry.fiber === ghost)
+      if (ghost && ghost.uid && !linked && typeof ghost.dispose === 'function') {
+        try { await ghost.dispose() } catch {}
+      }
+      for (const entry of entries) {
+        if (entry?.fiber?.state === 2) continue
+        try { if (entry.fiber && typeof entry._dispose === 'function') await entry._dispose() } catch {}
+        try { entry.fiber = undefined } catch {}
+        try { if (entry.disabled) entry.disabled = false } catch {}
+        try { if (entry.options && entry.options.disabled != null) delete entry.options.disabled } catch {}
+        try {
+          const parent = entry.parent
+          if (parent && Array.isArray(parent.data)) {
+            for (const row of parent.data) if (row && row.id === entry.id && row.disabled != null) delete row.disabled
+          }
+        } catch {}
+        try { if (!entry.fiber && typeof entry.refresh === 'function') await entry.refresh() } catch {}
+      }
+      try { reloadPluginByName(ctx, raw) } catch {}
+    } finally {
+      clientRevivePending.delete(raw)
+    }
+  }).catch(() => {})
+}
+
+/**
+ * 热重载后补登记 clientModules。
+ * processOne 在 entry.disabled 或 pkgMeta 负缓存（null，且不过期）时会 table.delete，
+ * /plugins/<pkg>/client.js 随之 404。先清 disabled 与 null 缓存；没有活 fiber 时不调用 processOne，避免误删。
+ */
+export function reloadPluginByName(ctx, pluginName) {
+  const raw = String(pluginName || '').trim()
+  if (!raw || !ctx) return { refreshed: false, reason: 'missing' }
+  const entries = []
+  let loader = ctx.loader
+  try { if ((!loader || typeof loader.entries !== 'function') && typeof ctx.get === 'function') loader = ctx.get('loader') } catch {}
+  try {
+    if (loader && typeof loader.entries === 'function') {
+      for (const entry of loader.entries()) {
+        if (!entry || entry.options?.group) continue
+        if (clientPkgMatches(entry.options?.name, raw)) entries.push(entry)
+      }
+    }
+  } catch {}
+  for (const entry of entries) {
+    try { if (entry.disabled) entry.disabled = false } catch {}
+    try { if (entry.options && entry.options.disabled != null) delete entry.options.disabled } catch {}
+    try {
+      const parent = entry.parent
+      if (parent && Array.isArray(parent.data)) {
+        for (const row of parent.data) {
+          if (!row || row.disabled == null) continue
+          if (row.id === entry.id || row.name === entry.options?.name) delete row.disabled
+        }
+      }
+    } catch {}
+  }
+  const qualifying = entries.filter((entry) => entry.fiber != null && !entry.disabled && entry.options?.disabled == null)
+  let cm
+  try { cm = typeof ctx.get === 'function' ? ctx.get('clientModules') : undefined } catch { cm = undefined }
+  if (!cm) return { refreshed: false, reason: 'no-clientModules', cleared: entries.length }
+  if (!qualifying.length) {
+    scheduleClientRevive(ctx, raw, entries)
+    return {
+      refreshed: false,
+      reason: 'no-live-entry',
+      cleared: entries.length,
+      diag: entries.map((entry) => ({
+        id: entry.id,
+        fiber: entry.fiber ? entry.fiber.state : null,
+        disabled: !!entry.disabled,
+        optionsDisabled: entry.options?.disabled ?? null,
+      })),
+    }
+  }
+  const targets = [...new Set(qualifying.map((entry) => entry.options.name))]
+  try {
+    const meta = cm.pkgMeta
+    if (meta && typeof meta.get === 'function' && typeof meta.delete === 'function') {
+      const keys = typeof meta.keys === 'function' ? [...meta.keys()] : targets
+      for (const key of keys) {
+        if (!targets.includes(key) && !clientPkgMatches(key, raw)) continue
+        if (meta.get(key) == null) meta.delete(key)
+      }
+    }
+  } catch {}
+  let changed = false
+  if (typeof cm.processOne === 'function') {
+    for (const pkgName of targets) {
+      try { if (cm.processOne(pkgName)) changed = true } catch {}
+    }
+  }
+  if (changed && typeof cm.compose === 'function') {
+    try {
+      cm.composed = cm.compose()
+      if (typeof cm.notifyGraphChanged === 'function') cm.notifyGraphChanged()
+    } catch {}
+  }
+  const present = !!(cm.table && typeof cm.table.has === 'function' && targets.some((pkgName) => cm.table.has(pkgName)))
+  return { refreshed: present || changed, changed, names: targets }
+}
+
 export function apply(ctx, rawConfig) {
   const config = { ...DEFAULTS, ...(rawConfig || {}) }
   const tools = ctx.tools
@@ -1961,6 +2782,7 @@ export function apply(ctx, rawConfig) {
   const wakeTimers = new Set()
   const wakeStates = new WeakMap()
   const activePipelines = new Map()
+  const pendingPipelines = new Set()
   const resumerTimers = new Set()
   let capabilitiesCache = { at: 0, ids: null }
 
@@ -2002,7 +2824,7 @@ export function apply(ctx, rawConfig) {
    * assistant/message 不代表它已经处理了本次 job 通知。因此在主会话真正 idle
    * 之前按拍退避检查，并以 jobId + 新轮次起点共同判定通知是否已被响应。
    */
-  function scheduleCompletionWake(owner, jobId) {
+  function scheduleCompletionWake(owner, jobId, hooks = {}) {
     if (disposed || !owner || typeof owner !== 'object') return
     const doneAt = Date.now()
     const wakeDelayMs = config.wakeDelayMs ?? DEFAULTS.wakeDelayMs
@@ -2118,13 +2940,16 @@ export function apply(ctx, rawConfig) {
       return lastStart > lastEnd
     }
 
-    const cancelWake = () => {
+    const cancelWake = (delivered = false) => {
       if (finished) return
       finished = true
       unhook()
       if (timer) clearTimeout(timer)
       timer = null
       wakeTimers.delete(cancelWake)
+      if (delivered) {
+        try { hooks.onDelivered?.() } catch {}
+      }
     }
     const removeFromInbox = (msg) => {
       const inbox = owner.inbox
@@ -2168,10 +2993,10 @@ export function apply(ctx, rawConfig) {
         return
       }
       if (wasJobNoticeHandled(owner.id, jobId, doneAt)) {
-        cancelWake()
+        cancelWake(true)
         return
       }
-      if (owner.status !== 'idle' || hasOpenTurn()) {
+      if (owner.status !== 'idle' || hasOpenTurn() || prefixEpochCompacting(sessionForParent(owner.id))) {
         sawBusy = true
         queueCheck(wakePollMs)
         return
@@ -2181,11 +3006,11 @@ export function apply(ctx, rawConfig) {
       // 唤醒的定时器不得借后来的 pending 再唤醒一次；自己的 inject 通知
       // 若已被其他路径消费，也不得凭保存的消息副本重复补投。
       if (!deliveredByThisWake && followedUp) {
-        cancelWake()
+        cancelWake(true)
         return
       }
       if (!deliveredByThisWake && injectedMsg !== null && owner.inbox && !isPendingMessage(injectedMsg)) {
-        cancelWake()
+        cancelWake(true)
         return
       }
 
@@ -2193,7 +3018,7 @@ export function apply(ctx, rawConfig) {
       // 若它已被消费，则立即收口；绝不能把后续 job 的 pending 通知抢来再投一次。
       if (deliveredByThisWake) {
         if (!deliveredMsg || !isPendingMessage(deliveredMsg)) {
-          cancelWake()
+          cancelWake(true)
           return
         }
         injectedMsg = deliveredMsg
@@ -2202,7 +3027,7 @@ export function apply(ctx, rawConfig) {
       const curState = getWakeState(owner)
       const pending = hasPendingInbox(owner)
       if (!pending && injectedMsg === null) {
-        cancelWake()
+        cancelWake(owner.status === 'idle' && !hasOpenTurn())
         return
       }
       if (curState.count >= maxWakes) {
@@ -2245,6 +3070,7 @@ export function apply(ctx, rawConfig) {
       // 避免连续完成时旧定时器消费并重复投递后一个 job 的通知。
       if (delivered) {
         deliveredByThisWake = true
+        try { hooks.onDelivered?.() } catch {}
         queueCheck(wakePollMs)
       } else cancelWake()
     }
@@ -2252,8 +3078,11 @@ export function apply(ctx, rawConfig) {
     wakeTimers.add(cancelWake)
   }
 
+  function scheduleParentFollowupWake(owner, wakeJobId, hooks) {
+    return scheduleCompletionWake(owner, wakeJobId, hooks || {})
+  }
   // 兼容插件内既有调用名；新调用应显式传入 jobId。
-  const scheduleOwnerWake = (owner, jobId) => scheduleCompletionWake(owner, jobId)
+  const scheduleOwnerWake = (owner, wakeJobId) => scheduleParentFollowupWake(owner, wakeJobId)
 
   const emitWarn = (msg) => {
     try {
@@ -2281,7 +3110,13 @@ export function apply(ctx, rawConfig) {
   }
 
   ctx.effect(() => () => {
+    // Detach synchronously before cancelling any job or other resource. A dispose
+    // may run between asynchronous wait_run slices; the manifest must be durable
+    // before the old generation can disappear.
     disposed = true
+    for (const detach of [...pendingPipelines]) {
+      try { detach() } catch (err) { emitWarn(`[relay-dispatch] dispose 清单落盘失败：${String(err?.message || err)}`) }
+    }
     if (slot) slot.active = false
     slot = null
     startChain = Promise.resolve()
@@ -2332,6 +3167,83 @@ export function apply(ctx, rawConfig) {
       }
     } catch {}
     try {
+      const agents = typeof ctx.get === 'function' ? ctx.get('agents') : undefined
+      if (agents && typeof agents.create === 'function') {
+        let createState = agents[SUBAGENT_CREATE_SYM]
+        if (!createState || typeof createState.orig !== 'function') {
+          createState = { orig: agents.create, generation: 0 }
+          agents[SUBAGENT_CREATE_SYM] = createState
+        } else {
+          agents.create = createState.orig
+        }
+        const myCreateGen = ++createState.generation
+        const origCreate = createState.orig
+        agents.create = function (options) {
+          const opts = options && typeof options === 'object' ? options : {}
+          if (!opts[SUBAGENT_CREATE_SYM]) {
+            const previous = opts.setup
+            opts.setup = (agentCtx) => {
+              armSubagentRequestGuard(agentCtx, opts.sessionId)
+              return typeof previous === 'function' ? previous(agentCtx) : undefined
+            }
+            opts[SUBAGENT_CREATE_SYM] = true
+          }
+          if (!opts.__subagentCtx) opts.__subagentCtx = { rpGuardianActive: detectRpGuardian(ctx) }
+          const fail = (err, asyncFailure) => {
+            if (asyncFailure) return Promise.reject(err)
+            throw err
+          }
+          const routeCtx = () => ({
+            ...(opts.__subagentCtx || {}),
+            now: typeof config.now === 'function' ? config.now() : Date.now(),
+            slot,
+            rpGuardianActive: detectRpGuardian(ctx) || opts.__subagentCtx?.rpGuardianActive === true,
+          })
+          const recover = (err, asyncFailure) => {
+            const info = routeCtx()
+            if (opts.__subagentRetried) {
+              const spent = noteSubagentStartFailure(opts.sessionId, err, info.now, info)
+              if (spent.fused && opts.__subagentPinned) markSubagentCandidateUnhealthy(opts.__subagentPinned, info.now)
+              return fail(err, asyncFailure)
+            }
+            if (!readSubagentFreeAudit(opts.sessionId)) evaluateSubagentPrepare(opts.sessionId, opts, info)
+            const decision = noteSubagentStartFailure(opts.sessionId, err, info.now, info)
+            if (!decision.retry) return fail(err, asyncFailure)
+            opts.__subagentRetried = true
+            opts.__subagentPinned = decision.candidate
+            writeCandidate(opts, decision.candidate)
+            writeCandidate(opts.agentOptions, decision.candidate)
+            pushSubagentCreate(opts)
+            try {
+              const retry = origCreate.call(this, opts)
+              if (retry && typeof retry.then === 'function') {
+                return Promise.resolve(retry).then((value) => value, (err2) => recover(err2, true))
+              }
+              return retry
+            } catch (err2) {
+              if (/already exists/i.test(String(err2?.message || err2))) return fail(err, asyncFailure)
+              return recover(err2, asyncFailure)
+            } finally {
+              popSubagentCreate()
+            }
+          }
+          pushSubagentCreate(opts)
+          try {
+            const result = origCreate.call(this, opts)
+            if (result && typeof result.then === 'function') return Promise.resolve(result).then((value) => value, (err) => recover(err, true))
+            return result
+          } catch (err) {
+            return recover(err, false)
+          } finally {
+            popSubagentCreate()
+          }
+        }
+        ctx.effect(() => () => {
+          if (agents[SUBAGENT_CREATE_SYM] && agents[SUBAGENT_CREATE_SYM].generation === myCreateGen) agents.create = origCreate
+        })
+      }
+    } catch {}
+    try {
       const sess = ctx.get('sessions')
       if (sess && typeof sess.prepare === 'function') {
         let prepState = sess[PREPARE_SYM]
@@ -2345,36 +3257,78 @@ export function apply(ctx, rawConfig) {
         const orig = prepState.orig
         const wrapped = function (id, opts) {
           let prepared
+          let subVerdict = null
           try {
             const s = slot
             const stack = new Error().stack || ''
             const inDispatchContext = Boolean(s && dispatchAls.getStore() === s)
             const reqKind = httpAls.getStore()
-            const verdict = evaluateRelayPrepare(id, opts, s, { inDispatchContext, reqKind, stack })
-            let injectedParent = 'none'
-            if (verdict.ok && s) {
-              const cleanOpts = { ...opts }
-              delete cleanOpts.relay
-              delete cleanOpts.initiator
-              delete cleanOpts.source
-              const cleanMeta = { ...opts.meta, parentSession: s.parent }
-              delete cleanMeta.initiator
-              delete cleanMeta.source
-              delete cleanMeta.client
-              s.used = true
-              s.sessionId = id
-              injectedParent = s.parent
-              opts = { ...cleanOpts, meta: cleanMeta }
-              void attachChildToWorkspace(ctx, id, s.parent, cleanMeta.cwd || s.cwd)
+            const frame = peekSubagentCreate()
+            const owned = frame && frame.sessionId === id ? frame : null
+            const savedCtx = (opts && opts.__subagentCtx) || (owned && owned.__subagentCtx) || {}
+            const ctxInfo = {
+              inDispatchContext,
+              reqKind,
+              stack,
+              slot: s,
+              now: typeof config.now === 'function' ? config.now() : Date.now(),
+              rpGuardianActive: detectRpGuardian(ctx) || savedCtx.rpGuardianActive === true,
+              pinnedCandidate: (opts && opts.__subagentPinned) || (owned && owned.__subagentPinned) || undefined,
+              kimiBridgeUp: savedCtx.kimiBridgeUp,
             }
-            logParent(
-              `prepare gen=${myGen} id=${id || '?'} slot=${verdict.slotStatus} cwdMatch=${verdict.cwdMatch} ` +
-              `result=${verdict.ok ? 'inject' : 'reject'} reason=${verdict.reason} parentSession=${injectedParent}`
-            )
+            subVerdict = evaluateSubagentPrepare(id, opts, ctxInfo)
+            if (subVerdict.action === 'rewrite') {
+              applySubagentRoute(opts, subVerdict, (owned && owned.agentOptions) || (opts && opts.agentOptions))
+              const parent = subVerdict.parentSession
+              const cwd = (opts && opts.meta && opts.meta.cwd) || (s && s.cwd)
+              void attachChildToWorkspace(ctx, id, parent, cwd)
+              const prompt = (opts && (opts.prompt || opts.task)) || (opts && opts.meta && (opts.meta.prompt || opts.meta.title)) || ''
+              if (prompt) scheduleTitle(id, prompt, '')
+              logParent(
+                `subagent-free gen=${myGen} id=${id || '?'} action=rewrite provider=${opts && opts.provider} model=${opts && opts.model} ` +
+                `reasoningEffort=${(opts && opts.reasoningEffort) || '-'} origin=subagent-free parentSession=${parent || 'none'} reason=${subVerdict.reason}`
+              )
+            } else if (subVerdict.action === 'fail-open') {
+              logParent(`subagent-free gen=${myGen} id=${id || '?'} action=fail-open reason=all-unhealthy parentInherited=1 origin=parent parentSession=${subVerdict.parentSession || 'none'}`)
+            }
+            const runRelay = !subVerdict || subVerdict.reason === 'not-subagent' || (subVerdict.reason === 'relay-slot' && subVerdict.depth < 1)
+            if (runRelay) {
+              const verdict = evaluateRelayPrepare(id, opts, s, ctxInfo)
+              let injectedParent = 'none'
+              if (verdict.ok && s) {
+                const cleanOpts = { ...opts }
+                delete cleanOpts.relay
+                delete cleanOpts.initiator
+                delete cleanOpts.source
+                const cleanMeta = { ...opts.meta, parentSession: s.parent }
+                delete cleanMeta.initiator
+                delete cleanMeta.source
+                delete cleanMeta.client
+                s.used = true
+                s.sessionId = id
+                injectedParent = s.parent
+                opts = { ...cleanOpts, meta: cleanMeta }
+                void attachChildToWorkspace(ctx, id, s.parent, cleanMeta.cwd || s.cwd)
+              }
+              logParent(
+                `prepare gen=${myGen} id=${id || '?'} slot=${verdict.slotStatus} cwdMatch=${verdict.cwdMatch} ` +
+                `result=${verdict.ok ? 'inject' : 'reject'} reason=${verdict.reason} parentSession=${injectedParent}`
+              )
+            }
           } catch (err) {
             logParent(`prepare gen=${myGen} id=${id || '?'} slot=error cwdMatch=false result=reject reason=error:${(err && err.message) || err} parentSession=none`)
           }
-          prepared = orig.call(this, id, opts)
+          try {
+            prepared = orig.call(this, id, opts)
+          } catch (err) {
+            if (opts && opts.meta && opts.meta.origin === 'subagent-free' && /origin must be/.test(String(err && err.message || err))) {
+              opts.meta.origin = 'subagent'
+              opts.meta.freeOrigin = 'subagent-free'
+              prepared = orig.call(this, id, opts)
+            } else {
+              throw err
+            }
+          }
           // Session.prepare currently persists only a fixed header subset and freezes
           // prepared.header via Object.freeze(). Attach the immutable manifest onto a
           // WeakMap / symbol or extensible target without mutating a frozen header object.
@@ -2511,6 +3465,8 @@ export function apply(ctx, rawConfig) {
       cleanArgs.permissionPreset = args.permissionPreset
       cleanArgs.confirmedDangerousPermission = args.confirmedDangerousPermission
     }
+    // 最后一道闸：read-only / start_review 绝不把 writeScope 送给 start_run。
+    if (toolName === TOOL_START_REVIEW || cleanArgs.permissionPreset === 'read-only') delete cleanArgs.writeScope
     args = cleanArgs
 
     const run = async () => {
@@ -2601,20 +3557,26 @@ export function apply(ctx, rawConfig) {
     return parseResult(result)
   }
 
-  async function runPluginReloads(plugins, agent, hasFailures) {
+  async function runPluginReloads(plugins, agent, hasFailures, { beforeReload, afterReload, beforeSelfReload } = {}) {
     const names = normalizeReloadPlugins(plugins)
     if (!names.length) return ''
     if (disposed) return `reload_pending: ${names.join(', ')}`
     if (hasFailures || activePipelines.size > 1) return `reload_pending: ${names.join(', ')}`
     const results = []
-    for (const pkg of [...names.filter((p) => p !== 'dsh-relay-dispatch'), ...names.filter((p) => p === 'dsh-relay-dispatch')]) {
+    const ordered = [...names.filter((p) => p !== 'dsh-relay-dispatch'), ...names.filter((p) => p === 'dsh-relay-dispatch')]
+    for (const pkg of ordered) {
+      if (pkg === 'dsh-relay-dispatch' && beforeSelfReload) await beforeSelfReload()
+      if (beforeReload) await beforeReload(pkg)
       try {
         const result = await tools.execute({ callId: `relay-dispatch-reload-${Date.now()}-${++seq}`, name: 'dev_reload_package', arguments: { packageName: pkg, package: pkg, name: pkg }, ...(agent ? { agent } : {}), signal: new AbortController().signal })
         const parsed = parseResult(result)
         if (parsed?.ok === false || parsed?.success === false) throw new Error(parsed.error || 'reload rejected')
         results.push(`${pkg}(ok)`)
+        try { reloadPluginByName(ctx, pkg) } catch {}
+        if (afterReload) await afterReload(pkg, true)
       } catch (err) {
         results.push(`${pkg}(failed:${clip(String(err?.message || err), 80)})`)
+        if (afterReload) await afterReload(pkg, false)
       }
     }
     return `reloaded: ${results.join(', ')}`
@@ -2642,6 +3604,7 @@ export function apply(ctx, rawConfig) {
   }
 
   async function startPipelineV2(args, exec, jobs, restored = null) {
+    if (disposed) throw new Error('relay_dispatch plugin disposed')
     const agent = exec && exec.agent
     const sessionId = agent?.session?.header?.id || null
     const faultPath = join(config.manifestDir || join(homedir(), '.dsh', 'relay-pipelines'), '.dispatcher-fault.json')
@@ -2667,7 +3630,7 @@ export function apply(ctx, rawConfig) {
     try {
       const expanded = restored ? args : expandTargets(args, { targets })
       expansionNotes = expanded.targetWriteScope?.length ? ['targets 展开含工作区外 writeScope；权限按既有规则升级'] : []
-      plan = restored ? { ...restored.plan, tasks: restored.plan.tasks.map((t) => ({ ...t, dependsOn: new Set(Array.isArray(t.dependsOn) ? t.dependsOn : []) })) } : preflightDispatchV2(expanded, { ...config, currentSessionId: agent?.session?.header?.id }, { modes, aliases: aliases || {}, roots: roots || {}, hosts, mechCommands, targets })
+      plan = restored ? { ...restored.plan, gate: restored.plan.gate ? { ...restored.plan.gate, commands: Array.isArray(restored.plan.gate.commands) ? restored.plan.gate.commands : [], checks: Array.isArray(restored.plan.gate.checks) ? restored.plan.gate.checks : [] } : restored.plan.gate, tasks: restored.plan.tasks.map((t) => ({ ...t, dependsOn: new Set(Array.isArray(t.dependsOn) ? t.dependsOn : []) })) } : preflightDispatchV2(expanded, { ...config, currentSessionId: agent?.session?.header?.id }, { modes, aliases: aliases || {}, roots: roots || {}, hosts, mechCommands, targets })
     } catch (err) { recordFault(err); throw err }
     if (plan.followUp) bumpStat('dispatch.followup.started')
     if (plan.tasks.some((t) => t.inferredScope?.readRoots?.length)) bumpStat('dispatch.scope_inferred')
@@ -2676,6 +3639,7 @@ export function apply(ctx, rawConfig) {
     const manifestPath = join(pipelineManifestDir(), `${pipelineId}.json`)
     const parentSessionId = restored ? (restored.parentSessionId || null) : ((agent && agent.session && agent.session.header && agent.session.header.id) || null)
     const createdAt = restored ? restored.createdAt : new Date().toISOString()
+    const preservedOriginalJobId = restored ? (restored.originalJobId || restored.jobId || null) : null
     let capabilityIds = null
     try { capabilityIds = await getCapabilityIdsV2(exec) } catch (e) { notes.push(`list_capabilities 失败，未过滤候选：${(e && e.message) || e}`) }
     const restoredItems = new Map((restored?.items || []).filter((item) => item.kind !== 'gate').map((item) => [item.index, item]))
@@ -2693,15 +3657,23 @@ export function apply(ctx, rawConfig) {
     })
     let jobId
     let finalRead = null
-    let pipelinePhase = 'running'
+    let pipelinePhase = ['completed', 'cancelled', 'superseded'].includes(restored?.phase) ? restored.phase : 'running'
+    let finishedAt = restored?.finishedAt
+    let reloadedPlugins = [...(restored?.reloadedPlugins || [])]
+    let parentWakeDelivered = restored?.parentWakeDelivered === true
+    let parentWakeArmed = false
     let pipelineResultHeader = V2_MACHINE_HEADER
     let cancelPipeline = () => {}
     const disposeCancel = (reason) => cancelPipeline(reason)
     const manifest = () => ({
       machineHeader: pipelineResultHeader,
       phase: pipelinePhase,
+      finishedAt,
+      reloadedPlugins: reloadedPlugins.length ? reloadedPlugins : undefined,
       pipelineId,
       jobId,
+      originalJobId: preservedOriginalJobId || jobId,
+      parentWakeDelivered,
       parentSessionId,
       createdAt,
       plan: { ...plan, tasks: plan.tasks.map((t) => ({ ...t, dependsOn: [...(t.dependsOn || [])] })) },
@@ -2726,10 +3698,34 @@ export function apply(ctx, rawConfig) {
       if (config.writeManifest === false) return
       try {
         mkdirSync(dirname(manifestPath), { recursive: true })
+        const body = manifest()
+        if (body.parentWakeDelivered !== true && existsSync(manifestPath)) {
+          try {
+            const prev = JSON.parse(readFileSync(manifestPath, 'utf8'))
+            if (prev?.pipelineId === pipelineId && prev.parentWakeDelivered === true) {
+              body.parentWakeDelivered = true
+              parentWakeDelivered = true
+            }
+          } catch {}
+        }
         const tmp = `${manifestPath}.tmp`
-        writeFileSync(tmp, JSON.stringify(manifest(), null, 2))
+        writeFileSync(tmp, JSON.stringify(body, null, 2))
         renameSync(tmp, manifestPath)
       } catch {}
+    }
+    const detachPipeline = () => {
+      if (!['completed', 'cancelled', 'superseded', 'detached'].includes(pipelinePhase)) {
+        pipelinePhase = 'detached'
+        writeManifest()
+      }
+    }
+    // Register before the first asynchronous capability/start call, not only once
+    // jobs.start begins. This closes the startup window of the reload lifecycle.
+    pendingPipelines.add(detachPipeline)
+    if (disposed) {
+      pendingPipelines.delete(detachPipeline)
+      detachPipeline()
+      throw new Error('relay_dispatch plugin disposed')
     }
     const modelNote = () => `实际使用：${items.map((i) => i.model).filter(Boolean).join(', ') || '(待定)'}（pipeline ${pipelineId}）` + (notes.length ? '；' + notes.join('；') : '')
 
@@ -2884,10 +3880,12 @@ export function apply(ctx, rawConfig) {
           if (cancelled) return
           cancelled = true
           const detachOnly = disposed || isDisposeCancelReason(reason)
-          // 先落 detached 清单，再让本地 job 以 reported 结算。kill 会重入本函数，cancelled 已置位。
+          // 先落 detached 清单，再让本地 job 以 reported 结算。若流水线已进入终态则不得回退为 detached。
           if (detachOnly) {
-            pipelinePhase = 'detached'
-            writeManifest()
+            if (!['completed', 'cancelled', 'detached'].includes(pipelinePhase)) {
+              pipelinePhase = 'detached'
+              writeManifest()
+            }
             if (jobId) quietDisposedJob(jobs, jobId, agent)
           }
           try { abort.abort(reason || 'cancelled') } catch {}
@@ -2902,6 +3900,7 @@ export function apply(ctx, rawConfig) {
           }
         }
         activePipelines.set(pipelineId, disposeCancel)
+        pendingPipelines.delete(detachPipeline)
         const snapshotText = () => {
           const lines = [V2_MACHINE_HEADER, `pipeline_id: ${pipelineId}`, 'state: running']
           for (const item of items) {
@@ -2909,14 +3908,34 @@ export function apply(ctx, rawConfig) {
           }
           return lines.join('\n')
         }
+        const armParentWake = () => {
+          if (parentWakeArmed || cancelled || disposed) return
+          parentWakeArmed = true
+          scheduleParentFollowupWake(agent, preservedOriginalJobId || jobId, {
+            onDelivered() {
+              parentWakeDelivered = true
+              writeManifest()
+            },
+          })
+        }
         const finish = (r) => {
           activePipelines.delete(pipelineId)
-          // 热重载只结束旧实例的本地等待：保留 detached 清单供新实例接管，不能发假完成通知。
-          if (disposed || pipelinePhase === 'detached') return { ...r, status: 'killed' }
-          pipelinePhase = 'completed'
+          if (pipelinePhase === 'detached' || (disposed && pipelinePhase !== 'completed' && pipelinePhase !== 'failed')) return { ...r, status: 'killed' }
+          if (disposed) {
+            if ((pipelinePhase === 'completed' || pipelinePhase === 'failed') && parentWakeDelivered !== true) {
+              parentWakeDelivered = false
+              if (!finishedAt) finishedAt = Date.now()
+              writeManifest()
+            }
+            return { ...r, status: 'killed' }
+          }
+          if (r?.status === 'failed') pipelinePhase = 'failed'
+          else if (pipelinePhase !== 'failed' && pipelinePhase !== 'cancelled') pipelinePhase = 'completed'
+          if (!finishedAt) finishedAt = Date.now()
+          if ((pipelinePhase === 'completed' || pipelinePhase === 'failed') && parentWakeDelivered !== true) parentWakeDelivered = false
           finalRead = `${pipelineResultHeader}\n${r.output || ''}\n${modelNote()}`
           writeManifest()
-          if (!cancelled) scheduleOwnerWake(agent, jobId)
+          if (!cancelled) armParentWake()
           return r
         }
         const done = (async () => {
@@ -3083,8 +4102,16 @@ export function apply(ctx, rawConfig) {
                 const beforeFix = targetItem.beforeGit || await captureGitTree(target.workspace)
                 try {
                   const fixTask = `请就地修复上一轮交付缺口，不扩大需求范围。以下为 Gate 完整审查结论（尤其处理所有[不通过]项）：\n${findings}`
+                  const actualModel = targetItem.model || (target.candidates?.[0] && `${target.candidates[0].provider}/${target.candidates[0].model}`)
+                  const [actualProvider, ...modelParts] = String(actualModel || '').split('/')
+                  const actualModelName = modelParts.join('/')
+                  const modelArgs = actualProvider && actualModelName ? {
+                    ...(Object.hasOwn(target.baseArgs, 'provider') ? {} : { provider: actualProvider }),
+                    ...(Object.hasOwn(target.baseArgs, 'model') ? {} : { model: actualModelName }),
+                  } : {}
                   const rawFixArgs = fillStartArgs({
                     ...target.baseArgs,
+                    ...modelArgs,
                     task: fixTask,
                     sessionMode: 'latest-idle',
                     sessionId: targetItem.sessionId,
@@ -3136,6 +4163,12 @@ export function apply(ctx, rawConfig) {
 
           const failedN = items.filter((i) => i.status === 'failed').length
           const succN = items.filter((i) => i.status === 'succeeded').length
+          const detachOnly = disposed || isDisposeCancelReason(abort.signal.reason)
+          if (detachOnly && !['completed', 'failed', 'superseded'].includes(pipelinePhase)) {
+            pipelinePhase = 'detached'
+            writeManifest()
+            return { status: 'killed', output: `pipeline ${pipelineId} detached` }
+          }
           const isCancelled = cancelled || abort.signal.aborted
           const taskItems = items.filter((i) => i.kind === 'task')
           const allTasksSucceeded = taskItems.length > 0 && taskItems.every((i) => i.status === 'succeeded')
@@ -3150,11 +4183,66 @@ export function apply(ctx, rawConfig) {
           }
           const needsMainAttention = result === 'PASS' ? 'no' : 'yes'
           if (plan.followUp) bumpStat(`dispatch.followup.${result === 'PASS' ? 'passed' : 'failed'}`)
+          pipelinePhase = isCancelled ? 'cancelled' : (failedN > 0 ? 'failed' : 'completed')
+          finishedAt = Date.now()
+          if ((pipelinePhase === 'completed' || pipelinePhase === 'failed') && parentWakeDelivered !== true) parentWakeDelivered = false
+          pipelineResultHeader = `${V2_MACHINE_HEADER} | RESULT: ${result} | needs_main_attention: ${needsMainAttention} | self_review: ${gateSelfReview ? 1 : 0} | gate_kind: ${gateItem?.gateKind || (plan.gate ? 'llm' : 'none')}${plan.followUpOf ? ` | followup_of=${plan.followUpOf}` : ''}`
+          writeManifest()
           await flushBeforeColdWake(parentSessionId)
-          let reloadSummary = await runPluginReloads(args.reloadPlugins ?? restored?.plan?.reloadPlugins, agent, failedN > 0 || isCancelled || items.some((i) => i.reloadPending))
+          if (disposed || isDisposeCancelReason(abort.signal.reason)) {
+            if (!['completed', 'failed', 'cancelled'].includes(pipelinePhase)) pipelinePhase = 'detached'
+            writeManifest()
+            return { status: 'killed', output: `pipeline ${pipelineId} detached` }
+          }
+          const reloadNames = normalizeReloadPlugins(args.reloadPlugins ?? restored?.plan?.reloadPlugins)
+          const hasFailures = failedN > 0 || isCancelled || items.some((i) => i.reloadPending)
+          if (!hasFailures && activePipelines.size <= 1) {
+            pipelinePhase = isCancelled ? 'cancelled' : (failedN > 0 ? 'failed' : 'completed')
+            finishedAt = Date.now()
+            if ((pipelinePhase === 'completed' || pipelinePhase === 'failed') && parentWakeDelivered !== true) parentWakeDelivered = false
+            writeManifest()
+          }
+          const willSelfReload = !hasFailures && activePipelines.size <= 1 && reloadNames.includes('dsh-relay-dispatch')
+          if (willSelfReload) {
+            const prelim = formatPipelineSummary({
+              pipelineId,
+              gate: plan.gate,
+              gateUserAsk: plan.gate ? plan.gate.userAsk : undefined,
+              items,
+              reloaded: '',
+              phase: pipelinePhase,
+              machineHeader: pipelineResultHeader,
+            }, config.maxResultChars, { slim: result === 'PASS' && needsMainAttention === 'no', brief: result !== 'PASS' || needsMainAttention !== 'no' })
+            finalRead = `${pipelineResultHeader}\n${prelim}\n${modelNote()}`
+          }
+          const reloadSummary = await runPluginReloads(reloadNames, agent, hasFailures, {
+            async beforeSelfReload() {
+              parentWakeDelivered = false
+              if (!finishedAt) finishedAt = Date.now()
+              if (!['completed', 'failed', 'cancelled'].includes(pipelinePhase)) pipelinePhase = failedN > 0 ? 'failed' : 'completed'
+              writeManifest()
+              scheduleParentFollowupWake(agent, preservedOriginalJobId || jobId, {
+                onDelivered() { parentWakeDelivered = true; writeManifest() },
+              })
+              parentWakeArmed = true
+            },
+            beforeReload(pkg) {
+              if (pkg === 'dsh-relay-dispatch') {
+                reloadedPlugins = [...new Set([...reloadedPlugins, pkg])]
+                if (!disposed) writeManifest()
+              }
+            },
+            afterReload(pkg) {
+              if (disposed) return
+              reloadedPlugins = [...new Set([...reloadedPlugins, pkg])]
+              writeManifest()
+            },
+          })
+          if (disposed || isDisposeCancelReason(abort.signal.reason)) {
+            return { status: 'killed', output: `pipeline ${pipelineId} self-reload` }
+          }
           if (reloadSummary.startsWith('reload_pending:')) items.forEach((i) => { i.reloadPending = true })
           writeManifest()
-          pipelineResultHeader = `${V2_MACHINE_HEADER} | RESULT: ${result} | needs_main_attention: ${needsMainAttention} | self_review: ${gateSelfReview ? 1 : 0} | gate_kind: ${gateItem?.gateKind || (plan.gate ? 'llm' : 'none')}${plan.followUpOf ? ` | followup_of=${plan.followUpOf}` : ''}`
           // 机器头只由 buildDelivery/finalRead 添加一次，output 保持正文，避免 detail 重复两行 RESULT。
           const output = formatPipelineSummary({
             pipelineId,
@@ -3187,7 +4275,7 @@ export function apply(ctx, rawConfig) {
         writeFileSync(previousPath, JSON.stringify(previous, null, 2))
       } catch (err) { emitWarn(`[relay-dispatch] followUp 父清单关联失败：${String(err?.message || err)}`) }
     }
-    return {
+    const dispatched = applyDispatchExplanation(args, exec, {
       jobId,
       pipelineId,
       tasks: plan.tasks.length,
@@ -3195,7 +4283,50 @@ export function apply(ctx, rawConfig) {
       note: `已创建 v2 流水线（${plan.tasks.length} 个任务${plan.gate ? ' + gate' : ''}，onWriteConflict=${plan.onWriteConflict}）。清单：${manifestPath}`,
       manifestPath,
       machineHeader: V2_MACHINE_HEADER,
-      ...(args.conclude === true ? { concludeReason: await finishConclude(exec, notes, config.concludeFence) } : {}),
+    })
+    if (args.conclude === true) dispatched.concludeReason = await finishConclude(exec, notes, config.concludeFence)
+    return dispatched
+  }
+
+  /** 自重载会清掉本实例的唤醒定时器；新实例补投最近 120s 内已完成/失败但尚未送达的父会话唤醒。 */
+  function deliverPendingParentWakes() {
+    if (disposed || config.parentWakeRecovery === false) return
+    let names = []
+    try { names = readdirSync(pipelineManifestDir()).filter((n) => n.endsWith('.json') && !n.startsWith('.')) } catch { return }
+    const cutoff = Date.now() - (config.parentWakeWindowMs ?? DEFAULTS.parentWakeWindowMs)
+    for (const name of names) {
+      try {
+        const manifestFile = join(pipelineManifestDir(), name)
+        const restoredWake = JSON.parse(readFileSync(manifestFile, 'utf8'))
+        if (!['completed', 'failed'].includes(restoredWake.phase) || restoredWake.parentWakeDelivered === true || activePipelines.has(restoredWake.pipelineId)) continue
+        const stamp = parseTimeMs(restoredWake.finishedAt) ?? parseTimeMs(restoredWake.updatedAt) ?? 0
+        if (stamp < cutoff) continue
+        const parent = restoredWake.parentSessionId
+        const agents = ctx.get('agents')
+        const owner = parent && agents && typeof agents.get === 'function' ? agents.get(parent) : undefined
+        if (!owner || typeof owner !== 'object') continue
+        const wakeId = restoredWake.originalJobId || restoredWake.jobId || restoredWake.pipelineId
+        const text = `${restoredWake.machineHeader || V2_MACHINE_HEADER}\npipeline_id: ${restoredWake.pipelineId}\nphase: ${restoredWake.phase}\njobId: ${wakeId}`
+        const settle = () => {
+          try {
+            const latest = JSON.parse(readFileSync(manifestFile, 'utf8'))
+            if (latest.parentWakeDelivered === true) return
+            latest.parentWakeDelivered = true
+            latest.updatedAt = new Date().toISOString()
+            const tmp = `${manifestFile}.tmp`
+            writeFileSync(tmp, JSON.stringify(latest, null, 2))
+            renameSync(tmp, manifestFile)
+          } catch (err) { emitWarn(`[relay-dispatch] parent wake flag 写入失败：${String(err?.message || err)}`) }
+        }
+        if (hasPendingInbox(owner) || (owner.status && owner.status !== 'idle')) {
+          if (!hasPendingInbox(owner)) sendSessionNotice(ctx, owner, text, `pipeline ${restoredWake.pipelineId}`)
+          scheduleParentFollowupWake(owner, wakeId, { onDelivered: settle })
+          continue
+        }
+        if (sendSessionNotice(ctx, owner, text, `pipeline ${restoredWake.pipelineId}`)) settle()
+      } catch (err) {
+        emitWarn(`[relay-dispatch] 补投父会话唤醒失败 ${name}：${String(err?.message || err)}`)
+      }
     }
   }
 
@@ -3209,7 +4340,7 @@ export function apply(ctx, rawConfig) {
     for (const name of names) {
       try {
         const restored = JSON.parse(readFileSync(join(pipelineManifestDir(), name), 'utf8'))
-        if (restored.phase !== 'detached' || !restored.plan || activePipelines.has(restored.pipelineId)) continue
+        if (!['detached', 'running'].includes(restored.phase) || !restored.plan || activePipelines.has(restored.pipelineId)) continue
         if ((parseTimeMs(restored.updatedAt || restored.createdAt) ?? 0) < cutoff) continue
         const parent = restored.parentSessionId
         const agents = ctx.get('agents')
@@ -3224,6 +4355,7 @@ export function apply(ctx, rawConfig) {
         emitWarn(`[relay-dispatch] 读取分离流水线 ${name} 失败：${String((err && err.message) || err)}`)
       }
     }
+    deliverPendingParentWakes()
   }
   const resumeTimer = setTimeout(resumeDetachedPipelines, config.resumeDelayMs ?? DEFAULTS.resumeDelayMs)
   resumeTimer.unref?.()
@@ -3247,7 +4379,8 @@ export function apply(ctx, rawConfig) {
         mode: { type: 'string', description: 'investigate/implement/verify/review/heavy/rp/uncensored' },
         review: { type: 'boolean', description: 'true 用 start_review（只读）' },
         maxWaitMinutes: { type: 'integer', description: '最长等待分钟，默认 240' },
-        conclude: { type: 'boolean', description: '同一步已写出最终回复文字时设为 true；派发成功且 context_compact 同步成功后结束本轮，省去后续一步' },
+        conclude: { type: 'boolean', description: '重要：使用 conclude:true 时，必须在同一步 tool_call 之前同时输出简短的 assistant 正文回复向用户说明本次派发干什么；summary 字段作为兜底同步展示。同一步已写出最终回复文字时设为 true；派发成功且 context_compact 同步成功后结束本轮，省去后续一步' },
+        summary: { type: 'string', description: '简短说明本次派发干什么；conclude:true 时若当步没有 assistant 正文，会以独立助手消息写入当前对话兜底展示后再结束本轮' },
         targets: { type: 'array', items: { type: 'string' }, description: '声明式插件套件宏；自动展开同步、机械 Gate、writeScope 与 reloadPlugins' },
         tasks: { type: 'array', description: '多任务；每项 {startArgs?,mode?,review?,label?,workspace/task/provider/model/writeScope}，与顶层 startArgs 合并', items: { type: 'object', additionalProperties: true, properties: {} } },
         specFile: { type: 'string', description: '规格文件；预检存在并给 task/Gate 拼指针，支持 @ws/@dsh/@plugins/yaml roots 宏' },
@@ -3264,12 +4397,7 @@ export function apply(ctx, rawConfig) {
     },
     output: {
       schema: { type: 'object', additionalProperties: true, properties: {} },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.pipelineId
-          ? `OK pipelineId=${value.pipelineId} jobId=${value.jobId}${value.concludeReason ? ` conclude skipped: ${value.concludeReason}` : ''}`
-          : `OK runId=${value.runId} jobId=${value.jobId}${value.concludeReason ? ` conclude skipped: ${value.concludeReason}` : ''}`,
-      }],
+      render: (_args, value) => [{ type: 'text', text: renderDispatchText(value) }],
     },
     async execute(args, exec) {
       const jobs = ctx.get('jobs')
@@ -3591,7 +4719,9 @@ export function apply(ctx, rawConfig) {
           }
         },
       })
-      return { jobId, runId, model: used, note: modelNote, ...(webUrl ? { webUrl } : {}), ...(args.conclude === true ? { concludeReason: await finishConclude(exec, notes, config.concludeFence) } : {}) }
+      const dispatched = applyDispatchExplanation(args, exec, { jobId, runId, model: used, note: modelNote, ...(webUrl ? { webUrl } : {}) })
+      if (args.conclude === true) dispatched.concludeReason = await finishConclude(exec, notes, config.concludeFence)
+      return dispatched
     },
   }))
 
@@ -3599,4 +4729,13 @@ export function apply(ctx, rawConfig) {
     if (disposed) return
     reconcileStrayChildSessions(ctx, config).catch(() => {})
   })
+  try {
+    const loader = (ctx && ctx.loader) || (typeof ctx.get === 'function' ? ctx.get('loader') : undefined)
+    if (loader && typeof ctx.get === 'function' && ctx.get('clientModules')) {
+      const timer = setTimeout(() => {
+        try { reloadPluginByName(ctx, '@dsh-external/dsh-relay-dispatch') } catch {}
+      }, 80)
+      if (typeof timer.unref === 'function') timer.unref()
+    }
+  } catch {}
 }

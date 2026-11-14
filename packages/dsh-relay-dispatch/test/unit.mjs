@@ -25,6 +25,9 @@ const w = fillStartArgs({ workspace: 'W', task: 't', permissionPreset: 'danger-f
 assert.deepEqual(w.writeScope, ['W']); assert.equal(w.confirmedDangerousPermission, true); assert.equal(w.provider, 'cursor'); assert.equal(w.agentPreset, 'standard-lean')
 assert.equal(fillStartArgs({ workspace: 'W', agentPreset: 'standard' }, { ...D, defaultAgentPreset: 'z' }).agentPreset, 'standard')
 assert.equal(fillStartArgs({ workspace: 'W', permissionPreset: 'workspace-write' }, D, true).writeScope, undefined)
+assert.equal(fillStartArgs({ workspace: 'W', model: 'grok-4.7-fast' }, D).reasoningEffort, 'xhigh')
+assert.equal(fillStartArgs({ workspace: 'W', model: 'grok-4.7-fast', reasoningEffort: 'high' }, D).reasoningEffort, 'high')
+assert.equal(fillStartArgs({ workspace: 'W', model: 'other' }, D).reasoningEffort, undefined)
 const external = fillStartArgs({ workspace: 'C:\\work', permissionPreset: 'workspace-write', contextReadScope: ['C:\\work', 'C:\\work\\agent\\.dsh'], writeScope: ['src', 'C:\\work\\agent\\.dsh\\plugins'] }, D)
 assert.equal(external.permissionPreset, 'danger-full-access')
 assert.deepEqual(external.writeScope, ['src', 'C:\\work\\agent\\.dsh\\plugins'])
@@ -103,7 +106,7 @@ await assert.rejects(() => t3.run({ mode: 'x', startArgs: { workspace: 'W', task
 // 无 mode 向后兼容
 let t4 = mk(() => okRes({ runId: 'r4' }), yp)
 r = await t4.run({ startArgs: { workspace: 'W', task: 'T' } })
-assert.equal(r.model, 'copilot/claude-sonnet-5.5'); assert.equal(t4.calls[0].arguments.task, 'T')
+assert.equal(r.model, 'cursor/grok-4.7-fast'); assert.equal(t4.calls[0].arguments.task, 'T')
 // 热读：改文件后同一实例立即生效
 writeFileSync(yp, Y1.replace('a/m1', 'a/hot'))
 let t5 = mk((c) => c.name.endsWith('list_capabilities') ? okRes({}) : okRes({ runId: 'r5' }), yp)
@@ -155,6 +158,7 @@ console.log('classify ok')
   assertGeminiSchema(dispatchTool.parameters)
   assert(visited > 10, '递归断言必须覆盖嵌套 Schema')
   assert.equal(Object.keys(dispatchTool.parameters.properties).filter((key) => key === 'reloadPlugins').length, 1)
+  assert.equal(dispatchTool.parameters.properties.summary?.type, 'string', 'Gemini strict schema must expose summary in properties')
   console.log('gemini schema ok')
 }
 
@@ -1585,17 +1589,17 @@ import { execFileSync } from 'node:child_process'
 
   // 临时索引快照包含未提交改动，但不污染真实 index / 工作树。
   const repo = mkdtempSync(join(tmpdir(), 'relay-v2-git-'))
-  execFileSync('git', ['init', '-q'], { cwd: repo })
+  execFileSync('git', ['-c', 'safe.directory=*', 'init', '-q'], { cwd: repo, env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_CONFIG'))) })
   writeFileSync(join(repo, 'a.txt'), 'one')
   const before = await captureGitTree(repo)
   assert(before.available && /^[0-9a-f]{40}$/.test(before.tree))
-  assert(execFileSync('git', ['status', '--short'], { cwd: repo, encoding: 'utf8' }).includes('?? a.txt'))
+  assert(execFileSync('git', ['status', '--short'], { cwd: repo, encoding: 'utf8', env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_CONFIG'))) }).includes('?? a.txt'))
   writeFileSync(join(repo, 'a.txt'), 'two')
   const after = await captureGitTree(repo)
   const gd = await diffGitTrees(repo, before, after)
   assert(gd.available && gd.changed && gd.files.includes('a.txt'))
   assert.notEqual(before.tree, after.tree)
-  assert(execFileSync('git', ['status', '--short'], { cwd: repo, encoding: 'utf8' }).includes('?? a.txt'))
+  assert(execFileSync('git', ['status', '--short'], { cwd: repo, encoding: 'utf8', env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_CONFIG'))) }).includes('?? a.txt'))
   const nonGit = await captureGitTree(dir)
   assert.equal(nonGit.available, false)
 
@@ -1607,6 +1611,7 @@ import { execFileSync } from 'node:child_process'
     const ctx = {
       effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d); return d },
       get(k) {
+        if (k === 'agents' && cfg.parentAgent) return { get: (id) => id === cfg.parentAgent.id ? cfg.parentAgent : undefined }
         if (k === 'jobs') return {
           start(spec) {
             const rec = { id: `job-v2-${jobs.length + 1}`, spec }
@@ -1836,6 +1841,97 @@ import { execFileSync } from 'node:child_process'
     resumed.dispose()
   }
 
+  // 旧代异常消失后遗留 phase=running：新一代沿用 runId，按拓扑继续剩余任务和 Gate，并唤醒父会话。
+  {
+    writeFileSync(yp, 'verify:\n  permission: read-only\n  models:\n    - c/m3\n')
+    const remote = new Map([['legacy-running', { runId: 'legacy-running', status: 'running' }]])
+    const parent = {
+      id: 'parent-running-resume', status: 'idle',
+      session: { header: { id: 'parent-running-resume' }, events: [] },
+      inbox: { nextStep: [], nextTurn: [] },
+      followUps: [],
+      followup(msg) { this.followUps.push(msg); this.inbox.nextStep.push(msg) },
+    }
+    const resumed = makeV2Env(async (c) => {
+      if (c.name.endsWith('list_capabilities')) return okRes(capsV2)
+      if (c.name.endsWith('start_run')) {
+        const id = c.arguments.task.includes('verdict: pass') ? 'legacy-gate' : 'legacy-downstream'
+        remote.set(id, { runId: id, status: 'running' })
+        return okRes({ runId: id, sessionId: `s-${id}` })
+      }
+      if (c.name.endsWith('wait_run')) {
+        const snap = remote.get(c.arguments.runId) || { runId: c.arguments.runId, status: 'succeeded' }
+        snap.status = 'succeeded'
+        return okRes({ ...snap, assistantText: c.arguments.runId === 'legacy-gate' ? 'verdict: pass' : `done-${c.arguments.runId}` })
+      }
+      return okRes({})
+    }, { maxConcurrentTasks: 1, resumeDelayMs: 5, wakeDelayMs: 200, wakePollMs: 5, wakeMaxChecks: 8, parentAgent: parent })
+    const manifestPath = join(dir, 'legacy-running.json')
+    const runningManifest = {
+      pipelineId: 'legacy-running', phase: 'running', parentSessionId: parent.id,
+      jobId: 'relay-dispatch-204',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      plan: {
+        hasTasks: true, onWriteConflict: 'error', gate: { criteria: 'C', userAsk: 'U' },
+        tasks: [
+          { index: 0, label: 'A', review: false, writable: false, workspace: 'W', dependsOn: [], baseArgs: { workspace: 'W', task: 'A', provider: 'a', model: 'm1', permissionPreset: 'read-only' }, candidates: [{ provider: 'a', model: 'm1' }] },
+          { index: 1, label: 'B', review: false, writable: false, workspace: 'W', dependsOn: [0], baseArgs: { workspace: 'W', task: 'B', provider: 'a', model: 'm1', permissionPreset: 'read-only' }, candidates: [{ provider: 'a', model: 'm1' }] },
+        ],
+      },
+      items: [
+        { index: 0, kind: 'task', label: 'A', status: 'running', runId: 'legacy-running' },
+        { index: 1, kind: 'task', label: 'B', status: 'pending', dependsOn: [0] },
+      ],
+    }
+    writeFileSync(manifestPath, JSON.stringify(runningManifest, null, 2))
+    // The fixture emulates a previous generation with no in-memory activePipelines.
+    for (let i = 0; i < 150 && !resumed.jobs[0]?.outcome; i++) await new Promise((r) => setTimeout(r, 5))
+    assert(resumed.jobs[0]?.outcome, 'phase=running must be resumed')
+    assert.equal(startsOf(resumed).length, 2, `only downstream task and gate may start: ${JSON.stringify(resumed.calls.map((c) => c.name))}\n${resumed.jobs[0]?.outcome?.detail || ''}\n${readFileSync(manifestPath, 'utf8')}`)
+    assert.equal(resumed.calls.filter((c) => c.name.endsWith('wait_run') && c.arguments.runId === 'legacy-running').length > 0, true)
+    const doneMf = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    assert.equal(doneMf.phase, 'completed')
+    assert.equal(doneMf.originalJobId, 'relay-dispatch-204')
+    assert.equal(doneMf.jobId, resumed.jobs[0].id)
+    assert.notEqual(doneMf.jobId, doneMf.originalJobId)
+    assert.deepEqual(doneMf.items.slice(0, 2).map((i) => i.status), ['succeeded', 'succeeded'])
+    assert.equal(doneMf.items[2].verdict, 'pass')
+    assert.equal(doneMf.items[1].runId, 'legacy-downstream')
+    // Host onJobDone normally queues the notice before scheduleParentFollowupWake.
+    // The minimal V2 harness has no notification service, so seed that exact pending notice.
+    parent.inbox.nextStep.push({ id: `notice-${doneMf.jobId}`, role: 'user', content: [{ type: 'text', text: resumed.jobs[0].outcome.detail }] })
+    for (let i = 0; i < 50 && parent.followUps.length === 0; i++) await new Promise((r) => setTimeout(r, 2))
+    assert.equal(parent.followUps.length, 1, 'completion must wake the restored parent session')
+    resumed.dispose()
+  }
+
+  // 自重载丢掉唤醒定时器后，新实例仍要按 originalJobId 补投父会话。
+  {
+    const parent = {
+      id: 'parent-wake-reload', status: 'idle',
+      session: { header: { id: 'parent-wake-reload' }, events: [] },
+      inbox: { nextStep: [], nextTurn: [] },
+      followUps: [],
+      followup(msg) { this.followUps.push(msg) },
+    }
+    const manifestPath = join(dir, 'p-reload-wake.json')
+    writeFileSync(manifestPath, JSON.stringify({
+      pipelineId: 'p-reload-wake', phase: 'completed', parentWakeDelivered: false,
+      finishedAt: Date.now(), updatedAt: new Date().toISOString(),
+      jobId: 'relay-dispatch-216', originalJobId: 'relay-dispatch-204',
+      parentSessionId: parent.id, machineHeader: 'relay_dispatch_v2: 1 | RESULT: PASS',
+      plan: { tasks: [] }, items: [],
+    }, null, 2))
+    const env = makeV2Env(async () => okRes({}), { resumeDelayMs: 5, parentAgent: parent, wakeDelayMs: 1, wakePollMs: 1, wakeMaxChecks: 2 })
+    for (let i = 0; i < 40 && parent.followUps.length === 0; i++) await new Promise((r) => setTimeout(r, 5))
+    assert.equal(parent.followUps.length, 1, 'self-reload must still wake the parent')
+    assert.match(parent.followUps[0].content[0].text, /relay-dispatch-204/)
+    const saved = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    assert.equal(saved.parentWakeDelivered, true)
+    assert.equal(saved.phase, 'completed')
+    env.dispose()
+  }
+
   // 纯机械门通过：不创建 LLM Gate；cmd 必须解析真实 node:test 计数。
   {
     const env = makeV2Env(async (c) => {
@@ -1870,6 +1966,7 @@ import { execFileSync } from 'node:child_process'
     const res = await env.run({ tasks: [{ startArgs: { workspace: 'W', task: 'T', permissionPreset: 'read-only' } }], gate: { userAsk: 'U', criteria: 'C' } })
     for (let i = 0; i < 100; i++) { const mf = JSON.parse(readFileSync(res.manifestPath, 'utf8')); if (mf.items[1]?.runId === 'gate-detach') break; await new Promise((r) => setTimeout(r, 2)) }
     env.dispose(); await env.jobs[0].done; finishGate = true
+    assert.equal(JSON.parse(readFileSync(res.manifestPath, 'utf8')).phase, 'detached', readFileSync(res.manifestPath, 'utf8'))
     const before = starts
     const resumed = makeV2Env(handler, { resumeDelayMs: 5 })
     for (let i = 0; i < 150 && !resumed.jobs[0]?.outcome; i++) await new Promise((r) => setTimeout(r, 5))
@@ -2022,6 +2119,126 @@ import { execFileSync } from 'node:child_process'
     delete globalThis[Symbol.for('dsh.context-compact.hooks.v1')]
   }
 
+  // 自重载前先落 completed；新实例恢复时不得再次跑批或重载。
+  {
+    const selfDir = mkdtempSync(join(tmpdir(), 'relay-self-reload-'))
+    let tool
+    let manifestPath
+    let reloadCalls = 0
+    const jobs = []
+    const disposers = []
+    const snapshots = []
+    const injector = { reload(pkg) {
+      reloadCalls++
+      const state = JSON.parse(readFileSync(manifestPath, 'utf8'))
+      snapshots.push(state)
+      assert.equal(pkg, 'dsh-relay-dispatch')
+      assert.equal(state.phase, 'completed')
+      assert.equal(typeof state.finishedAt, 'number')
+      assert(state.reloadedPlugins.includes('dsh-relay-dispatch'))
+    } }
+    const ctx = {
+      injector,
+      effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d); return d },
+      get(k) { if (k === 'jobs') return { start(spec) { const rec = { hooks: spec.run(), done: null }; rec.done = rec.hooks.done; jobs.push(rec); return 'job-self-reload' } } },
+      tools: { register(t) { tool = t }, execute: async (c) => {
+        if (c.name.endsWith('start_run')) return okRes({ runId: 'r-self-reload', sessionId: 's-self-reload' })
+        if (c.name.endsWith('wait_run')) return okRes({ runId: 'r-self-reload', status: 'succeeded', assistantText: 'done' })
+        if (c.name === 'dev_reload_package') { injector.reload(c.arguments.packageName); return okRes({ ok: true }) }
+        return okRes(capsV2)
+      } },
+    }
+    apply(ctx, { modesPath: yp, linkParentSession: false, refreshTitle: false, manifestDir: selfDir, sliceMs: 1, resumeDelayMs: 10000 })
+    const accepted = await tool.execute({ tasks: [{ startArgs: { workspace: 'W', task: 'T', permissionPreset: 'read-only' } }], reloadPlugins: ['dsh-relay-dispatch'] }, { agent: { session: { header: { id: 'parent-self-reload' } } } })
+    manifestPath = accepted.manifestPath
+    await jobs[0].done
+    assert.equal(reloadCalls, 1)
+    assert.equal(snapshots[0].phase, 'completed')
+
+    // 模拟新实例的 resumeDetachedPipelines：completed 清单必须被忽略。
+    let resumedJobs = 0
+    let resumedReloads = 0
+    const resumed = {
+      effect(fn) { return fn() },
+      get(k) { if (k === 'jobs') return { start() { resumedJobs++; return 'unexpected' } } },
+      tools: { register() {}, execute: async (c) => { if (c.name === 'dev_reload_package') resumedReloads++; return okRes({}) } },
+    }
+    apply(resumed, { modesPath: yp, linkParentSession: false, refreshTitle: false, manifestDir: selfDir, resumeDelayMs: 1 })
+    await new Promise((resolve) => setTimeout(resolve, 15))
+    assert.equal(resumedJobs, 0)
+    assert.equal(resumedReloads, 0)
+    while (disposers.length) await disposers.pop()()
+  }
+
+  // 自重载先唤醒再卸载；新实例必须把 parentWakeDelivered 补成 true，且不重开流水线。
+  {
+    const wakeDir = mkdtempSync(join(tmpdir(), 'relay-wake-reload-'))
+    const parent = {
+      id: 'parent-wake-reload',
+      status: 'idle',
+      session: { header: { id: 'parent-wake-reload' }, events: [] },
+      inbox: { nextStep: [{ id: 'pending-wake', content: [{ type: 'text', text: 'pipeline done' }] }], nextTurn: [] },
+      followUps: [],
+      followup(msg) { this.followUps.push(msg) },
+    }
+    const agents = new Map([[parent.id, parent]])
+    const reloadOrder = []
+    let tool
+    let manifestPath
+    const jobs = []
+    const disposers = []
+    const ctx = {
+      effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d); return d },
+      get(k) {
+        if (k === 'jobs') return { start(spec) { const rec = { hooks: spec.run(), done: null }; rec.done = rec.hooks.done; jobs.push(rec); return 'relay-dispatch-204' } }
+        if (k === 'agents') return { get: (id) => agents.get(id) }
+      },
+      tools: { register(t) { tool = t }, execute: async (c) => {
+        if (c.name.endsWith('start_run')) return okRes({ runId: 'r-wake-reload', sessionId: 's-wake-reload' })
+        if (c.name.endsWith('wait_run')) return okRes({ runId: 'r-wake-reload', status: 'succeeded', assistantText: 'done' })
+        if (c.name === 'dev_reload_package') {
+          reloadOrder.push(c.arguments.packageName)
+          if (c.arguments.packageName === 'dsh-relay-dispatch') {
+            while (disposers.length) { const d = disposers.pop(); try { d() } catch {} }
+          }
+          return okRes({ ok: true })
+        }
+        return okRes(capsV2)
+      } },
+    }
+    apply(ctx, { modesPath: yp, linkParentSession: false, refreshTitle: false, manifestDir: wakeDir, sliceMs: 1, resumeDelayMs: 60000, wakeDelayMs: 60000 })
+    const accepted = await tool.execute({ tasks: [{ startArgs: { workspace: 'W', task: 'T', permissionPreset: 'read-only' } }], reloadPlugins: ['dsh-relay-dispatch', 'dsh-tool-gate'] }, { agent: parent })
+    manifestPath = accepted.manifestPath
+    await jobs[0].done
+    assert.deepEqual(reloadOrder, ['dsh-tool-gate', 'dsh-relay-dispatch'])
+    const mid = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    assert.equal(mid.phase, 'completed')
+    assert.equal(mid.jobId, 'relay-dispatch-204')
+    assert.equal(mid.originalJobId, 'relay-dispatch-204')
+    assert.notEqual(mid.parentWakeDelivered, true)
+    assert.equal(parent.followUps.length, 0, '旧实例的唤醒定时器必须随自重载一起取消')
+
+    let resumedJobs = 0
+    const resumedDisposers = []
+    const resumed = {
+      effect(fn) { const d = fn(); if (typeof d === 'function') resumedDisposers.push(d); return d },
+      get(k) {
+        if (k === 'jobs') return { start() { resumedJobs++; return 'relay-dispatch-216' } }
+        if (k === 'agents') return { get: (id) => agents.get(id) }
+      },
+      tools: { register() {}, execute: async () => okRes({}) },
+    }
+    apply(resumed, { modesPath: yp, linkParentSession: false, refreshTitle: false, manifestDir: wakeDir, resumeDelayMs: 1, wakeDelayMs: 5, wakePollMs: 5, wakeMaxChecks: 4, parentWakeWindowMs: 120000 })
+    for (let i = 0; i < 40 && (parent.followUps.length === 0 || JSON.parse(readFileSync(manifestPath, 'utf8')).parentWakeDelivered !== true); i++) await new Promise((resolve) => setTimeout(resolve, 5))
+    const after = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    assert.equal(after.parentWakeDelivered, true)
+    assert.equal(after.originalJobId, 'relay-dispatch-204')
+    assert.equal(after.jobId, 'relay-dispatch-204')
+    assert.equal(resumedJobs, 0, 'completed 清单不得被 resume 成新 job')
+    assert.equal(parent.followUps.length, 1)
+    while (resumedDisposers.length) await resumedDisposers.pop()()
+  }
+
   // 单任务路径失败时只报告 reload_pending，不调用热重载。
   {
     let tool
@@ -2037,6 +2254,107 @@ import { execFileSync } from 'node:child_process'
     const out = await jobs[0].done
     assert.equal(calls.filter((c) => c.name === 'dev_reload_package').length, 0)
     assert(out.detail.includes('reload_pending: dsh-tool-gate'))
+  }
+
+  // reloadPluginByName：disabled + pkgMeta 负缓存不得把 client 行删成 404；无 fiber 时保留原行。
+  {
+    const { reloadPluginByName } = await import('../lib/index.js')
+    const pkg = '@dsh-external/dsh-relay-dispatch'
+    const entry = {
+      id: 'relay-dispatch',
+      disabled: true,
+      fiber: { state: 1 },
+      options: { name: pkg, disabled: true },
+      parent: { data: [{ id: 'relay-dispatch', name: pkg, disabled: true }] },
+    }
+    const table = new Map()
+    const pkgMeta = new Map([[pkg, null]])
+    let composed = 0
+    let notified = 0
+    const cm = {
+      table,
+      pkgMeta,
+      processOne(entryName) {
+        const qualifies = entry.options.name === entryName && entry.fiber != null && !entry.disabled && entry.options.disabled == null
+        if (!qualifies) return table.delete(entryName)
+        if (table.has(entryName)) return false
+        if (pkgMeta.get(entryName) === null) return false
+        const meta = pkgMeta.has(entryName) ? pkgMeta.get(entryName) : { clientPath: 'C:/relay/lib/client.js' }
+        if (meta == null) return false
+        table.set(entryName, { clientPath: meta.clientPath, entry: { id: entryName } })
+        return true
+      },
+      compose() { composed++; return { rev: 'ok', entries: [...table.values()].map((row) => row.entry) } },
+      notifyGraphChanged() { notified++ },
+    }
+    const ctx = { loader: { entries: () => [entry] }, get(k) { return k === 'clientModules' ? cm : undefined } }
+    const refreshed = reloadPluginByName(ctx, 'dsh-relay-dispatch')
+    assert.equal(entry.disabled, false)
+    assert.equal(entry.options.disabled, undefined)
+    assert.equal(entry.parent.data[0].disabled, undefined)
+    assert.equal(pkgMeta.has(pkg), false)
+    assert.equal(table.get(pkg).clientPath, 'C:/relay/lib/client.js')
+    assert.equal(composed, 1)
+    assert.equal(notified, 1)
+    assert.equal(refreshed.changed, true)
+    const kept = reloadPluginByName(ctx, pkg)
+    assert.equal(table.has(pkg), true)
+    assert.equal(kept.changed, false)
+    assert.equal(composed, 1)
+    entry.fiber = undefined
+    const duringDispose = reloadPluginByName(ctx, pkg)
+    assert.equal(table.has(pkg), true)
+    assert.equal(duringDispose.reason, 'no-live-entry')
+  }
+
+  // reloadPlugins 成功后必须走 reloadPluginByName，把 client 行补回去。
+  {
+    const pkg = '@dsh-external/dsh-relay-dispatch'
+    const entry = {
+      id: 'relay-dispatch',
+      disabled: true,
+      fiber: {},
+      options: { name: pkg, disabled: true },
+      parent: { data: [{ id: 'relay-dispatch', disabled: true }] },
+    }
+    const table = new Map()
+    const pkgMeta = new Map([[pkg, null]])
+    const cm = {
+      table,
+      pkgMeta,
+      processOne(entryName) {
+        const qualifies = entry.options.name === entryName && entry.fiber != null && !entry.disabled && entry.options.disabled == null
+        if (!qualifies) return table.delete(entryName)
+        if (table.has(entryName)) return false
+        if (pkgMeta.get(entryName) === null) return false
+        table.set(entryName, { clientPath: 'C:/relay/lib/client.js' })
+        return true
+      },
+      compose() { return { entries: [...table.keys()] } },
+      notifyGraphChanged() {},
+    }
+    let tool
+    const jobs = []
+    const ctx = {
+      loader: { entries: () => [entry] },
+      effect(fn) { return fn() },
+      get(k) {
+        if (k === 'jobs') return { start(spec) { const rec = { hooks: spec.run(), done: null }; rec.done = rec.hooks.done; jobs.push(rec); return 'job-client-row' } }
+        if (k === 'clientModules') return cm
+      },
+      tools: { register(t) { tool = t }, execute: async (c) => {
+        if (c.name.endsWith('start_run')) return okRes({ runId: 'r-client-row' })
+        if (c.name.endsWith('wait_run')) return okRes({ runId: 'r-client-row', status: 'succeeded', assistantText: 'done' })
+        if (c.name === 'dev_reload_package') return okRes({ ok: true })
+        return okRes(capsV2)
+      } },
+    }
+    apply(ctx, { modesPath: yp, linkParentSession: false, refreshTitle: false, manifestDir: dir, sliceMs: 1, resumeDelayMs: 60000 })
+    await tool.execute({ tasks: [{ startArgs: { workspace: 'W', task: 'T', permissionPreset: 'read-only' } }], reloadPlugins: ['dsh-relay-dispatch'] }, { agent: { session: { header: { id: 'parent-client-row' } } } })
+    await jobs[0].done
+    assert.equal(entry.disabled, false)
+    assert.equal(pkgMeta.has(pkg), false)
+    assert.equal(table.has(pkg), true)
   }
 
   const slim = (await import('../lib/index.js')).formatPipelineSummary({ pipelineId: 'slim', gateUserAsk: 'ask '.repeat(100), items: [{ index: 0, kind: 'task', status: 'succeeded', model: 'a/m1', output: 'summary: done', git: { available: true, files: ['a.js'] } }, { index: 1, kind: 'gate', status: 'succeeded', verdict: 'pass', output: 'verdict: pass\nall good' }] }, 2000, { slim: true })
@@ -2074,7 +2392,7 @@ import { execFileSync } from 'node:child_process'
     const out = await env.jobs[0].done
     assert.equal(startsOf(env).length, 1)
     assert.equal(startsOf(env)[0].arguments.sessionId, 'child')
-    assert.equal(startsOf(env)[0].arguments.sessionMode, 'latest-idle')
+    assert.equal(startsOf(env)[0].arguments.sessionMode, undefined)
     assert.equal(out.status, 'completed')
     assert(out.detail.includes('RESULT: PASS') && out.detail.includes('followup_of=p-fail'))
     const child = JSON.parse(readFileSync(res.manifestPath, 'utf8'))
@@ -2122,6 +2440,83 @@ console.log('v2 ok')
   assert(source.includes('paintBilling(dialog, latestBill, cumulativeBill)'))
   assert(!source.includes('setCost(el, dot(ctxCost))'), '圆环不得再按窗口 Token 估算金额')
   console.log('billing ok')
+}
+
+// 本轮实付按用户回合聚合：最近一条 user/message / turn/start 之后所有 LLM 步 usage 求和，多步显示步数。
+{
+  const { readFileSync } = await import('node:fs')
+  const vm = await import('node:vm')
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  let clientExports
+  const sandbox = { window: { __ModuleLoader__: { load: ({ factory }) => { clientExports = factory((id) => { throw new Error(`unexpected require: ${id}`) }) } } } }
+  vm.runInNewContext(source, sandbox)
+  const { billingBuckets, billingTotal, billingUsd, sumBillingBuckets, turnUsageEvents, usageOfEvent } = clientExports.billingInternals
+
+  // usageOfEvent：assistant/chunk usage 与 assistant/message usage 两种载体
+  assert.equal(usageOfEvent({ type: 'assistant/chunk', data: { chunk: { type: 'usage', usage: { inputTokens: 1 } } } }).inputTokens, 1)
+  assert.equal(usageOfEvent({ type: 'assistant/message', data: { usage: { inputTokens: 2 } } }).inputTokens, 2)
+  assert.equal(usageOfEvent({ type: 'tool/call', data: { name: 'x' } }), undefined)
+
+  // sumBillingBuckets：多步求和 + steps 计数；各步独立套价（长上下文档位不平均）
+  const stepA = { inputTokens: 20000, cachedInputTokens: 15000, outputTokens: 1000 } // $0.025
+  const stepB = { inputTokens: 5000, cacheReadTokens: 15000, outputTokens: 500, cacheWriteTokens: 100 } // 0.0102+0.006=0.0162
+  const agg = sumBillingBuckets([stepA, stepB])
+  assert.equal(agg.steps, 2)
+  assert.equal(agg.cached, 30000)
+  assert.equal(agg.uncached, 10000)
+  assert.equal(agg.output, 1500)
+  assert.equal(agg.cacheWrite, 100)
+  assert.equal(billingUsd(billingTotal(agg)), '0.044')
+  assert.equal(billingTotal(agg), billingTotal(billingBuckets(stepA)) + billingTotal(billingBuckets(stepB)), '多步合计=各步独立计价之和')
+  // 单步：与单条 billingBuckets 一致（多 steps 字段）
+  const single = sumBillingBuckets([stepA])
+  assert.equal(single.steps, 1)
+  assert.equal(billingTotal(single), billingTotal(billingBuckets(stepA)))
+  // 空数组 / 非法条目
+  assert.equal(sumBillingBuckets([]), null)
+  assert.equal(sumBillingBuckets(null), null)
+  assert.equal(sumBillingBuckets([null, {}]).steps, 1, '空 usage 对象计为一桶全 0 步')
+
+  // turnUsageEvents：只取最近 user/message 之后的 usage；跨用户回合不混入
+  const mkSession = (events) => ({
+    snapshotEvents: () => events,
+  })
+  const sessionsSvc = {
+    binding: (id) => (id === 's1' ? { session: mkSession([
+      { type: 'turn/start', seq: 1 },
+      { type: 'assistant/message', seq: 2, data: { usage: { inputTokens: 100, outputTokens: 10 } } },
+      { type: 'user/message', seq: 3, data: { content: [] } },
+      { type: 'assistant/chunk', seq: 4, data: { chunk: { type: 'usage', usage: { inputTokens: 200, outputTokens: 20 } } } },
+      { type: 'tool/call', seq: 5, data: { name: 'read' } },
+      { type: 'assistant/message', seq: 6, data: { usage: { inputTokens: 300, outputTokens: 30 } } },
+    ]) } : null),
+  }
+  const usages = turnUsageEvents(sessionsSvc, 's1')
+  assert.equal(usages.length, 2, '只统计最近 user/message 之后的 2 条 usage')
+  assert.equal(usages[0].inputTokens, 200)
+  assert.equal(usages[1].inputTokens, 300)
+  const aggTurn = sumBillingBuckets(usages)
+  assert.equal(aggTurn.steps, 2)
+  assert.equal(aggTurn.uncached, 500)
+  assert.equal(aggTurn.output, 50)
+
+  // 无 user/message 时回退到 turn/start 之后
+  const svc2 = { binding: () => ({ session: mkSession([
+    { type: 'user/message', seq: 1, data: {} },
+    { type: 'turn/start', seq: 2 },
+    { type: 'assistant/message', seq: 3, data: { usage: { inputTokens: 50, outputTokens: 5 } } },
+  ]) }) }
+  assert.equal(turnUsageEvents(svc2, 'x').length, 1)
+
+  // 空会话 / 缺服务
+  assert.equal(turnUsageEvents(null, 'x').length, 0)
+  assert.equal(turnUsageEvents(sessionsSvc, 'missing').length, 0)
+
+  // 源码契约：paintCost 走 turnUsageEvents + sumBillingBuckets；多步标签
+  assert(source.includes('sumBillingBuckets(turnUsages)'), '本轮账单必须聚合本轮全部 usage')
+  assert(!source.includes('latestUsageEvent('), '旧的单步 latestUsageEvent 必须移除')
+  assert(source.includes('turnSteps > 1'), '多步时必须显示步数')
+  console.log('turn-agg ok')
 }
 
 
@@ -2372,7 +2767,9 @@ console.log('v2 ok')
   writeFileSync(join(manifestDir, 'p-fail.json'), JSON.stringify(previous))
   const next = preflightFollowUp({ pipelineId: 'p-fail', patchTask: 'repair', patchGate: { llm: 'never', checks: [{ exists: ['C:\\work'] }] } }, { manifestDir, currentSessionId: 'parent' })
   assert.equal(next.tasks[0].baseArgs.sessionId, 'child')
-  assert.equal(next.tasks[0].baseArgs.sessionMode, 'latest-idle')
+  assert.equal(next.tasks[0].baseArgs.sessionMode, undefined)
+  assert.equal(next.tasks[0].previewArgs.sessionId, 'child')
+  assert.equal(next.tasks[0].previewArgs.sessionMode, undefined)
   assert(next.tasks[0].baseArgs.task.includes('failed check'))
   assert.equal(next.gate.llm, 'never')
   assert.throws(() => preflightFollowUp({ pipelineId: 'p-fail' }, { manifestDir }), (e) => e.code === 'DSH_E_FOLLOWUP_FOREIGN')
@@ -2557,11 +2954,271 @@ console.log('v2 ok')
   let clientExports
   const sandbox = { window: { __ModuleLoader__: { load: ({ factory }) => { clientExports = factory(() => { throw new Error('require') }) } } } }
   vm.runInNewContext(source, sandbox)
-  const { eventsOf } = clientExports.sidebarInternals
+  const { eventsOf, hasSidebarRelations, expandTruncatedSidebarGroups, buildSidebarTree } = clientExports.sidebarInternals
+  const truncatedById = {
+    parent: { id: 'parent', origin: 'user', updatedAt: 1 },
+    ...Object.fromEntries(Array.from({ length: 11 }, (_, i) => [`child-${i + 1}`, { id: `child-${i + 1}`, parentId: 'parent', updatedAt: i + 2 }])),
+  }
+  const visibleIds = Array.from({ length: 5 }, (_, i) => `child-${i + 7}`)
+  const allIds = ['parent', ...Array.from({ length: 11 }, (_, i) => `child-${i + 1}`)]
+  let expandClicks = 0
+  const expandButton = { textContent: 'Expand 6', click() { expandClicks++ } }
+  const group = { children: [expandButton] }
+  const rows = visibleIds.map((id) => ({ id }))
+  const expandedGroups = new WeakSet()
+  const didExpand = expandTruncatedSidebarGroups(rows, truncatedById, (el) => el.id, (el) => ({ parentElement: group }), expandedGroups)
+  assert.equal(hasSidebarRelations(visibleIds, truncatedById), true)
+  assert.equal(didExpand, true)
+  assert.equal(expandClicks, 1)
+  assert.equal(expandTruncatedSidebarGroups(rows, truncatedById, (el) => el.id, () => ({ parentElement: group }), expandedGroups), false, '展开必须幂等，避免重渲染循环')
+
+  const parentOfTruncated = (id) => truncatedById[id]?.parentId
+  const tree = buildSidebarTree(allIds, parentOfTruncated, new Set())
+  assert.equal(tree.kids.get('parent').length, 11)
+  assert.equal(tree.hidden.size, 11, '默认折叠时全部子会话必须隐藏')
+  assert.equal(tree.childIds.has('parent'), false, '父会话保持顶层')
+  assert.equal(tree.hidden.has('parent'), false)
+  const openTree = buildSidebarTree(allIds, parentOfTruncated, new Set(['parent']))
+  assert.equal(openTree.hidden.size, 0, '用户展开父会话后子会话可见')
   const usage = { inputTokens: 3, cacheReadTokens: 1, outputTokens: 1 }
   assert.equal(eventsOf({ snapshotEvents() { return [{ type: 'assistant/message', data: { usage } }] } })[0].data.usage, usage)
   assert.equal(eventsOf({ events: [{ type: 'user/message' }] })[0].type, 'user/message')
   assert.deepEqual(eventsOf(null), [])
   assert.equal(reads >= 1, true)
   console.log('sessionEvents sidebar ok')
+}
+
+import { evaluateSubagentPrepare, applySubagentRoute, noteSubagentStartFailure, resetSubagentFreeRouting, markSubagentCandidateUnhealthy, readSubagentFreeAudit } from '../lib/index.js'
+{
+  const plain = (id) => ({ provider: 'anthropic', model: 'claude-opus-4', reasoningEffort: 'low', meta: { delegationDepth: 1, origin: 'subagent', parentSession: 'parent-1', cwd: 'C:/work' }, prompt: id })
+  const modelOf = (v) => `${v.candidate.provider}/${v.candidate.model}`
+  resetSubagentFreeRouting()
+  const first = evaluateSubagentPrepare('sub-1', plain('one'), { now: 1000 })
+  const second = evaluateSubagentPrepare('sub-2', plain('two'), { now: 1000 })
+  assert.equal(first.action, 'rewrite')
+  assert.equal(first.reason, 'primary')
+  assert.equal(second.action, 'rewrite')
+  assert.equal(second.reason, 'primary')
+  assert.equal(modelOf(first), 'cursor/grok-4.7-fast')
+  assert.equal(modelOf(second), 'cursor/grok-4.7-fast')
+  assert.equal(first.candidate.reasoningEffort, 'xhigh')
+  const grokOpts = plain('grok')
+  applySubagentRoute(grokOpts, first)
+  assert.equal(grokOpts.provider, 'cursor')
+  assert.equal(grokOpts.model, 'grok-4.7-fast')
+  assert.equal(grokOpts.reasoningEffort, 'xhigh')
+  assert.equal(grokOpts.meta.origin, 'subagent-free')
+  assert.equal(grokOpts.meta.parentSession, 'parent-1')
+  assert.notEqual(grokOpts.model, 'claude-opus-4')
+
+  const forkOpts = { seed: [{ type: 'user/message' }], provider: 'anthropic', model: 'claude-opus-4', meta: { delegationDepth: 1, origin: 'subagent', parentSession: 'parent-1', seedLength: 1 } }
+  assert.equal(evaluateSubagentPrepare('fork-1', forkOpts, { now: 1000 }).action, 'keep')
+  assert.equal(forkOpts.model, 'claude-opus-4')
+  const relayOpts = { provider: 'cursor', model: 'grok-4.7', reasoningEffort: 'low', meta: { delegationDepth: 1, origin: 'relay-dispatch', parentSession: 'parent-1' } }
+  assert.equal(evaluateSubagentPrepare('relay-1', relayOpts, { now: 1000 }).reason, 'relay-dispatch')
+  assert.equal(relayOpts.model, 'grok-4.7')
+
+  resetSubagentFreeRouting()
+  const slot = { active: true, used: false, createdAt: 0, expiresAt: 5000, cwd: 'C:/ws', parent: 'parent-slot' }
+  assert.equal(evaluateSubagentPrepare('slot-1', { meta: { cwd: 'C:/ws' } }, { slot, now: 10 }).reason, 'relay-slot')
+  const slotPlain = evaluateSubagentPrepare('slot-2', plain('slot'), { now: 10 })
+  assert.equal(slotPlain.candidate.provider, 'cursor')
+  assert.equal(slotPlain.candidate.model, 'grok-4.7-fast')
+  assert.equal(slotPlain.candidate.reasoningEffort, 'xhigh')
+
+  resetSubagentFreeRouting()
+  const sensitive = evaluateSubagentPrepare('rp-1', { provider: 'kimi', model: 'kimi-k3.1-pro', meta: { delegationDepth: 1, origin: 'subagent', parentSession: 'parent-1', cwd: 'C:/Users/mikon/xiaoshuo' } }, { now: 10 })
+  assert.equal(sensitive.reason, 'sensitive')
+  assert.equal(sensitive.candidate.model, 'grok-4.7-fast')
+  assert.equal(sensitive.candidate.reasoningEffort, 'xhigh')
+  assert.equal(evaluateSubagentPrepare('rp-2', { meta: { delegationDepth: 1, origin: 'fork', parentSession: 'parent-1' }, prompt: '苏晚晴' }, { now: 10 }).candidate.provider, 'cursor')
+  assert.equal(evaluateSubagentPrepare('rp-3', plain('mac'), { now: 10, rpGuardianActive: true }).reason, 'sensitive')
+  assert.equal(evaluateSubagentPrepare('rp-4', { meta: { delegationDepth: 1, cwd: 'C:/work/mac-v4-sync', parentSession: 'parent-1' } }, { now: 10 }).candidate.model, 'grok-4.7-fast')
+  const sensFail = noteSubagentStartFailure('rp-1', new Error('HTTP 429 rate limit'), 10)
+  assert.equal(sensFail.retry, true)
+  assert.equal(sensFail.candidate.provider, 'cursor')
+  assert.equal(sensFail.candidate.model, 'grok-4.7-fast')
+  assert.equal(sensFail.candidate.reasoningEffort, 'xhigh')
+
+  resetSubagentFreeRouting()
+  const boom = evaluateSubagentPrepare('boom-1', plain('boom'), { now: 2000 })
+  assert.equal(boom.candidate.provider, 'cursor')
+  assert.equal(boom.candidate.model, 'grok-4.7-fast')
+  assert.equal(boom.candidate.reasoningEffort, 'xhigh')
+  const failed = noteSubagentStartFailure('boom-1', new Error('HTTP 429 rate limit'), 2000)
+  assert.equal(failed.retry, true)
+  assert.equal(failed.candidate.provider, 'kimi')
+  assert.equal(failed.candidate.model, 'kimi-k3.1-pro')
+  assert.equal(evaluateSubagentPrepare('boom-2', plain('next'), { now: 2000 }).candidate.model, 'kimi-k3.1-pro')
+  const recovered = evaluateSubagentPrepare('boom-3', plain('later'), { now: 2000 + 60000 })
+  assert.equal(recovered.candidate.model, 'grok-4.7-fast')
+  assert.equal(recovered.candidate.reasoningEffort, 'xhigh')
+  const kept = evaluateSubagentPrepare('boom-4', plain('keep'), { now: 3000 })
+  assert.equal(kept.candidate.provider, 'kimi')
+  const validation = noteSubagentStartFailure(kept.id, new Error('MCP error -32602: Input validation error: workspace required'), 3000)
+  assert.equal(validation.retry, false)
+  assert.equal(validation.fused, false)
+  assert.equal(evaluateSubagentPrepare('boom-5', plain('still'), { now: 3000 }).candidate.provider, 'kimi')
+
+  resetSubagentFreeRouting()
+  markSubagentCandidateUnhealthy({ provider: 'kimi', model: 'kimi-k3.1-pro' }, 4000)
+  markSubagentCandidateUnhealthy({ provider: 'cursor', model: 'grok-4.7-fast' }, 4000)
+  const open = evaluateSubagentPrepare('open-1', plain('open'), { now: 4000 })
+  assert.equal(open.action, 'fail-open')
+  const inherited = plain('open')
+  applySubagentRoute(inherited, open)
+  assert.equal(inherited.provider, 'anthropic')
+  assert.equal(inherited.model, 'claude-opus-4')
+
+  resetSubagentFreeRouting()
+  const batch = []
+  for (let i = 0; i < 10; i++) {
+    const verdict = evaluateSubagentPrepare(`batch-${i}`, plain(`b${i}`), { now: 5000 })
+    batch.push(verdict)
+    if (i === 4) markSubagentCandidateUnhealthy(verdict.candidate, 5000)
+  }
+  assert.equal(batch.length, 10)
+  const fused = modelOf(batch[4])
+  for (const verdict of batch.slice(5)) {
+    assert.equal(verdict.action, 'rewrite')
+    assert.notEqual(modelOf(verdict), fused)
+  }
+  assert.equal(readSubagentFreeAudit('batch-0').originAudit, 'subagent-free')
+  console.log('subagent-free routing ok')
+}
+
+{
+  const attached = []
+  const titles = []
+  const ids = ['parent-1']
+  const ws = {
+    path: 'C:/work',
+    sessionIds: ids,
+    async attachSession(id) { attached.push(id); if (!ids.includes(id)) ids.push(id) },
+    async insertSessionBefore() {},
+  }
+  const prepared = new Map()
+  const sessions = {
+    prepare(id, opts) { prepared.set(id, opts); return { id, header: { id, ...(opts && opts.meta) } } },
+    get(id) { return id === 'child-free' ? { header: { id }, events: [{ type: 'user/message' }, { type: 'request/header' }] } : undefined },
+    list() { return [] },
+  }
+  const disposers = []
+  const ctx = {
+    effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d); return d },
+    get(k) {
+      if (k === 'sessions') return sessions
+      if (k === 'workspaceRegistry') return { list: () => [ws] }
+      if (k === 'sessionTitle') return { rename(_session, title) { titles.push(title) } }
+      return undefined
+    },
+    tools: { register() { return () => {} } },
+  }
+  apply(ctx, {
+    modesPath: yp,
+    parentLogPath: join(dir, 'subagent-free.log'),
+    linkParentSession: true,
+    refreshTitle: true,
+    llmTitle: false,
+    titlePollFirstMs: 10,
+    titlePollIntervalMs: 10,
+    titlePollMaxAttempts: 2,
+    resumeDelayMs: 600000,
+  })
+  resetSubagentFreeRouting()
+  sessions.prepare('child-free', {
+    provider: 'anthropic',
+    model: 'claude-opus-4',
+    prompt: '读路由实现',
+    meta: { delegationDepth: 1, origin: 'subagent', parentSession: 'parent-1', cwd: 'C:/work' },
+  })
+  const saved = prepared.get('child-free')
+  assert.equal(saved.model, 'grok-4.7-fast', saved.model)
+  assert.equal(saved.reasoningEffort, 'xhigh')
+  assert.notEqual(saved.model, 'claude-opus-4')
+  assert.equal(saved.meta.origin, 'subagent-free')
+  assert.equal(saved.meta.parentSession, 'parent-1')
+  assert.equal(readSubagentFreeAudit('child-free').originAudit, 'subagent-free')
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.ok(attached.includes('child-free'), 'child should be attached under the parent workspace')
+  assert.ok(titles.some((title) => title.includes('读路由')))
+  while (disposers.length) disposers.pop()()
+  console.log('subagent-free sidebar ok')
+}
+
+{
+  const { applyDispatchExplanation, finishConclude, renderDispatchText, sessionEvents } = await import('../lib/index.js')
+  const toolOnly = () => ({ type: 'assistant/message', turn: 1, step: 1, data: { message: { content: [{ type: 'tool-call', id: 'r', name: 'relay_dispatch' }] } } })
+  const frozenSession = (earlier = []) => {
+    const log = [...earlier, { type: 'step/start' }, toolOnly()]
+    let appends = 0
+    const session = {
+      get events() { return Object.freeze(log.slice()) },
+      snapshotEvents() { return log.slice() },
+      append(type, data) { appends++; log.push({ type, data }); },
+    }
+    session.appends = () => appends
+    return session
+  }
+  const phase = { turn: 1, step: 1 }
+  const withSummary = frozenSession()
+  let concluded = 0
+  const summaryExec = { agent: { phase, session: withSummary }, concludeTurn() { concluded++ } }
+  const summaryValue = applyDispatchExplanation({ conclude: true, summary: '  去修跨模型 fork  ' }, summaryExec, { runId: 'r1', jobId: 'j1' })
+  assert.equal(await finishConclude(summaryExec), '')
+  assert.equal(concluded, 1)
+  const summaryEvents = sessionEvents(withSummary)
+  const summaryMessages = summaryEvents.filter((e) => e.type === 'assistant/message' && e.data?.message?.content?.some((b) => b.type === 'text' && b.text === '去修跨模型 fork'))
+  assert.equal(summaryMessages.length, 1)
+  // v4 attach-first: summary folds into the open tool-call message (no separate append).
+  assert.equal(withSummary.appends(), 0)
+  assert.equal(Object.isFrozen(withSummary.events), true)
+  assert.match(renderDispatchText({ ...summaryValue, concludeReason: '' }), /^📋 去修跨模型 fork\nOK runId=r1 jobId=j1/)
+
+  const autoSession = frozenSession()
+  const autoExec = { agent: { phase, session: autoSession }, concludeTurn() { concluded++ } }
+  applyDispatchExplanation({ conclude: true, tasks: [{ label: 'gate' }, { label: 'relay' }] }, autoExec, { runId: 'r2', jobId: 'j2' })
+  assert.equal(await finishConclude(autoExec), '')
+  const autoText = sessionEvents(autoSession).flatMap((e) => e.data?.message?.content || []).find((b) => b.type === 'text')?.text
+  assert.equal(autoText, '已派发后台流水线（gate、relay），完成后自动汇报。')
+
+  const visible = [{ type: 'step/start' }, { type: 'assistant/message', turn: 1, step: 1, data: { message: { content: [{ type: 'text', text: '已经说明了' }, { type: 'tool-call', id: 'r', name: 'relay_dispatch' }] } } }]
+  let pushes = 0
+  const visibleSession = { events: visible, append() { pushes++ } }
+  const visibleExec = { agent: { phase, session: visibleSession }, concludeTurn() { concluded++ } }
+  applyDispatchExplanation({ conclude: true, summary: '不要重复' }, visibleExec, { runId: 'r3', jobId: 'j3' })
+  assert.equal(await finishConclude(visibleExec), '')
+  assert.equal(pushes, 0)
+  assert.equal(visible.filter((e) => e.type === 'assistant/message').length, 1)
+  assert.equal(concluded, 3)
+
+  // R2 deep: text in an earlier step must not suppress the current tool-only step's explanation.
+  // (attach-first: the summary folds into the current tool-call message instead of appending a new one)
+  const multiStep = frozenSession([
+    { type: 'step/start', data: { turn: 1, step: 0 } },
+    { type: 'assistant/message', data: { turn: 1, step: 0, message: { role: 'assistant', content: [{ type: 'text', text: 'earlier step' }] } } },
+    { type: 'step/end', data: { turn: 1, step: 0 } },
+  ])
+  const multiExec = { agent: { phase, session: multiStep }, concludeTurn() { concluded++ } }
+  applyDispatchExplanation({ conclude: true, summary: 'current step summary' }, multiExec, { runId: 'r4', jobId: 'j4' })
+  assert.equal(await finishConclude(multiExec), '')
+  assert.equal(multiStep.appends(), 0)
+  const currentStepMessage = multiStep.snapshotEvents().findLast((e) => e.type === 'assistant/message' && e.data?.message?.content?.some((b) => b.type === 'tool-call'))
+  assert.equal(currentStepMessage.data.message.content[0].type, 'text')
+  assert.equal(currentStepMessage.data.message.content[0].text, 'current step summary')
+  assert.equal(Object.isFrozen(multiStep.events), true)
+
+  // R2 deep: followUp is schema-visible and conclude uses the same native message path.
+  const followExec = { agent: { phase, session: frozenSession() }, concludeTurn() { concluded++ } }
+  applyDispatchExplanation({ conclude: true, followUp: { pipelineId: 'p-r2', patchTask: 'retry' }, summary: 'follow-up conclude' }, followExec, { pipelineId: 'p-r2-f1', jobId: 'j5' })
+  assert.equal(await finishConclude(followExec), '')
+  assert.equal(followExec.agent.session.snapshotEvents().at(-1).data.message.content[0].text, 'follow-up conclude')
+
+  // R2 deep: a genuinely frozen v4 events property without append/record fails safely, never throws or corrupts events.
+  const immutableLog = Object.freeze([toolOnly()])
+  const immutable = { snapshotEvents: () => immutableLog.slice() }
+  Object.defineProperty(immutable, 'events', { value: immutableLog, writable: false, configurable: false })
+  assert.doesNotThrow(() => applyDispatchExplanation({ conclude: true, summary: 'cannot append' }, { agent: { phase, session: immutable } }, {}))
+  assert.equal(immutable.snapshotEvents().length, 1)
+  console.log('dispatch summary ok')
 }

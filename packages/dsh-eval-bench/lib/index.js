@@ -999,7 +999,8 @@ export async function evaluateRelayDispatchSuite() {
   )
 
   // 2. Candidate fallback simulation using real `applyRelayDispatch`:
-  //    Candidate 1 (`cursor/claude-opus-5-5`) fails with 429 Rate Limit -> automatically falls back to Candidate 2 (`copilot/claude-sonnet-5.5`).
+  //    Fixture heavy chain, not live BUILTIN_MODES: cursor/claude-opus-5-5 returns 429,
+  //    then copilot/claude-opus-5.5 is accepted.
   const attemptLog = []
   const registeredRelayTools = new Map()
   const startedJobs = []
@@ -1069,7 +1070,7 @@ export async function evaluateRelayDispatchSuite() {
   }
 
   applyRelayDispatch(relayCtx, {
-    modesPath: '__bench_builtin_modes_fallback__.yaml',
+    modesPath: join(FIXTURES_DIR, 'relay-429-modes.yaml'),
     parentLogPath: null,
     linkParentSession: false,
     refreshTitle: false,

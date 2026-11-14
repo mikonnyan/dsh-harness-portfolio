@@ -7,11 +7,9 @@
 
 aliases:
   models:
-    - sonnet=copilot/claude-sonnet-5.5
-    - opus=cursor/claude-opus-5-5
-    - gemini-pro=google/gemini-3.8-pro
-    - gemini-flash=google/gemini-3.8-flash
+    - k3=kimi/kimi-k3.1-pro
     - grok-fast=cursor/grok-4.7-fast
+    - qwen=strata/qwen3.8-flash-next-iq3_s
     - gpt-codex=openai/gpt-5.3-codex
 
 investigate:
@@ -19,8 +17,8 @@ investigate:
   agentPreset: standard-lean
   models:
     - grok-fast
-    - gemini-flash
-    - sonnet
+    - k3
+    - qwen
   taskPrefix: |
     通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
   deliverable: |
@@ -32,9 +30,9 @@ implement:
   permission: danger-full-access
   agentPreset: standard-lean
   models:
-    - sonnet
-    - gpt-codex
-    - opus
+    - k3
+    - grok-fast
+    - qwen
   taskPrefix: |
     通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
   deliverable: |
@@ -50,9 +48,9 @@ verify:
   permission: read-only
   agentPreset: standard-lean
   models:
-    - gemini-pro
-    - gpt-codex
-    - sonnet
+    - k3
+    - grok-fast
+    - qwen
   taskPrefix: |
     通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
     你是独立验证者（Verifier），必须独立执行检查命令与边界核验，不得轻信前序子任务的自述结论。
@@ -67,9 +65,9 @@ review:
   permission: read-only
   agentPreset: standard-lean
   models:
-    - opus
-    - gemini-pro
-    - gpt-codex
+    - k3
+    - grok-fast
+    - qwen
   taskPrefix: |
     通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
     请从架构一致性、并发竞态、故障恢复、安全边界四个维度进行只读代码审查。
@@ -84,9 +82,9 @@ heavy:
   agentPreset: standard-lean
   checkpoint: true
   models:
-    - opus
-    - sonnet
-    - gpt-codex
+    - k3
+    - grok-fast
+    - qwen
   taskPrefix: |
     通用禁令：不重启 DSH；不读 secrets、.credentials.yaml、.env；改文件前先备份；工作区外文件用绝对路径。
   deliverable: |

@@ -1,0 +1,7 @@
+# Fixture for the 429 candidate-chain bench. Production BUILTIN_MODES stay untouched.
+heavy:
+  permission: danger-full-access
+  checkpoint: true
+  models:
+    - cursor/claude-opus-5-5
+    - copilot/claude-opus-5.5

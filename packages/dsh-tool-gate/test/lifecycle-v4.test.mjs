@@ -27,7 +27,7 @@ function summary(h, kind) {
   reg.bySession.set(h.s, rec)
   rec.classBySummarySeq.set(seq, kind)
 }
-const cfg = { ...DEFAULT_CONFIG, hardIdleTurnsCap: 0 }
+const cfg = { ...DEFAULT_CONFIG, hardIdleTurnsCap: 0, groups: { ...DEFAULT_CONFIG.groups, dev: { ...DEFAULT_CONFIG.groups.dev, bypass: false } } }
 
 test('warm append-only L0 never relocks idle groups', () => {
   const h = makeSession(); direct(h); activity(h, 2); activity(h, 3); summary(h, 'append')
@@ -38,14 +38,17 @@ test('warm append-only L0 never relocks idle groups', () => {
   assert.equal(out.state.unlocked.has('dev'), true)
 })
 
-test('L1 rewrite relocks, while once remains single-turn regardless of boundary', () => {
+test('L1 rewrite relocks; once waits for PMW while the cache is warm', () => {
   const h = makeSession(); direct(h); activity(h, 2); activity(h, 3); summary(h, 'rewrite')
   assert.deepEqual(syncLifecycle(h.s, cfg, NOW).relocked, ['dev'])
   const once = makeSession(); once.append('tool/call', { turn: 1, name: 'tool_unlock', arguments: JSON.stringify({ groups: ['dev'], action: 'once' }) })
   activity(once, 1)
   assert.equal(syncLifecycle(once.s, cfg, NOW).state.unlocked.has('dev'), true)
   activity(once, 2); summary(once, 'append')
-  assert.equal(syncLifecycle(once.s, cfg, NOW).state.unlocked.has('dev'), false)
+  const warm = syncLifecycle(once.s, cfg, NOW)
+  assert.equal(warm.state.groupMeta.get('dev')?.pending, true)
+  assert.equal(warm.state.unlocked.has('dev'), true)
+  assert.equal(syncLifecycle(once.s, cfg, NOW + cfg.cacheExpiryMs).state.unlocked.has('dev'), false)
 })
 
 test('assistant activity prevents false cache expiry when request header is unchanged', () => {
@@ -73,11 +76,14 @@ test('v4 tool delta plus append compaction permits REBASE boundary', () => {
   assert.deepEqual(out.relocked, ['dev'])
 })
 
-test('hard cap is explicit and zero disables it', () => {
+test('hard cap is explicit and zero disables it; hot cache forces only when the cost inequality holds', () => {
   const h = makeSession(); direct(h)
   for (let turn = 2; turn <= 12; turn++) activity(h, turn)
   assert.equal(syncLifecycle(h.s, cfg, NOW).state.unlocked.has('dev'), true)
   const forced = makeSession(); direct(forced)
   for (let turn = 2; turn <= 13; turn++) activity(forced, turn)
-  assert.equal(syncLifecycle(forced.s, { ...cfg, hardIdleTurnsCap: 12 }, NOW).state.unlocked.has('dev'), false)
+  assert.equal(syncLifecycle(forced.s, { ...cfg, hardIdleTurnsCap: 12 }, NOW).state.unlocked.has('dev'), true)
+  const priced = makeSession(); direct(priced)
+  for (let turn = 2; turn <= 13; turn++) activity(priced, turn)
+  assert.equal(syncLifecycle(priced.s, { ...cfg, hardIdleTurnsCap: 12, groupSchemaTokens: 10_000, prefixTokens: 1_000, remainingRequests: 100 }, NOW).state.unlocked.has('dev'), false)
 })

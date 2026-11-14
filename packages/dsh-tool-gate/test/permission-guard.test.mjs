@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { compileCapabilityManifest } from '../../dsh-relay-dispatch/lib/index.js'
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 const fixture = mkdtempSync(join(tmpdir(), 'perm-gate-'))
@@ -80,6 +80,14 @@ test('approved loopback gateways and pinned node smoke pass; other ports and arb
   const decision = permissionDecision('pwsh', { command: `node ${smoke}`, workdir: work }, session(), { now: NOW + 1 })
   assert.equal(decision.kind, 'allow'); assert.equal(decision.classification, 'LOOPBACK_SMOKE')
   assert.equal(permissionDecision('pwsh', { command: `node ${join(work, 'other.mjs')}` }, session(), { now: NOW + 1 }).error.reason, 'command_not_statically_verifiable')
+  const bench = join(work, 'grok-effort-bench.js')
+  const benchSrc = new URL('../../kimi-bridge/grok-effort-bench.js', import.meta.url)
+  const benchFallback = new URL('../kimi-bridge/grok-effort-bench.js', import.meta.url)
+  copyFileSync(existsSync(benchSrc) ? benchSrc : benchFallback, bench)
+  const benchDecision = permissionDecision('pwsh', { command: `node ${bench}`, workdir: work }, session(), { now: NOW + 1 })
+  assert.equal(benchDecision.kind, 'allow'); assert.equal(benchDecision.classification, 'SCOPED_EFFORT_BENCH')
+  writeFileSync(bench, 'console.log(1)\n')
+  assert.equal(permissionDecision('pwsh', { command: `node ${bench}`, workdir: work }, session(), { now: NOW + 1 }).error.reason, 'unapproved_node_effort_bench')
   assert.equal(deny('pwsh', { command: 'node -e "fetch(\'http://127.0.0.1:4099\')"' }).error.reason, 'command_not_statically_verifiable')
   assert.equal(deny('pwsh', { command: 'curl http://127.0.0.1:4099/v1' }).error.reason, 'command_not_statically_verifiable')
 })

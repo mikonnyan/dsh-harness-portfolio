@@ -17,14 +17,19 @@ const request = (s, n, time = NOW) => {
   append(s, 'request/header', { header: {}, reason: 'initial' }, s.events.length)
   s.events.at(-1).time = time
 }
-const isOpen = (s, now = NOW) => syncLifecycle(s, DEFAULT_CONFIG, now).state.unlocked.has('dev')
+const implicitCfg = { ...DEFAULT_CONFIG, groups: { ...DEFAULT_CONFIG.groups, dev: { ...DEFAULT_CONFIG.groups.dev, bypass: false } } }
+const isOpen = (s, now = NOW) => syncLifecycle(s, implicitCfg, now).state.unlocked.has('dev')
 
-test('once unlock closes automatically on the following turn', () => {
+test('once unlock stays pending until the prefix mutation window opens', () => {
   const s = session(); turn(s, 1); unlock(s, 'once')
   assert.equal(isOpen(s), true)
   turn(s, 2)
+  const mid = syncLifecycle(s, implicitCfg, NOW)
+  assert.equal(mid.state.groupMeta.get('dev')?.pending, true)
+  assert.equal(mid.state.unlocked.has('dev'), true)
+  request(s, 2, NOW - DEFAULT_CONFIG.cacheExpiryMs - 1)
   assert.equal(isOpen(s), false)
-  assert.equal(syncLifecycle(s, DEFAULT_CONFIG, NOW).state.groupMeta.has('dev'), false)
+  assert.equal(syncLifecycle(s, implicitCfg, NOW).state.groupMeta.has('dev'), false)
 })
 
 test('unregistered compaction/summary is conservatively a rewrite boundary', () => {
@@ -61,12 +66,15 @@ test('explicit unlock uses four idle turns and five-minute expiry', () => {
   assert.equal(isOpen(s, NOW + DEFAULT_CONFIG.cacheExpiryMs), false)
 })
 
-test('twelve idle turns force relock even with a fresh request cache', () => {
+test('hot cache keeps an idle group until PMW; cost inequality can still force it', () => {
   const s = session(); turn(s, 1); direct(s)
-  for (let n = 2; n <= 12; n++) request(s, n)
+  for (let n = 2; n <= 13; n++) request(s, n)
   assert.equal(isOpen(s), true)
-  request(s, 13)
-  assert.equal(isOpen(s), false)
+  assert.equal(syncLifecycle(s, implicitCfg, NOW).state.groupMeta.get('dev')?.pending, true)
+  const priced = session(); turn(priced, 1); direct(priced)
+  for (let n = 2; n <= 13; n++) request(priced, n)
+  const hotCfg = { ...implicitCfg, hardIdleTurnsCap: 12, groupSchemaTokens: 10_000, prefixTokens: 1_000, remainingRequests: 100 }
+  assert.equal(syncLifecycle(priced, hotCfg, NOW).state.unlocked.has('dev'), false)
 })
 
 test('using any group tool refreshes its last-used turn', () => {

@@ -1,14 +1,53 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { isAbsolute, win32 } from 'node:path'
 import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { manifestOf, ARCHETYPE_RANK } from './session-archetype.js'
+import { readPin } from './pin-store.js'
 
+// SELF_FIX / SHELL_BUDGET live in orchestrator-guard.js (A14: zero duplicate export names).
 export const OUT_OF_SCOPE = 'DSH_E_OUT_OF_SCOPE'
-export { SELF_FIX, SHELL_BUDGET } from './orchestrator-guard.js'
 export const HIGH_RISK = 'DSH_HIGH_RISK_APPROVAL_REQUIRED'
 // These are HTTP endpoints, not permission to manage their host processes or reconfigure ports.
 export const DEFAULT_LOOPBACK_PORTS = Object.freeze([3080, 4098, 4141, 4142, 8318])
+
+// ── A8: worker tool surface, split into denied vs control-only ──
+export const WORKER_DENIED_TOOLS = Object.freeze(new Set([
+  'subagent', 'subagent_fork', 'cursor_agent', 'claude_code', 'claude_code_usage',
+  'workflow', 'ralph', 'web_search', 'x_search', 'read_page', 'job_kill',
+]))
+export const WORKER_DENIED_PATTERN = /chrome|connector/
+export const WORKER_CONTROL_ONLY_TOOLS = Object.freeze(new Set([
+  'relay_dispatch', 'tool_unlock', 'update_goal', 'create_goal', 'get_goal',
+  'send_message', 'interrupt_agent', 'list_agents',
+  'dsh_session_read', 'dsh_session_repair', 'dsh_session_search', 'dsh_supervisor_watch_tick',
+]))
+export const WORKER_CONTROL_ONLY_PREFIXES = Object.freeze(['dev_', 'mcp__harness_relay__'])
+
+/**
+ * Single policy-derived worker visibility function (CP-3.5, A8).
+ * hidden = WORKER_DENIED ∪ WORKER_CONTROL_ONLY exactly; exit_plan_mode removed from both.
+ * Fail-open for unknown / child-scoped tools.
+ */
+export function toolVisibleForWorker(toolName, manifest = null, opts = {}) {
+  const name = String(toolName || '')
+  const lower = name.toLowerCase()
+  if (!name) return false
+  if (WORKER_DENIED_TOOLS.has(lower)) return false
+  if (WORKER_CONTROL_ONLY_TOOLS.has(lower)) return false
+  if (WORKER_CONTROL_ONLY_PREFIXES.some((p) => lower.startsWith(p))) return false
+  if (WORKER_DENIED_PATTERN.test(lower)) return false
+  if (opts.narrowReadOnlyWorkerTools === true && manifest && validateCapabilityManifest(manifest, opts.now) === null) {
+    const writeRoots = manifest.write_roots || manifest.write_scope || []
+    if (Array.isArray(writeRoots) && writeRoots.length === 0 && (lower === 'write' || lower === 'edit')) return false
+  }
+  return true
+}
+
 const NODE_SMOKE_SCRIPTS = new Set(['live-gateway-smoke.mjs'])
 const APPROVED_NODE_SMOKE_SHA256 = new Set(['c41df4ec48b14d006321cd7681ffd0dde0780d14fff358382b2639ffdf0bec3c'])
+// Pinned by content hash, same shape as the loopback smoke allow. test-5-models.js is not in this tree.
+const NODE_EFFORT_BENCH_SCRIPTS = new Set(['grok-effort-bench.js'])
+const APPROVED_NODE_EFFORT_BENCH_SHA256 = new Set(['54dc305f7cf2cd2801c143dd23c81aac202b75fa3ee0265d9d9dd4410c306293'])
 const ESCALATION_KEYS = ['sandbox_permissions', 'amend', 'extend', 'escalate']
 const FILE_TOOLS = new Set(['read', 'write', 'edit'])
 const SHELL_TOOLS = new Set(['pwsh', 'bash', 'shell', 'cmd'])
@@ -84,18 +123,9 @@ export function localDeny(reason, manifest, details = {}) {
   return { kind: 'deny', decision: 'DENY_LOCAL', error, reason: JSON.stringify(error) }
 }
 
-export function manifestOf(session) {
-  const h = session?.header || {}
-  const direct = h.capabilityManifest || h.capability_manifest || session?.capabilityManifest || session?.capability_manifest
-  if (direct) return direct
-  const reg = globalThis[Symbol.for('@dsh-external/capability-manifests')]
-  if (reg && typeof reg.get === 'function') {
-    return reg.get(h) || (h.id ? reg.get(h.id) : null) || null
-  }
-  return null
-}
+// manifestOf moved to session-archetype.js (A14); re-exported at the top of this file.
 export function isChildSession(session) {
-  return Boolean(session?.header?.parentSession || manifestOf(session))
+  return Boolean(session?.header?.parentSession || manifestOf(session) || (ARCHETYPE_RANK[readPin(session?.header?.id)?.archetype] ?? 0) >= 2)
 }
 export function validateCapabilityManifest(manifest, now = Date.now()) {
   if (!manifest || manifest.schema_version !== 'capability/v1') return 'missing_or_invalid_manifest'
@@ -263,6 +293,11 @@ function isReadOnlyLoopbackGet(executable, argv) {
   if (['invoke-restmethod', 'irm', 'invoke-webrequest', 'iwr'].includes(executable)) return readOnlyPowerShellHttp(argv) != null
   return false
 }
+export function maskWindowsPaths(command) {
+  return String(command || '')
+    .replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'`<>)]+/g, '<url>')
+    .replace(/(?<![A-Za-z])[A-Za-z]:[\\/][^\s'"]*/g, '<path>')
+}
 export function normalizeCommand(command, cwd) {
   const tokens = tokenizeLiteral(String(command || '').trim())
   if (!tokens) return { risk: 'UNKNOWN', executable: null, argv: [], cwd }
@@ -273,11 +308,13 @@ export function normalizeCommand(command, cwd) {
   const forbidden = protectedCommand([normalized.executable, ...argv])
   if (forbidden) return { ...normalized, risk: 'OUT_OF_SCOPE', ...forbidden }
   if (isReadOnlyLoopbackGet(normalized.executable, argv)) return { ...normalized, risk: 'PORT_PROBE' }
-  const withoutWindowsPaths = command.replace(/[A-Za-z]:[\\/][^\s'"]*/g, '<path>')
+  const withoutWindowsPaths = maskWindowsPaths(command)
   if (DYNAMIC.test(withoutWindowsPaths) || /[*?]/.test(command) && ['remove-item', 'stop-process'].includes(normalized.executable)) return { ...normalized, risk: 'UNKNOWN' }
   if (HIGH_RISK_COMMANDS.test(normalized.executable)) return { ...normalized, risk: 'HIGH_RISK' }
   if (['node', 'npm', 'git'].includes(normalized.executable)) {
-    if (normalized.executable === 'node' && !['--test', '--check'].includes(argv[0]) && !(argv.length === 1 && NODE_SMOKE_SCRIPTS.has(win32.basename(argv[0]).toLowerCase())) && !(argv.length === 1 && /\.mjs$/i.test(argv[0]) && /(?:^|[\\/])(?:unit|[^\\/]+\.test)\.mjs$/i.test(argv[0]))) return { ...normalized, risk: 'UNKNOWN' }
+    const nodeBase = argv.length === 1 ? win32.basename(argv[0]).toLowerCase() : ''
+    const pinnedNode = argv.length === 1 && (NODE_SMOKE_SCRIPTS.has(nodeBase) || NODE_EFFORT_BENCH_SCRIPTS.has(nodeBase))
+    if (normalized.executable === 'node' && !['--test', '--check'].includes(argv[0]) && !pinnedNode && !(argv.length === 1 && /\.mjs$/i.test(argv[0]) && /(?:^|[\\/])(?:unit|[^\\/]+\.test)\.mjs$/i.test(argv[0]))) return { ...normalized, risk: 'UNKNOWN' }
     if (normalized.executable === 'npm') {
       const validPrefixTest = argv[0] === '--prefix' && argv.length === 3 && argv[2] === 'test' && typeof argv[1] === 'string'
       if (argv[0] === 'run' && !(argv.length === 2 && ['check', 'bench'].includes(argv[1]))) return { ...normalized, risk: 'UNKNOWN' }
@@ -390,6 +427,15 @@ export function permissionDecision(toolName, args = {}, session, options = {}) {
       if (!APPROVED_NODE_SMOKE_SHA256.has(digest)) return localDeny('unapproved_node_smoke_script', manifest, { operation: 'shell', path: script })
       return { kind: 'allow', classification: 'LOOPBACK_SMOKE', loopbackPorts: [...DEFAULT_LOOPBACK_PORTS] }
     }
+    if (command.executable === 'node' && command.argv.length === 1 && NODE_EFFORT_BENCH_SCRIPTS.has(win32.basename(command.argv[0]).toLowerCase())) {
+      const script = command.argv[0]
+      const approved = rootsOf(manifest, 'read').some((root) => pathWithinVerified(script, root, cwd))
+      if (!approved) return localDeny('path_outside_read_scope', manifest, { operation: 'shell', path: script })
+      let digest = ''
+      try { digest = sha256(readFileSync(lexicalPath(script, cwd))) } catch {}
+      if (!APPROVED_NODE_EFFORT_BENCH_SHA256.has(digest)) return localDeny('unapproved_node_effort_bench', manifest, { operation: 'shell', path: script })
+      return { kind: 'allow', classification: 'SCOPED_EFFORT_BENCH' }
+    }
     if (command.risk === 'SCOPED_WRITE') {
       const targets = pathArgs(command.executable, command.argv)
       if (!targets.length || targets.some((p) => SENSITIVE.test(p) || !rootsOf(manifest, 'write').some((root) => pathWithinVerified(p, root, cwd)))) return localDeny('command_path_outside_write_scope', manifest, { operation: 'shell' })
@@ -402,6 +448,6 @@ export function permissionDecision(toolName, args = {}, session, options = {}) {
   }
   // Process, network, browser and arbitrary code tools cannot be constrained by
   // this static PEP and therefore fail closed for children.
-  if (/^(?:subagent|subagent_fork|cursor_agent|claude_code|workflow|ralph|web_search|x_search|read_page|job_kill)$/.test(name) || /chrome|connector/.test(name)) return localDeny('tool_not_in_role_boundary', manifest, { tool: toolName })
+  if (WORKER_DENIED_TOOLS.has(name) || WORKER_DENIED_PATTERN.test(name)) return localDeny('tool_not_in_role_boundary', manifest, { tool: toolName })
   return { kind: 'allow' }
 }
