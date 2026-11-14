@@ -10,8 +10,10 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { decideAutoCompact, autoCompactState, noteAutoFailure, autoFailures, observeRequestStats, DEFAULT_MIN_INTERVAL_REQUESTS } from './auto-engine.js'
 import { collectSalience, renderSalienceSections } from './salience.js'
-import { coalesceSummaryBlocks, extractRecallTags } from './coalesce.js'
-import { takeRecallSlot, capRecallText, markAutoCompactSample, noteRecallRebound, closedRecallResults, recallEvictStub, evictRecallBlock, recallTurnOf } from './recall-budget.js'
+import { coalesceSummaryBlocks, extractRecallTags, renderL1, stripTopicTimeline as stripTopicTimelineBlock } from './coalesce.js'
+import { takeRecallSlot, capRecallText, markAutoCompactSample, noteRecallRebound, closedRecallResults, recallEvictStub, evictRecallBlock, recallTurnOf, normalizeRecallKey, evaluateRecallGate, recordRecallCallMeta, getRecallCallMeta, buildRecallBreadcrumbDigest, resolveRouteCachePricing, defaultEstimateRecallTokens, recallFlightKey, markRecallPending, noteRecallRefusal, RECALL_LOOP_LINE } from './recall-budget.js'
+import { sanitizeExplicitTopics, inferSpanTopics, resolveCheckpointTopics, parseHeaderTopics, normalizeTopicName, RECALL_FOLDED_PREFIX_RE, COMPACT_HEADER_TOKEN_RE, rulesHashOfConfig } from './topics.js'
+import { buildCheckpointIndex, executeTopicCatalogRecall, executeSummaryTierRecall, stripTopicTimeline, parseEmbeddedStagesMinimal } from './topic-index.js'
 
 export const name = '@dsh-external/dsh-context-compact'
 // Cordis 4 resolves every inject key as required (array, or a name → config map).
@@ -179,7 +181,7 @@ export function epochRecord(session) {
   }
   return rec
 }
-export function publishPrefixClass(session, summarySeq, prefixClass) {
+export function publishPrefixClass(session, summarySeq, prefixClass, publishNow) {
   const rec = epochRecord(session)
   rec.classBySummarySeq.set(summarySeq, prefixClass)
   const nodes = session?.surface?.nodes
@@ -187,7 +189,17 @@ export function publishPrefixClass(session, summarySeq, prefixClass) {
   if (Number.isFinite(watermark)) {
     for (const seq of [...rec.classBySummarySeq.keys()]) if (typeof seq === 'number' && seq < watermark) rec.classBySummarySeq.delete(seq)
   }
-  if (prefixClass === 'rewrite') rec.pmw = { open: true, reason: 'rewrite', requestSeq: rec.requestClock.requestSeq || 0 }
+  if (prefixClass === 'rewrite') {
+    // C-20: advance the request clock at publish so the PMW window is fresh at this boundary.
+    // `now` is left to the owning publisher (tool-gate passes its own clock); only bump requestSeq.
+    const length = logLength(session)
+    if (rec.requestClock.length !== length) {
+      rec.requestClock.requestSeq = (rec.requestClock.requestSeq || 0) + 1
+      rec.requestClock.length = length
+      if (publishNow !== undefined && !(rec.requestClock.now > 0)) rec.requestClock.now = publishNow
+    }
+    rec.pmw = { open: true, reason: 'rewrite', requestSeq: rec.requestClock.requestSeq || 0 }
+  }
   return rec
 }
 /** One clock per log length, shared with tool-gate through the prefix-epoch registry (R8). */
@@ -195,11 +207,12 @@ export function stampRequestClock(session, now = Date.now()) {
   if (!session) return now
   const rec = epochRecord(session)
   const length = logLength(session)
+  const explicitNow = arguments.length >= 2 && typeof now === 'number' && Number.isFinite(now) && now > 0
   if (rec.requestClock.length !== length) {
     rec.requestClock.requestSeq = (rec.requestClock.requestSeq || 0) + 1
     rec.requestClock.length = length
     rec.requestClock.now = now
-  } else if (!(rec.requestClock.now > 0)) rec.requestClock.now = now
+  } else if (explicitNow || !(rec.requestClock.now > 0)) rec.requestClock.now = now
   return rec.requestClock.now
 }
 
@@ -952,10 +965,88 @@ function checkpointTurnsLabel(ev, events, logInfo) {
   const turns = [...new Set(leaves.map((seq) => logInfo.eventTurnMap.get(seq) ?? 0).filter((t) => t > 0))].sort((a, b) => a - b)
   return formatTurnsLabel(turns)
 }
-function carriedSummaryBlock(ev, events, logInfo) {
+function carriedSummaryBlock(ev, events, logInfo, config = {}) {
   const text = (ev.data?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
-  const inner = text.replace(/^[\s\S]*?<compacted-summary>\s*/i, '').replace(/\s*<\/compacted-summary>[\s\S]*$/i, '').trim()
-  return `[Compact carried turns:${checkpointTurnsLabel(ev, events, logInfo)}] ${inner}`
+  const inner = stripTopicTimelineBlock(text.replace(/^[\s\S]*?<compacted-summary>\s*/i, '').replace(/\s*<\/compacted-summary>[\s\S]*$/i, '').trim())
+  const turnsLabel = checkpointTurnsLabel(ev, events, logInfo)
+  // C-28: topics on the carried header only when topicIndexing is on (I-P3: new nodes only).
+  if (config?.topicIndexing === true) {
+    const topics = resolveCheckpointTopics(session, ev, events, logInfo, config)
+    if (topics.length) return `[Compact carried turns:${turnsLabel} topics:${topics.join(',')}] ${inner}`
+  }
+  return `[Compact carried turns:${turnsLabel}] ${inner}`
+}
+function stripSummaryWrapper(text) {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== SUMMARY_OPEN_TAG && line.trim() !== SUMMARY_CLOSE_TAG)
+    .join('\n')
+    .trim()
+}
+
+function clipTimelineLine(line) {
+  const s = String(line ?? '').replace(/\s+/g, ' ').trim()
+  return Array.from(s).slice(0, 90).join('')
+}
+
+/** C-13/C-23: harvest the chronological sub-span ledger for an L1 merge. */
+function extractSubSpansForMerge(session, events, logInfo, shadowedSeqs, config = {}) {
+  const entries = []
+  const surfaceOrder = new Map((session?.surface?.nodes ?? []).map((seq, i) => [seq, i]))
+  const seenLeafSets = new Set()
+  for (const seq of shadowedSeqs ?? []) {
+    const ev = events[seq]
+    if (!ev || !isSummaryCheckpointEvent(ev)) continue
+    const leaves = resolveLeafSurfaceSeqs(events, [seq])
+    if (!leaves.length) continue
+    const leafKey = leaves.join(',')
+    if (seenLeafSets.has(leafKey)) continue
+    seenLeafSets.add(leafKey)
+    const summarySeq = ev.sourceEventSeqs?.[1]
+    const summaryEvent = events[summarySeq]?.type === 'compaction/summary' ? events[summarySeq] : null
+    const text = extractSummaryText(ev)
+    const stripped = stripTopicTimeline(text)
+    const ownTag = [...stripped.matchAll(/\[recall:\s*(@span:S\d+-\d+(?:\+S\d+-\d+)*(?:\s+turns:[\d,..-]+)?)\]/g)].at(-1)?.[1] ?? null
+    const turnList = [...new Set(leaves.map((s) => logInfo.eventTurnMap.get(s)).filter((t) => t > 0))].sort((a, b) => a - b)
+    entries.push({
+      checkpointSeq: seq,
+      summaryEventSeq: summaryEvent?.seq,
+      level: summaryEvent?.data?.level ?? 'L0',
+      spanTag: ownTag,
+      turns: formatTurnsLabel(turnList),
+      turnList,
+      topics: resolveCheckpointTopics(session, ev, events, logInfo, config, summaryEvent),
+      summaryLine: clipTimelineLine(stripped.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? ''),
+      anchors: [],
+      _order: surfaceOrder.get(seq) ?? 0,
+      _minLeaf: leaves[0],
+    })
+  }
+  return entries.sort((a, b) => a._minLeaf - b._minLeaf)
+}
+
+/** C-23: render the `## Topic Timeline` index block (<=12 rows, <=400 tokens; overflow drops the oldest). */
+function renderTopicTimelineBlock(subSpans, hullRecallTag) {
+  if (!Array.isArray(subSpans) || !subSpans.length) return ''
+  const MAX_ROWS = 12
+  const MAX_TOKENS = 400
+  const hullTag = typeof hullRecallTag === 'string' ? hullRecallTag.replace(/^\[recall:\s*/, '').replace(/\]$/, '') : ''
+  const rowOf = (sp) => {
+    const line = clipTimelineLine(sp.summaryLine).replace(/\[recall:/g, '(recall:')
+    return `- T${sp.turns || '?'} [topics:${(sp.topics || []).join(',')}] ${line} [recall: ${sp.spanTag ?? hullTag}]`
+  }
+  let shown = subSpans.length > MAX_ROWS ? subSpans.slice(-MAX_ROWS) : subSpans.slice()
+  let overflow = subSpans.length - shown.length
+  while (shown.length > 1) {
+    const body = shown.map(rowOf)
+    const footer = overflow > 0 ? `\n[+${overflow} earlier stages: context_recall({ target: "@topic:<name>" })]` : ''
+    if (Math.ceil(`## Topic Timeline\n${body.join('\n')}${footer}`.length / 4) <= MAX_TOKENS) break
+    shown = shown.slice(1)
+    overflow += 1
+  }
+  const rows = shown.map(rowOf)
+  if (overflow > 0) rows.push(`[+${overflow} earlier stages: context_recall({ target: "@topic:<name>" })]`)
+  return `## Topic Timeline\n${rows.join('\n')}`
 }
 function splitRangeLabel(start, end) {
   return `S${start}-${end}`
@@ -1225,7 +1316,7 @@ export function findRedundantSummaryCheckpoints(session, excludedSeqs = []) {
   return redundant.sort((a, b) => a - b)
 }
 
-function buildSpanPlan(session, tokenMeter, fields, minSavingsTokens) {
+function buildSpanPlan(session, tokenMeter, fields, minSavingsTokens, config = {}) {
   const {
     from,
     to,
@@ -1242,6 +1333,7 @@ function buildSpanPlan(session, tokenMeter, fields, minSavingsTokens) {
 
   const events = getAllEvents(session)
   const logInfo = inspectSessionLog(session)
+  const topicIndexing = config?.topicIndexing === true
   const redundantSummarySeqs = findRedundantSummaryCheckpoints(session, shadowedSeqs)
   if (redundantSummarySeqs.length) {
     const baseSeqs = [...shadowedSeqs]
@@ -1271,10 +1363,48 @@ function buildSpanPlan(session, tokenMeter, fields, minSavingsTokens) {
   if (!ranges.length) ranges.push([minLeaf, maxLeaf])
   const turnLabel = Array.isArray(resolvedTurns) && resolvedTurns.length > 0 ? ` turns:${formatTurnsLabel(resolvedTurns)}` : ''
   const recallTag = `[recall: ${formatSpanTag(ranges, resolvedTurns)}]`
-  const carried = (fields.carried ?? []).map((ev) => carriedSummaryBlock(ev, events, logInfo))
+  const carried = (fields.carried ?? []).map((ev) => carriedSummaryBlock(ev, events, logInfo, config))
   const auto = parseAutoSummary(summary)
-  const resolvedSummary = auto.auto ? limitAutoSummary(`${buildAutoSpanDigest(session, logInfo, shadowedSeqs)}${auto.tail ? ` | ${auto.tail}` : ''}`) : summary.trim()
-  const formattedText = [...carried, `[Compact${turnLabel}] ${resolvedSummary} ${recallTag}`].join('\n')
+
+  // v5 topics (C-21): explicit topics win; otherwise deterministic inference.
+  const explicit = sanitizeExplicitTopics(fields.topics)
+  const inferred = inferSpanTopics({
+    events, logInfo, seqs: shadowedSeqs, summaryText: typeof summary === 'string' ? summary : '', explicitTopics: fields.topics, config,
+  })
+  const topics = explicit.topics.length ? explicit.topics : inferred.topics
+  const droppedTopics = explicit.dropped
+
+  // v5 L1 sub-span ledger + Timeline (C-23): only on mergeSummaries && topicIndexing.
+  let subSpans = []
+  let timelineBlock = ''
+  if (allowMerge && topicIndexing) {
+    subSpans = extractSubSpansForMerge(session, events, logInfo, shadowedSeqs, config)
+    timelineBlock = renderTopicTimelineBlock(subSpans, recallTag)
+  }
+
+  let resolvedSummary
+  if (auto.auto) {
+    const digest = buildAutoSpanDigest(session, logInfo, shadowedSeqs)
+    if (allowMerge) {
+      // C-27: @auto + mergeSummaries is allowed; deterministic renderL1 synthesis.
+      const blocks = (fields.carried ?? []).map((ev) => ({
+        text: extractSummaryText(ev),
+        level: 'L0',
+        recallTags: extractRecallTags(extractSummaryText(ev)),
+      }))
+      const mergedText = renderL1(blocks, formatTurnsLabel(resolvedTurns ?? []))
+      resolvedSummary = stripSummaryWrapper(mergedText)
+    } else {
+      resolvedSummary = limitAutoSummary(`${digest}${auto.tail ? ` | ${auto.tail}` : ''}`)
+    }
+  } else {
+    resolvedSummary = summary.trim()
+  }
+  // C-22: remove literal wrapper lines for every caller before framing.
+  resolvedSummary = stripSummaryWrapper(resolvedSummary)
+  if (timelineBlock) resolvedSummary = `${resolvedSummary}\n${timelineBlock}`
+  const topicsToken = topicIndexing && topics.length ? ` topics:${topics.join(',')}` : ''
+  const formattedText = [...carried, `[Compact${turnLabel}${topicsToken}] ${resolvedSummary} ${recallTag}`].join('\n')
   const summaryBlocks = [{ type: 'text', text: formattedText }]
   const framedContent = [
     { type: 'text', text: `${CHECKPOINT_PREAMBLE}\n\n${SUMMARY_OPEN_TAG}` },
@@ -1319,6 +1449,11 @@ function buildSpanPlan(session, tokenMeter, fields, minSavingsTokens) {
     resolvedTo,
     summary: auto.auto ? limitAutoSummary(resolvedSummary) : resolvedSummary,
     mergeSummaries: allowMerge,
+    level: allowMerge ? 'L1' : 'L0',
+    topicIndexing,
+    topics,
+    droppedTopics,
+    subSpans,
     startSeq: shadowedSeqs[0] ?? startSeq,
     endSeq: shadowedSeqs.at(-1) ?? endSeq,
     shadowedSeqs,
@@ -1344,7 +1479,7 @@ function buildSpanPlan(session, tokenMeter, fields, minSavingsTokens) {
   }
 }
 
-function planTurnsSpanCompaction(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodes, nodeTurnsList) {
+function planTurnsSpanCompaction(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodes, nodeTurnsList, config = {}) {
   const summary = spanSpec.summary
   const allowMerge = spanSpec?.mergeSummaries === true
   const resolvedTurns = resolveSpanTurns(spanSpec, logInfo)
@@ -1462,7 +1597,8 @@ function planTurnsSpanCompaction(session, tokenMeter, spanSpec, minSavingsTokens
     clusters,
     carried,
     detachedCount,
-  }, minSavingsTokens)
+    topics: spanSpec.topics,
+  }, minSavingsTokens, config)
 }
 
 export function summaryFrontierIndex(session) {
@@ -1490,7 +1626,7 @@ export function classifySurfaceNode(session, seq, logInfo = inspectSessionLog(se
   if (ev?.surfaceOp === 'append' && ['user/message', 'assistant/message', 'tool/result'].includes(ev.type)) return { kind: 'RAW', ev, index, turns }
   return { kind: 'DEV', ev, index, turns }
 }
-function planContinuousSlice(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodes, nodeTurnsList, startIdx, endIdx, from, to, resolvedFrom, resolvedTo) {
+function planContinuousSlice(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodes, nodeTurnsList, startIdx, endIdx, from, to, resolvedFrom, resolvedTo, config = {}) {
   const allowMerge = spanSpec?.mergeSummaries === true
   const policy = spanSpec?.detachedPolicy ?? 'allow'
   if (!['allow', 'snap', 'reject'].includes(policy)) throw new Error(`invalid detachedPolicy "${policy}"`)
@@ -1551,10 +1687,11 @@ function planContinuousSlice(session, tokenMeter, spanSpec, minSavingsTokens, lo
     startSeq: trimmed[0].seqs[0], endSeq: trimmed[0].seqs.at(-1),
     shadowedSeqs: trimmed.flatMap((c) => c.seqs), clusters: trimmed, carried,
     resolvedTurns: [...rawTurns].sort((a, b) => a - b),
+    topics: spanSpec.topics,
     detachedCount: carried.length, frontierIndex: frontier,
     prefixClass: allowMerge && startIdx < frontier ? 'rewrite' : 'append',
     detachedWarning: skippedRawBefore ? `前面还有未压缩内容；下次使用 from:"auto" 自动携带合拢。` : '',
-  }, minSavingsTokens)
+  }, minSavingsTokens, config)
 }
 
 /**
@@ -1594,7 +1731,7 @@ function compactableClosedFloor(session, logInfo, surfaceNodes, nodeTurnsList, f
   return null
 }
 
-export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsTokens = DEFAULT_MIN_SAVINGS_TOKENS) {
+export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsTokens = DEFAULT_MIN_SAVINGS_TOKENS, config = {}) {
   const { to, summary } = spanSpec
   // Absorb duplicate summaries only alongside an actual new compaction. A
   // dedicated zero-output operation is deliberately absent to avoid hot-cache
@@ -1613,11 +1750,35 @@ export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsToke
   if (typeof summary !== 'string' || summary.trim().length === 0) {
     throw new Error('span summary must be a non-empty string')
   }
-  if (spanSpec.mergeSummaries === true && parseAutoSummary(summary).auto) throw new Error('@auto 不支持 mergeSummaries，请手写 Epoch 摘要')
+  // C-27: the @auto+mergeSummaries throw is lifted; buildSpanPlan synthesizes deterministic L1 text.
 
   const logInfo = inspectSessionLog(session)
   if (logInfo.unmatchedCompactionStart) {
     throw new Error('compaction lock is already active on this session (unmatched compaction/start)')
+  }
+
+  // C-26: internal seq-list path, honoured only with mergeSummaries. Not in the tool schema.
+  if (spanSpec.mergeSummaries === true && Array.isArray(spanSpec.shadowedCheckpointSeqs) && spanSpec.shadowedCheckpointSeqs.length) {
+    const surfaceNodesAll = [...session.surface.nodes]
+    const seqs = [...new Set(spanSpec.shadowedCheckpointSeqs)].sort((a, b) => a - b)
+    let firstIdx = -1
+    let lastIdx = -1
+    const idxOf = new Map(surfaceNodesAll.map((seq, i) => [seq, i]))
+    for (const seq of seqs) {
+      const idx = idxOf.get(seq)
+      if (idx === undefined || !isSummaryCheckpointEvent(getEvent(session, seq))) {
+        throw new Error(`shadowedCheckpointSeqs: seq ${seq} is not an adjacent summary checkpoint on the surface`)
+      }
+      if (firstIdx === -1 || idx < firstIdx) firstIdx = idx
+      if (idx > lastIdx) lastIdx = idx
+    }
+    for (let k = firstIdx; k <= lastIdx; k++) {
+      if (!seqs.includes(surfaceNodesAll[k])) throw new Error('shadowedCheckpointSeqs: seqs must be an adjacent summary-checkpoint run on the surface')
+    }
+    return planContinuousSlice(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodesAll,
+      surfaceNodesAll.map((seq) => resolveSurfaceNodeTurns(session, seq, logInfo)),
+      firstIdx, lastIdx, spanSpec.from ?? `S${seqs[0]}`, spanSpec.to ?? `S${seqs.at(-1)}`,
+      `turn:${resolveSurfaceNodeTurns(session, seqs[0], logInfo).minTurn || 1}`, `turn:${resolveSurfaceNodeTurns(session, seqs.at(-1), logInfo).maxTurn || 1}`, config)
   }
 
   const allSurfaceNodes = [...session.surface.nodes]
@@ -1626,7 +1787,7 @@ export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsToke
 
   const nodeTurnsList = surfaceNodes.map((seq) => resolveSurfaceNodeTurns(session, seq, logInfo))
   if (hasExplicitTurns(spanSpec)) {
-    return planTurnsSpanCompaction(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodes, nodeTurnsList)
+    return planTurnsSpanCompaction(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodes, nodeTurnsList, config)
   }
   if (to === undefined && spanSpec.resolvedTo === undefined) {
     throw new Error('span requires to or turns')
@@ -1644,7 +1805,7 @@ export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsToke
           ...spanSpec,
           to: `turn:${target}`,
           resolvedTo: undefined,
-        }, minSavingsTokens)
+        }, minSavingsTokens, config)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         if (!/nothing to compact|is after to|no compactable closed-turn|no uncompacted closed turn/.test(message)) throw err
@@ -1663,7 +1824,7 @@ export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsToke
     while (endIdx + 1 < surfaceNodes.length && isElidedPlaceholderEvent(getEvent(session, surfaceNodes[endIdx + 1]))) endIdx++
     const startTurn = nodeTurnsList[startIdx]?.minTurn ?? endTurn
     return planContinuousSlice(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodes, nodeTurnsList,
-      startIdx, endIdx, from, to, `turn:${startTurn}`, `turn:${endTurn}`)
+      startIdx, endIdx, from, to, `turn:${startTurn}`, `turn:${endTurn}`, config)
   }
   const start = resolveEndpointSurfaceIndices(session, effectiveFrom, false, logInfo, surfaceNodes, nodeTurnsList)
   const end = resolveEndpointSurfaceIndices(session, effectiveTo, true, logInfo, surfaceNodes, nodeTurnsList)
@@ -1690,7 +1851,7 @@ export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsToke
       if (actualTurn === resolvedToTurn && (nodeTurnsList[startIdx].turns.has(actualTurn) || nodeTurnsList[endIdx].turns.has(actualTurn))) {
         return planSpanCompaction(session, tokenMeter, {
           from: `turn:${actualTurn}`, to: `turn:${actualTurn}`, summary,
-        }, minSavingsTokens)
+        }, minSavingsTokens, config)
       }
     }
   }
@@ -1796,13 +1957,13 @@ export function planSpanCompaction(session, tokenMeter, spanSpec, minSavingsToke
   }
 
   return planContinuousSlice(session, tokenMeter, spanSpec, minSavingsTokens, logInfo, surfaceNodes, nodeTurnsList,
-    startIdx, endIdx, from, to, clampedFrom ?? normalizeEndpointSelector(effectiveFrom, logInfo), clampedTo ?? normalizeEndpointSelector(effectiveTo, logInfo))
+    startIdx, endIdx, from, to, clampedFrom ?? normalizeEndpointSelector(effectiveFrom, logInfo), clampedTo ?? normalizeEndpointSelector(effectiveTo, logInfo), config)
 }
 
 /**
  * Execute one validated span compaction synchronously (4 events back-to-back, no await).
  */
-export function commitSpanCompaction(session, tokenMeter, plan) {
+export function commitSpanCompaction(session, tokenMeter, plan, config = {}) {
   const currentPlan = planSpanCompaction(session, tokenMeter, {
     from: plan.from,
     to: plan.to,
@@ -1812,8 +1973,9 @@ export function commitSpanCompaction(session, tokenMeter, plan) {
     resolvedTurns: plan.turns ? plan.resolvedTurns : undefined,
     summary: plan.summary,
     mergeSummaries: plan.mergeSummaries === true,
+    topics: Array.isArray(plan.topics) ? plan.topics : undefined,
     now: plan.now,
-  }, 1)
+  }, 1, config)
 
   const logInfo = inspectSessionLog(session)
   const compactionId = randomUUID()
@@ -1853,6 +2015,11 @@ export function commitSpanCompaction(session, tokenMeter, plan) {
     const projection = buildCompactionProjection(beforeSurface - firstTokens, epochRecord(session).calibration, (startEvent?.seq ?? 0) + 1)
     summaryEvent = session.append('compaction/summary', {
       compactionId,
+      ...(currentPlan.topicIndexing === true ? {
+        level: currentPlan.level ?? 'L0',
+        topics: Array.isArray(currentPlan.topics) && currentPlan.topics.length ? [...currentPlan.topics] : ['general'],
+        subSpans: Array.isArray(currentPlan.subSpans) ? currentPlan.subSpans : [],
+      } : {}),
       summary: currentPlan.summaryBlocks,
       shadowedRange: { start: firstStart, end: firstEnd },
       shadowedSeqs: [...firstCluster.seqs],
@@ -1945,7 +2112,7 @@ export function planResultCompaction(session, tokenMeter, itemSpec, activeCallId
 
   const auto = parseAutoSummary(summary)
   if (auto.auto) summary = limitAutoSummary(`${buildAutoResultDigest(session, logInfo, targetSeq)}${auto.tail ? ` | ${auto.tail}` : ''}`)
-  const recallEvicted = summary.startsWith('[Compact-Recall-Evicted]')
+  const recallEvicted = RECALL_FOLDED_PREFIX_RE.test(summary)
   const recallTag = recallEvicted ? '' : `[recall: @call:${rawCallId}]`
   const formattedText = summary.startsWith('[Compact-Auto]') || recallEvicted ? summary : `[Compact] ${summary} ${recallTag}`
   const newContent = [{ type: 'text', text: formattedText }]
@@ -2088,13 +2255,44 @@ export function executeHistorySearch(session, args = {}) {
   }
 }
 
-export function executeRecall(session, args = {}) {
+export function executeRecall(session, args = {}, options = {}) {
   const target = String(args.target ?? '').trim()
-  if (!target) throw new Error('target is required (e.g. "@call:<callId>", "@span:S<min>-<max>", "@turn:<N>", "@index", or event seq)')
-  if (/^@(?:index|all|search)$/i.test(target)) return executeHistorySearch(session, args)
+  if (!target) throw new Error('target is required (e.g. "@call:<callId>", "@span:S<min>-<max>", "@turn:<N>", "@topics", "@topic:<name>", "@index", or event seq)')
 
   const events = getAllEvents(session)
   const logInfo = inspectSessionLog(session)
+
+  // v5 mode normalization (C-05/C-19): 'raw' -> 'full', unknown -> 'full' + note.
+  const modeRaw = String(args.mode ?? '')
+  let mode = 'full'
+  let modeNote = ''
+  if (modeRaw === 'summaries_only') mode = 'summaries_only'
+  else if (modeRaw && modeRaw !== 'full' && modeRaw !== 'raw') modeNote = `\n[mode note: unknown mode ${JSON.stringify(modeRaw)} treated as full]`
+  else if (modeRaw === 'raw') modeNote = '\n[mode note: raw is an alias of full]'
+
+  // C-19 routing order: @topics, then @topic:<list>, then summaries_only, then legacy.
+  if (/^@topics$/i.test(target)) return executeTopicCatalogRecall(session, events, logInfo, {}, null)
+  const topicMatch = /^@topic:([a-z0-9_,-]+)$/i.exec(target)
+  if (topicMatch) {
+    const res = executeSummaryTierRecall(session, args, events, logInfo, {})
+    if (modeNote) res.text += modeNote
+    return res
+  }
+  if (mode === 'summaries_only') {
+    // summaries_only on @index/@all/@search/@span:/@turn: routes to the summary tier.
+    if (/^@(?:index|all|search)$/i.test(target) || /^@?span:/i.test(target) || /^@?turn:/i.test(target)) {
+      const res = executeSummaryTierRecall(session, { ...args, target: topicMatch ? target : target }, events, logInfo, {})
+      if (modeNote) res.text += modeNote
+      return res
+    }
+    // @call: or bare seq has no summary tier: fall back to full with a note (C-05).
+    modeNote = '\n[mode note: summaries_only is not available for this target; returning full]'
+  }
+  if (/^@(?:index|all|search)$/i.test(target)) {
+    const res = executeHistorySearch(session, args)
+    if (modeNote) res.text += modeNote
+    return res
+  }
   const rootSeqs = []
   const nestedPointers = []
 
@@ -2117,24 +2315,48 @@ export function executeRecall(session, args = {}) {
     if (minSeq > maxSeq) throw new Error(`invalid span range ${target}: start ${minSeq} > end ${maxSeq}`)
     const wantedTag = target.replace(/^@?span:/i, '@span:').replace(/\s+turns:[\d,..-]+$/i, '')
     const fullWantedTag = target.replace(/^@?span:/i, '@span:')
-    let taggedCheckpoint = null
+    const wantTurns = /\s+turns:([\d,..-]+)$/i.exec(target)?.[1] ?? null
+    // C-15: tiered owner selection (fixes D4/F5). Own hull tag = last [recall: @span:...] in text.
+    const tierA = []
+    const tierB = []
+    const tierC = []
     let leafCheckpoint = null
     for (const ev of events) {
       if (!isSummaryCheckpointEvent(ev)) continue
       const blocks = ev.data?.content ?? []
       const text = blocks.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('\n')
+      const ownMatches = [...text.matchAll(/@span:S\d+-\d+(?:\+S\d+-\d+)*(?:\s+turns:[\d,..-]+)?/g)]
+      const ownTag = ownMatches.at(-1)?.[0] ?? null
+      const ownRangeStr = ownTag ? ownTag.replace(/\s+turns:[\d,..-]+$/i, '') : null
+      const ownTurns = ownTag ? (/\s+turns:([\d,..-]+)$/i.exec(ownTag)?.[1] ?? null) : null
+      const leaves = resolveLeafSurfaceSeqs(events, [ev.seq])
+      if (ownRangeStr && ownRangeStr.toLowerCase() === wantedTag.toLowerCase()) {
+        if (wantTurns === null || ownTurns === wantTurns) tierA.push({ ev, leaves })
+        else if (ownTurns !== null) tierC.push({ ev, leaves })
+      } else if (ownTag && ownTag.toLowerCase() === fullWantedTag.toLowerCase()) {
+        tierA.push({ ev, leaves })
+      }
+      if (leaves.length > 0 && leaves[0] === minSeq && leaves.at(-1) === maxSeq) {
+        tierB.push({ ev, leaves })
+        if (!leafCheckpoint) leafCheckpoint = { ev, leaves }
+      }
       const escapedFull = fullWantedTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
       const escapedPrefix = wantedTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
       const unionPattern = /@span:S\d+-\d+(?:\+S\d+-\d+)*/g
       const unionMatches = text.match(unionPattern) ?? []
-      if (new RegExp(`${escapedFull}(?![\\d+])`, 'i').test(text) || unionMatches.some((tag) => tag.toLowerCase() === wantedTag.toLowerCase())) taggedCheckpoint = ev
-      const leaves = resolveLeafSurfaceSeqs(events, [ev.seq])
-      if (leaves.length > 0 && leaves[0] === minSeq && leaves.at(-1) === maxSeq) {
-        leafCheckpoint = ev
-      }
+      if (new RegExp(`${escapedFull}(?![\\d+])`, 'i').test(text) || unionMatches.some((tag) => tag.toLowerCase() === wantedTag.toLowerCase())) tierC.push({ ev, leaves })
     }
-    const matchedCheckpoint = leafCheckpoint || taggedCheckpoint
+    const pickTier = (tier) => {
+      if (!tier.length) return null
+      const sorted = [...tier].sort((a, b) => (a.leaves.length - b.leaves.length) || (b.ev.seq - a.ev.seq))
+      return sorted[0]
+    }
+    const matched = pickTier(tierA) ?? pickTier(tierB) ?? pickTier(tierC)
+    const matchedCheckpoint = matched?.ev ?? null
     if (matchedCheckpoint) {
+      const tierANote = tierA.length > 1 && wantTurns === null
+        ? `\n[note: ${tierA.length - 1} other checkpoint(s) share this range string; add turns: to disambiguate: ${tierA.slice(1).slice(0, 2).map((t) => t.ev && [...(extractSummaryText(t.ev).matchAll(/@span:S\d+-\d+(?:\+S\d+-\d+)*(?:\s+turns:[\d,..-]+)?/g))].at(-1)?.[0]).filter(Boolean).join(', ') || '?'}]`
+        : ''
       const provenance = Array.isArray(matchedCheckpoint.sourceEventSeqs) && matchedCheckpoint.sourceEventSeqs.length > 0
         ? matchedCheckpoint.sourceEventSeqs.filter((seq) => {
             const src = events[seq]
@@ -2144,7 +2366,8 @@ export function executeRecall(session, args = {}) {
       for (const seq of provenance) {
         const src = events[seq]
         if (isSummaryCheckpointEvent(src) || isElidedPlaceholderEvent(src)) {
-          const nested = /@span:S\d+-\d+(?:\+S\d+-\d+)*(?:\s+turns:[\d,..-]+)?/.exec(src.data?.content?.map((b) => b.text ?? '').join('\n'))?.[0]
+          // C-16: nested pointer uses the child's own hull tag (last match), not the first.
+          const nested = [...extractSummaryText(src).matchAll(/@span:S\d+-\d+(?:\+S\d+-\d+)*(?:\s+turns:[\d,..-]+)?/g)].at(-1)?.[0]
           if (nested) nestedPointers.push(nested)
         } else rootSeqs.push(seq)
       }
@@ -2241,9 +2464,51 @@ export function executeRecall(session, args = {}) {
 
   const maxLines = DEFAULT_RECALL_MAX_LINES
   const sliceEnd = Math.min(endOffset, startOffset + maxLines)
-  const page = selectedLines.slice(startOffset, sliceEnd)
-  const hasMore = sliceEnd < selectedLines.length
-  const nextStartLine = hasMore ? selectedLines[sliceEnd].lineNumber : null
+  let page = selectedLines.slice(startOffset, sliceEnd)
+  const tokenBudget = Number.isFinite(Number(options?.maxTokens)) ? Math.floor(Number(options.maxTokens)) : null
+  const estimatePage = typeof options?.estimateTokens === 'function' ? options.estimateTokens : null
+  if (tokenBudget != null && estimatePage && page.length) {
+    const renderPage = (rows, more) => {
+      const next = more ? selectedLines[startOffset + rows.length] : null
+      const nextStart = next ? next.lineNumber : null
+      const nextEnd = more ? Math.min(totalLines, nextStart + maxLines - 1) : null
+      const bodyText = rows.map((item) => `${item.lineNumber}: ${item.text}`).join('\n')
+      const cursor = more
+        ? `\n\n[More lines available (${totalLines} total). Continue with: context_recall { target: "${target}"${query ? `, query: ${JSON.stringify(query)}` : ''}, line_range: [${nextStart}, ${nextEnd}] }]`
+        : ''
+      const first = rows[0]?.lineNumber ?? 0
+      const last = rows.at(-1)?.lineNumber ?? 0
+      return `[Recall ${target} | leaves: ${leafSeqs.map((s) => `S${s}`).join(',')} | lines: ${first}-${last} of ${totalLines}]\n${bodyText}${cursor}${modeNote}`
+    }
+    const kept = []
+    for (const item of page) {
+      const trial = [...kept, item]
+      const more = startOffset + trial.length < selectedLines.length
+      if (estimatePage(renderPage(trial, more)) <= tokenBudget) { kept.push(item); continue }
+      if (kept.length === 0) {
+        const original = String(item.text ?? '')
+        let cut = original
+        let chosen = null
+        while (cut.length > 0) {
+          const dropped = original.length - cut.length
+          const text = dropped > 0 ? `${cut}…[line truncated, ${dropped} chars]` : cut
+          const candidate = { ...item, text }
+          if (estimatePage(renderPage([candidate], startOffset + 1 < selectedLines.length || dropped > 0)) <= tokenBudget || cut.length <= 1) {
+            chosen = candidate
+            break
+          }
+          const nextLen = Math.max(1, Math.floor(cut.length * 0.8))
+          if (nextLen >= cut.length) break
+          cut = cut.slice(0, nextLen)
+        }
+        kept.push(chosen ?? item)
+      }
+      break
+    }
+    if (kept.length) page = kept
+  }
+  const hasMore = startOffset + page.length < selectedLines.length
+  const nextStartLine = hasMore ? selectedLines[startOffset + page.length].lineNumber : null
   const nextEndLine = hasMore ? Math.min(totalLines, nextStartLine + maxLines - 1) : null
 
   const body = page.map((item) => `${item.lineNumber}: ${item.text}`).join('\n')
@@ -2258,7 +2523,7 @@ export function executeRecall(session, args = {}) {
     returnedLines: page.length,
     hasMore,
     ...(hasMore ? { nextLineRange: [nextStartLine, nextEndLine] } : {}),
-    text: `[Recall ${target} | leaves: ${leafSeqs.map((s) => `S${s}`).join(',')} | lines: ${page[0]?.lineNumber ?? 0}-${page[page.length - 1]?.lineNumber ?? 0} of ${totalLines}]\n${body}${cursorHint}`,
+    text: `[Recall ${target} | leaves: ${leafSeqs.map((s) => `S${s}`).join(',')} | lines: ${page[0]?.lineNumber ?? 0}-${page[page.length - 1]?.lineNumber ?? 0} of ${totalLines}]\n${body}${cursorHint}${modeNote}`,
   }
 }
 
@@ -3087,6 +3352,22 @@ export function collectHardResultCandidates(session, tokenMeter, options = {}) {
   return candidates.sort((a, b) => b.tokens - a.tokens || a.seq - b.seq)
 }
 
+function plainToolResultText(ev) {
+  const blocks = Array.isArray(ev?.data?.message?.content?.[0]?.content) ? ev.data.message.content[0].content : ev?.data?.message?.content
+  return (Array.isArray(blocks) ? blocks : []).map((b) => (b?.type === 'text' ? b.text : '')).join('\n')
+}
+
+/** C-29: a later real appended assistant message, ignoring synthetic receipts. */
+function recallReadSafely(events, resultSeq) {
+  for (let i = resultSeq + 1; i < events.length; i++) {
+    const ev = events[i]
+    if (!ev) continue
+    if (ev.type === 'turn/end' && ev.data?.reason?.kind !== 'completed') return false
+    if (ev.type === 'assistant/message' && ev.surfaceOp === 'append' && ev.data?.source?.kind !== 'synthetic-receipt') return true
+  }
+  return false
+}
+
 /** Zero-LLM hard watermark/overflow pass. Every planning failure is isolated to its candidate. */
 export function runHardCompaction(session, tokenMeter, options = {}) {
   const contextWindow = session.requestContext()?.contextWindow
@@ -3099,6 +3380,45 @@ export function runHardCompaction(session, tokenMeter, options = {}) {
   const targetRatio = configuredPositive(options, 'hardTargetRatio', DEFAULT_HARD_TARGET_RATIO)
   const committedResults = []
   let measurement = tokenMeter.measure(session)
+  if (options?.recallRollingDigest === true && contextWindow > 0) {
+    const events = getAllEvents(session)
+    const latestStepByTurn = new Map()
+    for (const ev of events) {
+      if (ev?.type !== 'step/start') continue
+      const turn = ev.data?.turn ?? logInfo.eventTurnMap.get(ev.seq) ?? 0
+      latestStepByTurn.set(turn, Math.max(latestStepByTurn.get(turn) ?? 0, ev.data?.step ?? 0))
+    }
+    const pricedBySeq = new Map(measurement.nodes.map((n) => [n.seq, nodeTokens(n)]))
+    const recalls = []
+    for (const seq of session.surface.nodes) {
+      const ev = getEvent(session, seq)
+      if (ev?.type !== 'tool/result' || ev.surfaceOp !== 'append') continue
+      const callId = ev.data?.message?.source?.callId ?? ''
+      if (!callId || logInfo.callMap.get(callId)?.name !== 'context_recall') continue
+      const text = plainToolResultText(ev)
+      if (!text || RECALL_FOLDED_PREFIX_RE.test(text) || text.startsWith('[Recall-Gate ') || text.startsWith('[recall evicted:')) continue
+      if (!recallReadSafely(events, seq)) continue
+      const at = stepOfSurfaceResult(session, seq, logInfo)
+      const latestStep = latestStepByTurn.get(at.turn) ?? at.step
+      if (logInfo.openTurn !== null && at.turn === logInfo.openTurn && at.step === latestStep) continue
+      const tokens = pricedBySeq.get(seq) ?? 0
+      if (tokens < 180) continue
+      recalls.push({ seq, callId, tokens, text })
+    }
+    recalls.sort((a, b) => b.tokens - a.tokens || a.seq - b.seq)
+    for (const candidate of recalls) {
+      if (measurement.totalTokens / contextWindow <= targetRatio) break
+      try {
+        const rawArgs = logInfo.callMap.get(candidate.callId)?.arguments
+        const parsedArgs = typeof rawArgs === 'string' ? (() => { try { return JSON.parse(rawArgs) } catch { return {} } })() : (rawArgs ?? {})
+        const meta = getRecallCallMeta(session, candidate.callId)
+        const digest = buildRecallBreadcrumbDigest(candidate.text, parsedArgs, { ...(meta ?? {}), step: 'overflow' })
+        const plan = planResultCompaction(session, tokenMeter, { callId: candidate.callId, summary: digest }, undefined, 1)
+        committedResults.push(commitResultCompaction(session, tokenMeter, plan))
+        measurement = tokenMeter.measure(session)
+      } catch {}
+    }
+  }
   for (const candidate of collectHardResultCandidates(session, tokenMeter, options)) {
     if (contextWindow > 0 && measurement.totalTokens / contextWindow <= targetRatio) break
     try {
@@ -3216,7 +3536,7 @@ export function resolveCompactRuntimeConfig(raw = {}) {
     if (Object.prototype.hasOwnProperty.call(file, key)) return file[key]
     return underTest ? undefined : true
   }
-  return { ...file, ...explicit, autoEngine: pick('autoEngine'), autoCoalesce: pick('autoCoalesce'), recallBudget: pick('recallBudget') }
+  return { ...file, ...explicit, autoEngine: pick('autoEngine'), autoCoalesce: pick('autoCoalesce'), recallBudget: pick('recallBudget'), topicIndexing: pick('topicIndexing'), recallRollingDigest: pick('recallRollingDigest') }
 }
 
 export function apply(ctx, rawConfig = {}) {
@@ -3225,6 +3545,14 @@ export function apply(ctx, rawConfig = {}) {
   const overflowRetries = new WeakMap()
   const overflowStepKeys = new WeakMap()
   const overflowSessionAgents = new WeakMap()
+  const recallInFlight = new WeakMap()
+  const pinnedRecallGroups = new WeakMap()
+  function recallInFlightForRegistry(session) {
+    let set = recallInFlight.get(session)
+    if (!set) { set = new Set() ; recallInFlight.set(session, set) }
+    return set
+  }
+  const recallInFlightFor = recallInFlightForRegistry
   let restoreNativeCompaction = () => {}
   try {
     restoreNativeCompaction = takeoverNativeCompaction(ctx, config.takeoverNativeCompaction !== false)
@@ -3358,7 +3686,12 @@ export function apply(ctx, rawConfig = {}) {
           skippedSpans.push({ from: sp.from, to: sp.to, reason })
           continue
         }
+        const touchIdx = (plan.shadowedSeqs || []).map((s) => session.surface.nodes.indexOf(s)).filter((i) => i >= 0)
         const committed = commitSpanCompaction(session, tokenMeter, plan)
+        if (touchIdx.length) {
+          const touch = Math.min(...touchIdx)
+          st.lastFlushMinIndex = Math.min(st.lastFlushMinIndex ?? touch, touch)
+        }
         for (const s of committed.shadowedSeqs) shadowedBySpans.add(s)
         if (Array.isArray(sp.shadowedSeqs)) {
           for (const s of sp.shadowedSeqs) shadowedBySpans.add(s)
@@ -3421,7 +3754,9 @@ export function apply(ctx, rawConfig = {}) {
 
       try {
         const plan = planResultCompaction(session, tokenMeter, res, activeCallId, minSavingsTokens)
+        const touch = session.surface.nodes.indexOf(plan.seq)
         const committed = commitResultCompaction(session, tokenMeter, plan, activeCallId)
+        if (touch >= 0) st.lastFlushMinIndex = Math.min(st.lastFlushMinIndex ?? touch, touch)
         committedResults.push(committed)
       } catch (err) {
         const afterStatus = isResultAlreadyCompacted(session, res.callId, shadowedBySpans)
@@ -3517,6 +3852,204 @@ export function apply(ctx, rawConfig = {}) {
   ctx.effect(() => () => { /* no flush/drop on dispose: next instance inherits pure data */ },
     '@dsh-external/dsh-context-compact: state')
 
+  // ---- v5 recall folding engine (C-29..C-41) ----
+
+  /** C-29: read-safety test — a real appended assistant/message after the result, no abnormal turn/end between. */
+  function isRecallReadSafely(events, resultSeq) {
+    return recallReadSafely(events, resultSeq)
+  }
+
+  function recallResultText(ev) {
+    return plainToolResultText(ev)
+  }
+
+  function collectSurfaceRecallEntries(session, events, logInfo) {
+    const entries = []
+    const priced = new Map((ctx.tokenMeter.measure(session).nodes || []).map((n) => [n.seq, nodeTokens(n)]))
+    for (const seq of session.surface.nodes) {
+      const ev = events[seq]
+      if (ev?.type !== 'tool/result' || ev.surfaceOp !== 'append') continue
+      const callId = ev.data?.message?.source?.callId ?? ''
+      const callInfo = logInfo.callMap.get(callId)
+      if (callInfo?.name !== 'context_recall') continue
+      const text = recallResultText(ev)
+      if (RECALL_FOLDED_PREFIX_RE.test(text) || text.startsWith('[Recall-Gate ') || text.startsWith('[recall evicted:')) continue
+      entries.push({ seq, callId, ev, text, tokens: priced.get(seq) ?? 0, turn: logInfo.eventTurnMap.get(seq) ?? 0 })
+    }
+    return entries
+  }
+
+  /**
+   * v5 `evictConsumedRecallResults` (C-30/C-31/C-38/C-39).
+   * Modes: 'pre-step' (D=0 tail-only fold), 'turn-end', 'pmw-open'.
+   */
+  function evictConsumedRecallResults(session, mode = 'pre-step', options = {}) {
+    if (config?.recallRollingDigest !== true || !session) return { folded: 0 }
+    const events = getAllEvents(session)
+    const logInfo = inspectSessionLog(session)
+    if (logInfo.unmatchedCompactionStart) return { folded: 0 }
+    if (mode === 'pre-step' || mode === 'pmw-open') {
+      const openTurn = logInfo.openTurn
+      let hasRaw = false
+      if (openTurn !== null) {
+        for (const seq of session.surface.nodes) {
+          const ev = events[seq]
+          if (ev?.type !== 'tool/result' || ev.surfaceOp !== 'append') continue
+          if ((logInfo.eventTurnMap.get(seq) ?? 0) !== openTurn) continue
+          const callId = ev.data?.message?.source?.callId ?? ''
+          if (logInfo.callMap.get(callId)?.name !== 'context_recall') continue
+          const text = plainToolResultText(ev)
+          if (RECALL_FOLDED_PREFIX_RE.test(text) || text.startsWith('[Recall-Gate ') || text.startsWith('[recall evicted:')) continue
+          hasRaw = true
+          break
+        }
+      }
+      if (!hasRaw) return { folded: 0 }
+    }
+    const entries = collectSurfaceRecallEntries(session, events, logInfo)
+    if (!entries.length) return { folded: 0 }
+    const st = stagedBySession.get(session)
+    const stagedCallIds = new Set([...(st?.results?.keys() ?? [])])
+
+    const foldOne = (entry, step) => {
+      const meta = getRecallCallMeta(session, entry.callId)
+      const args = logInfo.callMap.get(entry.callId)?.arguments
+      const parsedArgs = typeof args === 'string' ? (() => { try { return JSON.parse(args) } catch { return {} } })() : (args ?? {})
+      const digest = buildRecallBreadcrumbDigest(entry.text, parsedArgs, { ...(meta ?? {}), step })
+      const plan = planResultCompaction(session, ctx.tokenMeter, { callId: entry.callId, summary: digest }, undefined, 1)
+      commitResultCompaction(session, ctx.tokenMeter, plan)
+      return true
+    }
+
+    if (mode === 'pmw-open') {
+      if (!pmwOpenNow(session)) return { folded: 0 }
+      let folded = 0
+      for (const entry of entries.filter((e) => e.turn > 0 && (logInfo.openTurn === null || e.turn < logInfo.openTurn) && e.tokens >= 180).sort((a, b) => a.seq - b.seq)) {
+        if (stagedCallIds.has(entry.callId)) continue
+        try { if (foldOne(entry, 'pmw')) folded++ } catch {}
+      }
+      return { folded }
+    }
+
+    if (mode === 'turn-end') {
+      const closingTurn = options.closingTurn ?? logInfo.openTurn ?? logInfo.lastTurn
+      const nodes = session.surface.nodes
+      const indexOf = new Map(nodes.map((seq, i) => [seq, i]))
+      const pStar = Number.isInteger(options.pStar) ? options.pStar : nodes.length
+      const candidates = entries
+        .filter((e) => e.turn === closingTurn && e.tokens >= 180 && recallResultEvictable(session, e.seq, closingTurn))
+        .map((e) => ({ ...e, idx: indexOf.get(e.seq) ?? -1 }))
+        .filter((e) => e.idx >= 0)
+      const atOrAfter = candidates.filter((c) => c.idx >= pStar).sort((a, b) => a.idx - b.idx)
+      let folded = 0
+      for (const c of atOrAfter) {
+        if (stagedCallIds.has(c.callId)) continue
+        try { if (foldOne(c, 'turn-end')) folded++ } catch {}
+      }
+      const before = candidates.filter((c) => c.idx < pStar).sort((a, b) => a.idx - b.idx)
+      if (before.length) {
+        const { r, w } = resolveRouteCachePricing(session, config)
+        const ewma = autoCompactState(session)?.reqPerTurnEwma
+        const N = typeof config?.recallFoldExpectedRequests === 'number'
+          ? config.recallFoldExpectedRequests
+          : (ewma ? Math.max(6, Math.round(ewma * 3)) : 8)
+        const dOf = (c) => Math.min(160, Math.max(10, Math.ceil(c.tokens / 16)))
+        const priced = new Map((ctx.tokenMeter.measure(session).nodes || []).map((n) => [n.seq, n.tokens ?? 0]))
+        let bestI = -1
+        for (let i = 0; i < before.length; i++) {
+          let S = 0
+          for (let j = i; j < before.length; j++) S += Math.max(0, before[j].tokens - dOf(before[j]))
+          let T = 0
+          for (let k = before[i].idx; k < pStar && k < nodes.length; k++) T += priced.get(nodes[k]) ?? 0
+          if (N * r * S > (w - r) * (T - S)) { bestI = i ; break }
+        }
+        if (bestI >= 0) {
+          for (let j = bestI; j < before.length; j++) {
+            if (stagedCallIds.has(before[j].callId)) continue
+            try { if (foldOne(before[j], 'turn-end')) folded++ } catch {}
+          }
+        }
+      }
+      return { folded }
+    }
+
+    // mode === 'pre-step' (C-30/C-31): D=0 tail group. G is recall results only.
+    const nodes = session.surface.nodes
+    let a = -1
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const ev = events[nodes[i]]
+      if (ev?.type === 'assistant/message' && ev.surfaceOp === 'append' && ev.data?.source?.kind !== 'synthetic-receipt') { a = i ; break }
+    }
+    if (a <= 0) return { folded: 0 }
+    const latestAsst = events[nodes[a]]
+    let issuerIdx = -1
+    for (let i = a - 1; i >= 0; i--) {
+      const ev = events[nodes[i]]
+      if (ev?.type === 'assistant/message' && ev.surfaceOp === 'append' && ev.data?.source?.kind !== 'synthetic-receipt') { issuerIdx = i ; break }
+    }
+    if (issuerIdx < 0) return { folded: 0 }
+    const issuer = events[nodes[issuerIdx]]
+    let decided = pinnedRecallGroups.get(session)
+    if (!decided) { decided = new Set() ; pinnedRecallGroups.set(session, decided) }
+    if (decided.has(issuer.seq)) return { folded: 0, alreadyDecided: true }
+    const entryBySeq = new Map(entries.map((e) => [e.seq, e]))
+    const group = []
+    for (let i = issuerIdx + 1; i < a; i++) {
+      const seq = nodes[i]
+      const ev = events[seq]
+      if (ev?.type !== 'tool/result' || ev.surfaceOp !== 'append') continue
+      const callId = ev.data?.message?.source?.callId ?? ''
+      if (logInfo.callMap.get(callId)?.name !== 'context_recall') continue
+      if (findIssuerAssistant(events, callId)?.seq !== issuer.seq) continue
+      const entry = entryBySeq.get(seq)
+      if (entry) group.push({ ...entry, idx: i })
+    }
+    if (!group.length) return { folded: 0 }
+    const lo = a - group.length
+    const eligible = group.every((g, n) => g.idx === lo + n)
+    if (!eligible) {
+      decided.add(issuer.seq)
+      return { folded: 0, pinned: group.length }
+    }
+    if (!group.every((g) => isRecallReadSafely(events, g.seq))) return { folded: 0 }
+    if (group.some((g) => stagedCallIds.has(g.callId))) return { folded: 0 }
+    const totalActiveRecallTokens = entries.reduce((sum, e) => sum + e.tokens, 0)
+    const latestIssuedRecall = (latestAsst.data?.message?.content ?? []).some((b) => b?.type === 'tool-call' && b.name === 'context_recall')
+    const shouldFold = latestIssuedRecall || totalActiveRecallTokens > 2500
+    decided.add(issuer.seq)
+    if (!shouldFold) return { folded: 0, pinned: group.length }
+    let folded = 0
+    for (const g of group) {
+      if (g.tokens < 180) continue
+      try { if (foldOne(g, 'pre-step')) folded++ } catch { /* C-33: group already recorded */ }
+    }
+    return { folded }
+  }
+
+  function findIssuerAssistant(events, callId) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i]
+      if (ev?.type !== 'assistant/message') continue
+      for (const block of ev.data?.message?.content ?? []) {
+        if (block?.type === 'tool-call' && block.id === callId) return ev
+      }
+    }
+    return null
+  }
+
+  /** C-20: one fresh PMW predicate. */
+  function pmwOpenNow(session) {
+    const rec = epochRecord(session)
+    stampRequestClock(session)
+    const lag = configuredPositive(config, 'pmwFreshnessLag', 0, true)
+    if (rec.pmw?.open !== true) return false
+    const fresh = rec.requestClock.requestSeq - rec.pmw.requestSeq <= lag
+    if (!fresh) {
+      try { autoCompactState(session).pmwStaleSkips = (autoCompactState(session).pmwStaleSkips ?? 0) + 1 } catch {}
+    }
+    return fresh
+  }
+
   function autoCompactClosingTurnResults(session, closingTurn) {
     const threshold = configuredPositive(config, 'autoCompactOpenTurnThreshold', DEFAULT_AUTO_COMPACT_OPEN_TURN_THRESHOLD, true)
     if (threshold === 0) return []
@@ -3535,7 +4068,7 @@ export function apply(ctx, rawConfig = {}) {
       const toolName = callInfo?.name ?? ''
       const tokens = pricedBySeq.get(seq) ?? 0
       if (toolName === 'context_recall') {
-        if (turn === closingTurn && tokens >= RECALL_EVICT_TOKENS && recallResultEvictable(session, seq, closingTurn)) {
+        if (config?.recallRollingDigest !== true && turn === closingTurn && tokens >= RECALL_EVICT_TOKENS && recallResultEvictable(session, seq, closingTurn)) {
           candidates.push({ seq, callId, tokens, recall: true, recallTarget: recallOriginalTarget(session, callId, callInfo) })
         }
         continue
@@ -3545,6 +4078,25 @@ export function apply(ctx, rawConfig = {}) {
       if (tokens >= threshold || archiveMultimedia) candidates.push({ seq, callId, tokens })
     }
     const committed = []
+    // v5 turn-end rolling digest (C-39): fold before legacy eviction candidates run.
+    if (config?.recallRollingDigest === true) {
+      try {
+        const nodes = session.surface.nodes
+        let pStar = nodes.length
+        if (epochRecord(session).pmw?.open === true) pStar = 0
+        else {
+          const idxs = []
+          for (const c of candidates) {
+            const idx = nodes.indexOf(c.seq)
+            if (idx >= 0) idxs.push(idx)
+          }
+          const flushed = sessionState(session).lastFlushMinIndex
+          if (typeof flushed === 'number' && flushed >= 0) idxs.push(flushed)
+          if (idxs.length) pStar = Math.min(...idxs)
+        }
+        evictConsumedRecallResults(session, 'turn-end', { closingTurn, pStar })
+      } catch {}
+    }
     for (const candidate of candidates) {
       try {
         const summary = candidate.recall
@@ -3567,7 +4119,10 @@ export function apply(ctx, rawConfig = {}) {
     return value === true || value === 'shadow'
   }
   function applyRecallPmwEvict(session) {
-    if (config?.recallBudget !== true || !session) return
+    if (config?.recallRollingDigest === true || !session) return
+    if (config?.recallBudget !== true) return
+    if (!pmwOpenNow(session)) return
+    // Legacy in-place path (pre-v5), kept byte-identical when the flag is off.
     const rec = epochRecord(session)
     if (!rec.pmw?.open) return
     for (const item of closedRecallResults(getAllEvents(session))) {
@@ -3655,30 +4210,79 @@ export function apply(ctx, rawConfig = {}) {
   }
   function maybeCoalesceSummaries(session) {
     if (config?.autoCoalesce !== true || !session?.surface?.nodes) return { skipped: 'disabled' }
-    const rec = epochRecord(session)
-    if (!rec.pmw?.open) return { skipped: 'pmw-closed' }
+    if (!pmwOpenNow(session)) return { skipped: 'pmw-closed' }
+    const events = getAllEvents(session)
+    const logInfo = inspectSessionLog(session)
     const frontier = summaryFrontierIndex(session)
     const blocks = []
     for (let i = 0; i < frontier; i++) {
       const seq = session.surface.nodes[i]
-      const ev = getEvent(session, seq)
+      const ev = events[seq]
       if (!isSummaryCheckpointEvent(ev)) continue
       const text = extractSummaryText(ev)
-      blocks.push({ seq, text, tokens: Math.ceil(text.length / 4), level: text.includes('[epoch L1') ? 'L1' : 'L0', recallTags: extractRecallTags(text) })
+      // C-24: strip Timeline rows; recallTags come from the unstripped text.
+      const summarySeq = ev.sourceEventSeqs?.[1]
+      const summaryEvent = events[summarySeq]?.type === 'compaction/summary' ? events[summarySeq] : null
+      const nt = resolveSurfaceNodeTurns(session, seq, logInfo)
+      const leafMin = nt.leafSeqs[0] ?? seq
+      const leafMax = nt.leafSeqs.at(-1) ?? seq
+      const sortedTurns = [...nt.turns].sort((a, b) => a - b)
+      // C-11: level from metadata first; text fallback anchored, never includes().
+      const afterHeader = text.replace(COMPACT_HEADER_TOKEN_RE, '').trim()
+      const level = summaryEvent?.data?.level
+        ?? ((afterHeader.startsWith('[epoch L1 ·') || (afterHeader.startsWith('<compacted-summary>') && afterHeader.replace(/^<compacted-summary>\s*/, '').startsWith('[epoch L1 ·'))) ? 'L1' : 'L0')
+      blocks.push({
+        seq,
+        text,
+        tokens: Math.ceil(text.length / 4),
+        level,
+        recallTags: extractRecallTags(text),
+        spanStart: leafMin,
+        spanEnd: leafMax,
+        turns: formatTurnsLabel(sortedTurns),
+        topics: resolveCheckpointTopics(session, ev, events, logInfo, config, summaryEvent),
+      })
     }
     const tokens = blocks.reduce((sum, block) => sum + block.tokens, 0)
     if (blocks.length <= DEFAULT_COALESCE_BLOCKS && tokens <= DEFAULT_COALESCE_TOKENS) return { skipped: 'under-threshold' }
     const coalesced = coalesceSummaryBlocks(blocks, { maxBlocks: DEFAULT_COALESCE_BLOCKS, maxTokens: DEFAULT_COALESCE_TOKENS })
     if (!coalesced.changed) return { skipped: 'idempotent' }
     try {
-      const turns = [...new Set(blocks.flatMap((b) => [...(inspectSessionLog(session).eventTurnMap.get(b.seq) ? [inspectSessionLog(session).eventTurnMap.get(b.seq)] : [])]))]
-      const from = turns.length ? `turn:${Math.min(...turns)}` : 'auto'
-      const to = turns.length ? `turn:${Math.max(...turns)}` : 'auto'
-      const summary = coalesced.blocks.map((b) => b.text).filter(Boolean).join('\n\n')
-      if (!summary) return { skipped: 'empty' }
-      const plan = planSpanCompaction(session, ctx.tokenMeter, { from, to, summary, mergeSummaries: true }, 1)
-      commitSpanCompaction(session, ctx.tokenMeter, plan)
-      return { coalesced: true, tags: coalesced.tags }
+      // C-25: commit one checkpoint per coalesced L1 group; keepL0 tail untouched.
+      const l1Blocks = coalesced.blocks.filter((b) => b.level === 'L1')
+      if (!l1Blocks.length) return { skipped: 'no-groups' }
+      let committedGroups = 0
+      for (const group of l1Blocks) {
+        const memberSeqs = Array.isArray(group.memberSeqs) ? group.memberSeqs : []
+        const headSeqs = memberSeqs.length ? memberSeqs : [group.seq].filter(Boolean)
+        if (!headSeqs.length) continue
+        // A group must be a run of adjacent surface indices that are all summary checkpoints.
+        const surfaceNodes = session.surface.nodes
+        const firstIdx = surfaceNodes.indexOf(headSeqs[0])
+        const lastIdx = surfaceNodes.indexOf(headSeqs.at(-1))
+        if (firstIdx < 0 || lastIdx < firstIdx) continue
+        let contiguous = true
+        for (let k = firstIdx; k <= lastIdx; k++) {
+          if (!isSummaryCheckpointEvent(events[surfaceNodes[k]]) || !headSeqs.includes(surfaceNodes[k])) { contiguous = false ; break }
+        }
+        if (!contiguous) continue
+        const turns = group.turns || blocks.filter((b) => headSeqs.includes(b.seq)).flatMap((b) => (b.turns || '').split(',')).filter(Boolean).join(',')
+        const summaryText = stripSummaryWrapper(String(group.text ?? ''))
+        if (!summaryText) continue
+        const plan = planSpanCompaction(session, ctx.tokenMeter, {
+          from: headSeqs.length ? `turn:${Math.min(...headSeqs.map((s) => logInfo.eventTurnMap.get(s) ?? 1))}` : 'auto',
+          to: headSeqs.length ? `turn:${Math.max(...headSeqs.map((s) => logInfo.eventTurnMap.get(s) ?? 1))}` : 'auto',
+          shadowedCheckpointSeqs: headSeqs,
+          summary: summaryText,
+          mergeSummaries: true,
+          topics: Array.isArray(group.topics) ? group.topics : undefined,
+        }, 1, config)
+        commitSpanCompaction(session, ctx.tokenMeter, plan, config)
+        committedGroups++
+        // C-25: stop after the first failed commit (planSpanCompaction throws above).
+      }
+      if (!committedGroups) return { skipped: 'no-committed-groups' }
+      return { coalesced: true, tags: coalesced.tags, committedGroups }
     } catch (err) {
       try { ctx.logger?.('context-compact')?.warn?.(`coalesce skipped: ${err instanceof Error ? err.message : String(err)}`) } catch {}
       return { skipped: 'error' }
@@ -3691,6 +4295,10 @@ export function apply(ctx, rawConfig = {}) {
       considerAutoCompact(session)
       maybeCoalesceSummaries(session)
       applyRecallPmwEvict(session)
+      // v5 C-38: PMW-open rolling digest fold (commitResultCompaction, never in-place).
+      if (session && config?.recallRollingDigest === true && pmwOpenNow(session)) {
+        try { evictConsumedRecallResults(session, 'pmw-open') } catch {}
+      }
     } catch {}
     return next()
   })
@@ -3702,6 +4310,7 @@ export function apply(ctx, rawConfig = {}) {
     const session = agent?.session
     if (!session) return
     const q = stagedBySession.get(session)
+    sessionState(session).lastFlushMinIndex = undefined
     if (q && (q.spans.length > 0 || q.results.size > 0)) {
       flushStagedCompactions(session, undefined, DEFAULT_MIN_SAVINGS_TOKENS, DEFAULT_MAX_FLUSH_RETRIES)
     }
@@ -3713,6 +4322,13 @@ export function apply(ctx, rawConfig = {}) {
       const agent = payload?.agent ?? this?.agent
       const session = agent?.session
       if (!session || payload?.signal?.aborted) return next()
+      // C-41: recall fold first, in its own try/catch; an error must not skip the watermark check.
+      if (config?.recallRollingDigest === true) {
+        try {
+          const openTurn = inspectSessionLog(session).openTurn
+          if (openTurn !== null) evictConsumedRecallResults(session, 'pre-step')
+        } catch {}
+      }
       const contextWindow = session.requestContext()?.contextWindow
       const ratio = configuredPositive(config, 'hardWatermarkRatio', DEFAULT_HARD_WATERMARK_RATIO)
       if (!contextWindow || contextWindow <= 0 || ratio <= 0 || ctx.tokenMeter.measure(session).totalTokens / contextWindow < ratio) return next()
@@ -3854,6 +4470,7 @@ export function apply(ctx, rawConfig = {}) {
               },
               summary: { type: 'string', description: 'Checkpoint summary.' },
               mergeSummaries: { type: 'boolean', description: 'Merge selected summaries into one L1 epoch summary.' },
+              topics: { type: 'array', description: 'Optional topic tags for this span, at most 3, lowercase kebab-case (e.g. gateway). Omit to infer.', items: { type: 'string' } },
             },
             required: ['summary'],
             additionalProperties: false,
@@ -4058,6 +4675,8 @@ export function apply(ctx, rawConfig = {}) {
       const beforeRatio = contextWindow > 0 ? beforeMeasurement.totalTokens / contextWindow : 0
       const tierCliffTokens = configuredPositive(config, 'tierCliffTokens', DEFAULT_TIER_CLIFF_TOKENS, true)
       const tierCliffReached = tierCliffTokens > 0 && (beforeMeasurement.totalTokens >= tierCliffTokens || beforeMeasurement.surfaceTokens >= tierCliffTokens)
+      const droppedTopics = [...new Set(plannedSpans.flatMap((x) => Array.isArray(x.droppedTopics) ? x.droppedTopics : []))]
+      const droppedTopicNote = droppedTopics.length ? ` (dropped topics: ${droppedTopics.join(', ')})` : ''
       const commitNow = concludeTurn || beforeRatio > DEFAULT_IMMEDIATE_RATIO || tierCliffReached
       if (commitNow) {
         if (exec?.signal?.aborted) throw new Error('aborted before commit')
@@ -4101,7 +4720,7 @@ export function apply(ctx, rawConfig = {}) {
         const errNote = outcome.errors.length > 0 ? ` [errors: ${outcome.errors.join('; ')}]` : ''
         const concludeNote = turnConcluded ? ' | turn concluded' : concludeBlockedNote
         parts.push(
-          `[Compact committed immediately: ${outcome.committedSpans.length} span(s), ${outcome.committedResults.length} result(s), saved ~${savedTokens} tok. ${tags.join(' ')}${skipNote}${skipSpanNote}${dedupNote}${noopNote}${concludeNote}${errNote}]`
+          `[Compact committed immediately: ${outcome.committedSpans.length} span(s), ${outcome.committedResults.length} result(s), saved ~${savedTokens} tok. ${tags.join(' ')}${skipNote}${skipSpanNote}${dedupNote}${noopNote}${concludeNote}${errNote}${droppedTopicNote}]`
         )
       } else {
         const savedTokens =
@@ -4119,7 +4738,7 @@ export function apply(ctx, rawConfig = {}) {
           ? ` (overlapping spans will be skipped at commit: ${overlapStageNotes.join(', ')})`
           : ''
         parts.push(
-          `[Compact staged for turn-stopping: ${plannedSpans.length} span(s), ${plannedResults.length} result(s), est. save ~${savedTokens} tok. Original content remains visible for the rest of this turn. ${tags.join(' ')}${skipNote}${dedupNote}${overlapNote}${noopNote}]`
+          `[Compact staged for turn-stopping: ${plannedSpans.length} span(s), ${plannedResults.length} result(s), est. save ~${savedTokens} tok. Original content remains visible for the rest of this turn. ${tags.join(' ')}${skipNote}${dedupNote}${overlapNote}${noopNote}${droppedTopicNote}]`
         )
       }
 
@@ -4135,7 +4754,12 @@ export function apply(ctx, rawConfig = {}) {
       properties: {
         target: {
           type: 'string',
-          description: 'Recall target: "@call:<callId>", "@span:S<start>-<end>", "@turn:<N>", "@index"/"@all"/"@search" for global query search, or event seq.',
+          description: 'Recall target: "@call:<callId>", "@span:S<start>-<end>", "@turn:<N>", "@topics" for the topic catalog, "@topic:<a,b>" for topic stage summaries, "@index"/"@all"/"@search" for global query search, or event seq.',
+        },
+        mode: {
+          type: 'string',
+          enum: ['full', 'summaries_only'],
+          description: 'full (default): original lines. summaries_only: stage summaries without expanding raw content.',
         },
         query: {
           type: 'string',
@@ -4175,23 +4799,66 @@ export function apply(ctx, rawConfig = {}) {
       if (exec?.signal?.aborted) throw new Error('tool call aborted')
       const session = exec?.agent?.session
       if (!session) throw new Error('context_recall requires an active agent session')
-      if (config?.recallBudget === true) {
-        const slot = takeRecallSlot(session, args, { perTurn: DEFAULT_RECALL_PER_TURN })
-        if (!slot.ok) {
-          return { text: slot.text, target: String(args?.target || ''), leafSeqs: [], totalLines: 0, returnedLines: 0, hasMore: false }
+      const gateOn = config?.recallRollingDigest === true
+      const budgetOn = config?.recallBudget === true
+      const inFlight = recallInFlightFor(session)
+      const isTopicCatalog = /^@topics$/i.test(String(args?.target ?? ''))
+      const isSummaryTier = String(args?.mode ?? '') === 'summaries_only' || /^@topic:/i.test(String(args?.target ?? ''))
+      const capLimit = isTopicCatalog ? 380 : isSummaryTier ? 1200 : RECALL_EVICT_TOKENS
+      const estimateFn = (s) => ctx.tokenMeter.estimateMessage({ role: 'tool', content: [{ type: 'text', text: s }] })
+      const recallOptions = { maxTokens: capLimit, estimateTokens: estimateFn }
+      const refused = (text) => ({ text, target: String(args?.target || ''), leafSeqs: [], totalLines: 0, returnedLines: 0, hasMore: false })
+      const finish = (res) => {
+        const capped = capRecallText(res.text, capLimit, estimateFn)
+        if (exec?.callId) {
+          recordRecallCallMeta(session, exec.callId, {
+            target: String(args?.target ?? ''), query: typeof args?.query === 'string' ? args.query : undefined,
+            mode: String(args?.mode ?? 'full'), totalLines: res.totalLines, returnedLines: res.returnedLines,
+            nextLineRange: res.nextLineRange, leafSeqs: res.leafSeqs, turnsLabel: '',
+            firstLine: Number(/lines: (\d+)-/.exec(res.text)?.[1] ?? 0) || undefined,
+            lastLine: Number(/lines: \d+-(\d+)/.exec(res.text)?.[1] ?? 0) || undefined,
+          })
         }
+        return {
+          text: capped.text,
+          target: res.target,
+          leafSeqs: res.leafSeqs,
+          totalLines: res.totalLines,
+          returnedLines: res.returnedLines,
+          hasMore: res.hasMore,
+        }
+      }
+      if (gateOn) {
+        const flightKey = recallFlightKey(session, args)
+        const gate = evaluateRecallGate(session, args, { inFlight, recallBudget: budgetOn, perTurn: DEFAULT_RECALL_PER_TURN })
+        if (!gate.ok) {
+          const n = noteRecallRefusal(session)
+          return refused(n > 3 ? RECALL_LOOP_LINE : (gate.text || '[Recall-Gate refused]'))
+        }
+        inFlight.add(flightKey)
+        try {
+          if (budgetOn) noteRecallRebound(session, recallTurnOf(session), args?.target)
+          const res = executeRecall(session, args, recallOptions)
+          markRecallPending(session, flightKey)
+          if (gate.pin && exec?.callId) {
+            const issuer = findIssuerAssistant(getAllEvents(session), exec.callId)
+            if (issuer) {
+              let decided = pinnedRecallGroups.get(session)
+              if (!decided) { decided = new Set(); pinnedRecallGroups.set(session, decided) }
+              decided.add(issuer.seq)
+            }
+          }
+          return finish(res)
+        } finally {
+          inFlight.delete(flightKey)
+        }
+      }
+      if (budgetOn) {
+        const slot = takeRecallSlot(session, args, { perTurn: DEFAULT_RECALL_PER_TURN })
+        if (!slot.ok) return refused(slot.text)
         noteRecallRebound(session, recallTurnOf(session), args?.target)
       }
-      const res = executeRecall(session, args)
-      const capped = capRecallText(res.text, RECALL_EVICT_TOKENS)
-      return {
-        text: capped.text,
-        target: res.target,
-        leafSeqs: res.leafSeqs,
-        totalLines: res.totalLines,
-        returnedLines: res.returnedLines,
-        hasMore: res.hasMore,
-      }
+      return finish(executeRecall(session, args, recallOptions))
     },
   }), '@dsh-external/dsh-context-compact: context_recall')
 

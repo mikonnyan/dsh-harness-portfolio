@@ -1467,11 +1467,16 @@ function plantSummaryCheckpoint(session, fromTurn, toTurn, text) {
 test('summary @auto is deterministic, bounded, supports a judgement tail and rejects epoch merge', async () => {
   const { buildAutoSpanDigest, parseAutoSummary, planSpanCompaction } = await import('../lib/index.js')
   assert.deepEqual(parseAutoSummary('@auto root cause'), { auto: true, tail: 'root cause' })
-  const session = { events: [], surface: { nodes: [] } }
-  session.events.push({ seq: 0, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'implement protocol' }] } })
-  const digest = buildAutoSpanDigest(session, { eventTurnMap: new Map([[0, 1]]) }, [0])
+  const session = { events: [], surface: { nodes: [] }, requestHeader: () => ({}) }
+  session.events.push({ seq: 0, type: 'turn/start', time: 1, data: { turn: 1, time: 1 } })
+  session.events.push({ seq: 1, type: 'user/message', time: 1, surfaceOp: 'append', data: { source: { kind: 'user' }, time: 1, content: [{ type: 'text', text: 'implement protocol' }] } })
+  session.events.push({ seq: 2, type: 'turn/end', time: 2, data: { turn: 1, time: 2, reason: { kind: 'completed' } } })
+  session.events.push({ seq: 3, type: 'turn/start', time: 3, data: { turn: 2, time: 3 } })
+  session.surface.nodes = [1]
+  const digest = buildAutoSpanDigest(session, { eventTurnMap: new Map([[1, 1]]) }, [1])
   assert(digest.includes('implement protocol') && digest.length <= 300)
-  assert.throws(() => planSpanCompaction(session, { measure: () => ({ nodes: [] }) }, { to: 'turn:1', summary: '@auto', mergeSummaries: true, now: Date.now() + 300000 }), /mergeSummaries/)
+  // v5 C-27: the @auto + mergeSummaries throw is lifted; planning succeeds inside the cold-start window.
+  assert.doesNotThrow(() => planSpanCompaction(session, { measure: () => ({ nodes: [{ seq: 1, tokens: 500 }], surfaceTokens: 500, totalTokens: 500 }), estimateMessage: () => 1 }, { to: 'turn:1', summary: '@auto', mergeSummaries: true, now: Date.now() + 300000 }, 1, { topicIndexing: true }))
 })
 
 test('Pillar 2: closing-turn heavy output auto-compacts and recalls losslessly', async () => {

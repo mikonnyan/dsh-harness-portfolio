@@ -53,7 +53,8 @@
   "scripts": {
     "build": "bash scripts/build.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:v5": "node --test test/index.test.js"
   },
   "dsh": {
     "bundle": {

@@ -4,6 +4,24 @@ import { createHash } from 'node:crypto'
 
 const TAG_RE = /\[recall:\s*@[^\]]+\]/g
 const SECTION_RE = /^##\s*(决定与纠正|未完成事项|锚点|经过)\s*$/
+const TIMELINE_HEADING_RE = /^##\s*Topic Timeline\s*$/
+const TIMELINE_ROW_RE = /^(?:-\s+T|\[\+)/
+
+/** Remove the `## Topic Timeline` block (C-24). */
+export function stripTopicTimeline(text) {
+  const lines = String(text ?? '').split(/\r?\n/)
+  const out = []
+  let inBlock = false
+  for (const line of lines) {
+    if (TIMELINE_HEADING_RE.test(line.trim())) { inBlock = true ; continue }
+    if (inBlock) {
+      if (TIMELINE_ROW_RE.test(line.trim())) continue
+      inBlock = false
+    }
+    out.push(line)
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
 
 export function extractRecallTags(text) {
   return [...String(text || '').matchAll(TAG_RE)].map((m) => m[0])
@@ -57,10 +75,12 @@ function spanCovered(inner, outer) {
 }
 
 function parseSections(text) {
+  // C-24: Timeline blocks are structural, never narrative; strip them before sectioning.
+  const stripped = stripTopicTimeline(text)
   const buckets = { '决定与纠正': [], '未完成事项': [], '锚点': [], '经过': [] }
   let current = '经过'
   let any = false
-  for (const raw of String(text || '').split(/\r?\n/)) {
+  for (const raw of String(stripped || '').split(/\r?\n/)) {
     const line = raw.trim()
     if (!line || line === '<compacted-summary>' || line === '</compacted-summary>') continue
     if (/^\[recall:\s*@/.test(line) && normalizeSummaryText(line) === '') continue
@@ -68,7 +88,7 @@ function parseSections(text) {
     if (heading) { current = heading[1]; any = true; continue }
     buckets[current].push(line)
   }
-  if (!any) buckets['经过'] = normalizeSummaryText(text) ? [normalizeSummaryText(text)] : []
+  if (!any) buckets['经过'] = normalizeSummaryText(stripped) ? [normalizeSummaryText(stripped)] : []
   return buckets
 }
 
@@ -85,12 +105,14 @@ function dedupeLines(rows) {
 }
 
 export function renderL1(blocks, turns, narrativeBudget = 1500) {
+  // C-24: never re-ingest Timeline rows from a constituent block.
+  const safeBlocks = (Array.isArray(blocks) ? blocks : []).map((b) => (b && typeof b === 'object' ? { ...b, text: stripTopicTimeline(b.text) } : b))
   const buckets = { '决定与纠正': [], '未完成事项': [], '锚点': [], '经过': [] }
-  for (const block of blocks) {
+  for (const block of safeBlocks) {
     const parsed = parseSections(block.text)
     for (const key of Object.keys(buckets)) buckets[key].push(...parsed[key])
   }
-  const tags = unionTags(blocks.flatMap((b) => archivalTags(b)))
+  const tags = unionTags(safeBlocks.flatMap((b) => archivalTags(b)))
   const narrative = dedupeLines(buckets['经过'])
   let narrativeText = narrative.join('\n')
   const budget = Number.isFinite(narrativeBudget) && narrativeBudget >= 0 ? narrativeBudget : 1500
@@ -110,8 +132,8 @@ export function renderL1(blocks, turns, narrativeBudget = 1500) {
     narrativeText || '（无）',
     tags.join(' '),
   ].join('\n')
-  const label = turns ? `turns ${turns}` : `${blocks.length} blocks`
-  return `<compacted-summary>\n[epoch L1 · ${label} · ${blocks.length} blocks]\n${body}\n</compacted-summary>`
+  const label = turns ? `turns ${turns}` : `${safeBlocks.length} blocks`
+  return `<compacted-summary>\n[epoch L1 · ${label} · ${safeBlocks.length} blocks]\n${body}\n</compacted-summary>`
 }
 
 function decorate(block, index) {
@@ -215,6 +237,16 @@ function makeL1(group, narrativeBudget) {
   const recallTag = `[recall: @span:S${Number.isFinite(spanStart) ? spanStart : 0}-${Number.isFinite(spanEnd) ? spanEnd : 0}]`
   const rendered = renderL1(group, turns, narrativeBudget)
   const text = rendered.includes(recallTag) ? rendered : rendered.replace('</compacted-summary>', `${recallTag}\n</compacted-summary>`)
+  const memberSeqs = group.map((b) => b.seq).filter((n) => typeof n === 'number')
+  const topics = []
+  for (const block of group) {
+    for (const topic of Array.isArray(block.topics) ? block.topics : []) {
+      if (typeof topic !== 'string' || !topic || topics.includes(topic)) continue
+      if (topics.length >= 3) break
+      topics.push(topic)
+    }
+    if (topics.length >= 3) break
+  }
   return {
     level: 'L1',
     text,
@@ -222,6 +254,9 @@ function makeL1(group, narrativeBudget) {
     recallTags: unionTags(group.flatMap((block) => archivalTags(block))),
     spanStart,
     spanEnd,
+    turns,
+    topics,
+    memberSeqs,
     tokens: Math.ceil(text.length / 4),
   }
 }

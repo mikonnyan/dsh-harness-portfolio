@@ -154,11 +154,12 @@ const MAP_V3 = Object.freeze({
     }),
   }),
   context_recall: Object.freeze({
-    expectParams: Object.freeze(['context_lines', 'line_range', 'query', 'target']),
-    description: 'Read-only lossless recall of original uncompacted content, including nested compactions. Returns up to 120 lines per call with a continuation cursor.',
+    expectParams: Object.freeze(['context_lines', 'line_range', 'mode', 'query', 'target']),
+    description: 'Read-only lossless recall of compacted history or topic/stage summaries. Max 120 lines per call with cursor.',
     params: Object.freeze({
-      target: 'Recall target: @call:<id>, @span:, @turn:, @search.',
-      query: 'Substring or regex filter within the recalled content.',
+      target: 'Target: @topics, @topic:<a,b>, @span:, @call:<id>, @turn:<N>, @search.',
+      mode: 'full (default) or summaries_only.',
+      query: 'Substring or regex filter within recalled content.',
       line_range: 'Optional 1-based inclusive [start, end] range.',
       context_lines: 'Surrounding context lines when query is used.',
     }),
