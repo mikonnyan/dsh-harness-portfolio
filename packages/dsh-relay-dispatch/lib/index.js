@@ -2262,12 +2262,57 @@ export function formatPipelineSummary(manifest, maxResultChars = 2000, options =
   return lines.join('\n')
 }
 
+// GIT env-config sanitation: dsh-subprocess scrubbedParentEnv() strips KEY/PASSWORD/SECRET/TOKEN
+// named vars, removing GIT_CONFIG_KEY_0 while keeping GIT_CONFIG_COUNT (and often GIT_CONFIG_VALUE_0).
+// Git then aborts with "missing config key GIT_CONFIG_KEY_0" / "unable to parse command-line config"
+// in every host-spawned child. sanitizeGitEnvConfig keeps a complete custom env and drops an
+// incomplete set. The host process.env trio is stripped unconditionally by sanitizeProcessEnvGitConfig,
+// because a complete trio is still unsafe under the /KEY/i scrub.
+export function sanitizeGitEnvConfig(env) {
+  if (!env || typeof env !== 'object') return env
+  const hasCount = Object.prototype.hasOwnProperty.call(env, 'GIT_CONFIG_COUNT')
+  const raw = String(env.GIT_CONFIG_COUNT ?? '').trim()
+  const pairIdx = (k) => (/^GIT_CONFIG_(KEY|VALUE)_(\d+)$/.exec(k) || [])[2]
+  const pairKeys = Object.keys(env).filter((k) => pairIdx(k) !== undefined)
+  const dropKeys = (target, keys) => { const out = { ...target }; for (const k of keys) delete out[k]; return out }
+  if (!hasCount || !/^\d+$/.test(raw)) {
+    if (!pairKeys.length && !hasCount) return env
+    const keys = [...pairKeys]
+    if (hasCount) keys.push('GIT_CONFIG_COUNT')
+    return dropKeys(env, keys)
+  }
+  const count = Number(raw)
+  if (count <= 0) {
+    if (!pairKeys.length) return env
+    return dropKeys(env, ['GIT_CONFIG_COUNT', ...pairKeys])
+  }
+  for (let i = 0; i < count; i++) {
+    if (env[`GIT_CONFIG_KEY_${i}`] === undefined || env[`GIT_CONFIG_VALUE_${i}`] === undefined) {
+      return dropKeys(env, ['GIT_CONFIG_COUNT', ...pairKeys])
+    }
+  }
+  const strays = pairKeys.filter((k) => Number(pairIdx(k)) >= count)
+  if (strays.length) return dropKeys(env, strays)
+  return env
+}
+
+// In-place, idempotent. Always drops GIT_CONFIG_COUNT and every GIT_CONFIG_KEY_* /
+// GIT_CONFIG_VALUE_* from env (default: the live host process.env), including a complete trio.
+export function sanitizeProcessEnvGitConfig(env = process.env) {
+  if (!env || typeof env !== 'object') return undefined
+  const before = env.GIT_CONFIG_COUNT
+  for (const k of Object.keys(env)) {
+    if (k === 'GIT_CONFIG_COUNT' || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(k)) delete env[k]
+  }
+  return before
+}
+
 function execGit(workspace, args, env = {}, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const fullArgs = ['-c', 'core.quotepath=off', ...args]
     execFile('git', fullArgs, {
       cwd: workspace,
-      env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_CONFIG'))), ...env },
+      env: { ...sanitizeGitEnvConfig(process.env), ...env },
       windowsHide: true,
       timeout: timeoutMs,
       maxBuffer: 16 * 1024 * 1024,
@@ -2413,7 +2458,7 @@ function execCheck(command, cwd, timeoutMs = 120000) {
           : args
     // A gate often runs inside `node --test`. Inheriting NODE_TEST_CONTEXT makes the
     // child `node --test` treat itself as recursive and skip the file, so minTests sees no count.
-    const env = { ...process.env }
+    const env = { ...sanitizeGitEnvConfig(process.env) }
     for (const key of Object.keys(env)) {
       if (key === 'NODE_CHANNEL_FD' || key === 'NODE_CHANNEL_SERIALIZATION_MODE' || key.startsWith('NODE_TEST_')) delete env[key]
     }
@@ -2770,6 +2815,9 @@ export function reloadPluginByName(ctx, pluginName) {
 }
 
 export function apply(ctx, rawConfig) {
+  // Host env sanitation: drop GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_* even
+  // when the trio is complete (scrubbedParentEnv matches /KEY/i and orphans COUNT).
+  try { sanitizeProcessEnvGitConfig() } catch {}
   const config = { ...DEFAULTS, ...(rawConfig || {}) }
   const tools = ctx.tools
   const dispatchAls = new AsyncLocalStorage()

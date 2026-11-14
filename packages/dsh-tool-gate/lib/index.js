@@ -37,6 +37,59 @@ export const EXTRAS_TOOLS = Object.freeze([
   'modlens_read_image', 'x_search', 'read_page',
 ])
 
+// GIT env-config protocol: git reads GIT_CONFIG_COUNT + GIT_CONFIG_KEY_i/GIT_CONFIG_VALUE_i pairs.
+// dsh-subprocess scrubbedParentEnv() strips KEY/PASSWORD/SECRET/TOKEN-named vars, which removes
+// GIT_CONFIG_KEY_0 but keeps GIT_CONFIG_COUNT (and often GIT_CONFIG_VALUE_0) -> every host-spawned
+// child (pwsh tool, subagents, verify subtasks) sees an orphaned counter and git aborts with
+// "missing config key GIT_CONFIG_KEY_0" / "unable to parse command-line config".
+// sanitizeGitEnvConfig keeps a complete custom env and drops an incomplete set
+// (COUNT present and any KEY_i/VALUE_i for i < COUNT missing, or stray pairs).
+// The host process is different: scrubbedParentEnv() matches /KEY/i and deletes
+// GIT_CONFIG_KEY_* while leaving GIT_CONFIG_COUNT, so a complete trio on
+// process.env is still unsafe. sanitizeProcessEnvGitConfig strips it unconditionally.
+export function sanitizeGitEnvConfig(env) {
+  if (!env || typeof env !== 'object') return env
+  const hasCount = Object.prototype.hasOwnProperty.call(env, 'GIT_CONFIG_COUNT')
+  const raw = String(env.GIT_CONFIG_COUNT ?? '').trim()
+  const pairIdx = (k) => (/^GIT_CONFIG_(KEY|VALUE)_(\d+)$/.exec(k) || [])[2]
+  const pairKeys = Object.keys(env).filter((k) => pairIdx(k) !== undefined)
+  const dropKeys = (target, keys) => { const out = { ...target }; for (const k of keys) delete out[k]; return out }
+  if (!hasCount || !/^\d+$/.test(raw)) {
+    // COUNT absent (stray pairs only) or non-numeric ("bogus count" for git) -> drop both.
+    if (!pairKeys.length && !hasCount) return env
+    const keys = [...pairKeys]
+    if (hasCount) keys.push('GIT_CONFIG_COUNT')
+    return dropKeys(env, keys)
+  }
+  const count = Number(raw)
+  if (count <= 0) {
+    if (!pairKeys.length) return env
+    return dropKeys(env, ['GIT_CONFIG_COUNT', ...pairKeys])
+  }
+  for (let i = 0; i < count; i++) {
+    if (env[`GIT_CONFIG_KEY_${i}`] === undefined || env[`GIT_CONFIG_VALUE_${i}`] === undefined) {
+      // Orphaned counter (the scrubbedParentEnv shape): drop the whole set.
+      return dropKeys(env, ['GIT_CONFIG_COUNT', ...pairKeys])
+    }
+  }
+  const strays = pairKeys.filter((k) => Number(pairIdx(k)) >= count)
+  if (strays.length) return dropKeys(env, strays)
+  return env
+}
+
+// Mutates env in place (default: the live host process.env). Idempotent.
+// Always drops GIT_CONFIG_COUNT and every GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_*,
+// including a complete trio. Called at plugin apply() so host-spawned children
+// (pwsh, subagents, verify subtasks) never inherit an orphan COUNT.
+export function sanitizeProcessEnvGitConfig(env = process.env) {
+  if (!env || typeof env !== 'object') return undefined
+  const before = env.GIT_CONFIG_COUNT
+  for (const k of Object.keys(env)) {
+    if (k === 'GIT_CONFIG_COUNT' || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(k)) delete env[k]
+  }
+  return before
+}
+
 export const DEFAULT_CONFIG = {
   groups: {
     extras: { prefixes: [], names: [...EXTRAS_TOOLS], bypass: true, hint: 'create_goal/get_goal/update_goal、workflow、ralph、cursor_agent 等低频工具；仅用户明确要求时用，先 tool_unlock(extras, once) 再调用' },
@@ -525,6 +578,10 @@ function classifyDeps(ctx, agent) {
 }
 
 export function apply(ctx) {
+  // Host env sanitation: drop GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_*
+  // even when the trio is complete. scrubbedParentEnv() matches /KEY/i and would
+  // otherwise delete KEY_* and leave an orphan COUNT. In-place, idempotent, no restart.
+  try { sanitizeProcessEnvGitConfig() } catch {}
   const index = () => Object.entries(loadConfig().groups).map(([g, d]) => `- ${g}: ${d.hint || ''}`).join('\n')
   ctx.effect(() => ctx.tools.register({
     name: 'tool_unlock',
@@ -649,6 +706,8 @@ export function apply(ctx) {
 
   ctx.on('tools/pre-execute', async (exec, next) => {
     if (isInternalCall(exec)) return next()
+    // Belt-and-suspenders: re-strip host git env-config if a later layer restored it.
+    try { sanitizeProcessEnvGitConfig() } catch {}
     const session = exec.agent?.session, cfg = loadConfig()
     // Guard before bypass, so dev_* cannot skip the orchestrator budget.
     if ((cfg.strictOrchestratorGuard === true || cfg.strictOrchestratorGuard === 'shadow') && isMainOrchestratorSession(session)) try {

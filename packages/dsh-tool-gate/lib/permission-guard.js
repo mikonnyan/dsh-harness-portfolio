@@ -48,6 +48,60 @@ const APPROVED_NODE_SMOKE_SHA256 = new Set(['c41df4ec48b14d006321cd7681ffd0dde07
 // Pinned by content hash, same shape as the loopback smoke allow. test-5-models.js is not in this tree.
 const NODE_EFFORT_BENCH_SCRIPTS = new Set(['grok-effort-bench.js'])
 const APPROVED_NODE_EFFORT_BENCH_SHA256 = new Set(['54dc305f7cf2cd2801c143dd23c81aac202b75fa3ee0265d9d9dd4410c306293'])
+
+// ── Git subcommand classification (A15): read-only / scoped-write / high-risk ──
+// Reads the real subcommand, skipping global flags (-C <dir>, --git-dir=..., --no-pager, --version).
+const GIT_GLOBAL_FLAGS_WITH_VALUE = new Set(['-c', '-C', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix'])
+const GIT_READ_ONLY_SUBCOMMANDS = new Set(['diff', 'status', 'show', 'log', 'rev-parse', 'branch', 'remote', 'ls-files', 'describe', 'tag', 'config', 'version', 'help', 'cat-file', 'ls-remote', 'blame', 'shortlog', 'reflog', 'name-rev', 'annotate', 'count-objects', 'verify-commit', 'verify-tag', 'whatchanged'])
+const GIT_SCOPED_WRITE_SUBCOMMANDS = new Set(['add', 'commit', 'push', 'pull', 'fetch', 'rm', 'mv', 'restore', 'checkout', 'stash', 'merge', 'rebase', 'clone', 'init', 'apply', 'cherry-pick', 'revert', 'switch', 'tag-create'])
+const GIT_DESTRUCTIVE_SUBCOMMANDS = new Set(['reset', 'clean', 'gc', 'filter-branch', 'reflog-expire', 'prune', 'update-ref', 'symbolic-ref'])
+
+function gitSubcommand(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === '--version' || arg === '--help') return arg
+    if (arg === '--') return null
+    if (arg.startsWith('--')) {
+      const name = arg.slice(2).split('=')[0]
+      if (GIT_GLOBAL_FLAGS_WITH_VALUE.has(`--${name}`) && !arg.includes('=')) i++
+      continue
+    }
+    if (arg.startsWith('-') && arg !== '-') {
+      if (GIT_GLOBAL_FLAGS_WITH_VALUE.has(arg)) i++
+      continue
+    }
+    return arg
+  }
+  return null
+}
+
+// subcommand-level write flags that flip a read-only verb into a scoped write
+const GIT_WRITE_FLAG_PREFIXES = ['-d', '-D', '-e', '-m', '-a', '-u', '-s', '--delete', '--edit', '--set', '--add', '--unset', '--create', '--force-create', '--move', '--copy', '--remove', '--update', '--all']
+const GIT_BRANCH_READ_ONLY = (subArgv) => subArgv.some((a) => ['-d', '-D', '-m', '-M', '--edit-ref'].includes(a))
+const GIT_REMOTE_READ_ONLY = (subArgv) => !subArgv.includes('add') && !subArgv.some((a) => a === 'set-url' || a === 'rename' || a === 'remove' || a === 'prune' || a === 'update' || a === 'delete')
+const GIT_TAG_READ_ONLY = (subArgv) => subArgv.every((a) => a === '-l' || a === '--list' || a === '-n' || /^--sort/.test(a) || /^--format/.test(a) || /^refs\//.test(a) || a === '--contains' || a === '--points-at' || a === '--merged' || a === '--no-merged' || a === '-n*')
+const GIT_CONFIG_READ_ONLY = (subArgv) => subArgv.length === 1 || (subArgv.length === 2 && !subArgv.some((a) => GIT_WRITE_FLAG_PREFIXES.some((p) => a === p || a.startsWith(`${p}=`)))) && !subArgv.includes('--global')
+
+function classifyGitSubcommand(executable, argv) {
+  if (executable !== 'git') return null
+  const sub = gitSubcommand(argv)
+  if (sub == null) return null
+  if (sub === '--version' || sub === 'version' || sub === '--help' || sub === 'help') return 'SAFE_READ'
+  const rest = argv.slice(argv.indexOf(sub) + 1)
+  // Force / rewrite anywhere in argv is HIGH_RISK (reset --hard, clean -f/-fd, push --force/-f).
+  const isResetHard = sub === 'reset' && rest.includes('--hard')
+  const isCleanForce = sub === 'clean' && rest.some((a) => /^-(?:\w*f\w*)$/.test(a))
+  const isPushForce = sub === 'push' && rest.some((a) => a === '--force' || a === '-f' || a === '--force-with-lease' || /^--force[=-]/.test(a))
+  if (isResetHard || isCleanForce || isPushForce) return 'HIGH_RISK'
+  if (GIT_DESTRUCTIVE_SUBCOMMANDS.has(sub)) return 'HIGH_RISK'
+  if (sub === 'branch') return GIT_BRANCH_READ_ONLY(rest) ? null : 'SAFE_READ'
+  if (sub === 'remote') return GIT_REMOTE_READ_ONLY(rest) ? 'SAFE_READ' : 'SCOPED_WRITE'
+  if (sub === 'tag') return GIT_TAG_READ_ONLY(rest) ? 'SAFE_READ' : 'SCOPED_WRITE'
+  if (sub === 'config') return GIT_CONFIG_READ_ONLY(rest) ? 'SAFE_READ' : null
+  if (GIT_READ_ONLY_SUBCOMMANDS.has(sub)) return 'SAFE_READ'
+  if (GIT_SCOPED_WRITE_SUBCOMMANDS.has(sub)) return 'SCOPED_WRITE'
+  return null
+}
 const ESCALATION_KEYS = ['sandbox_permissions', 'amend', 'extend', 'escalate']
 const FILE_TOOLS = new Set(['read', 'write', 'edit'])
 const SHELL_TOOLS = new Set(['pwsh', 'bash', 'shell', 'cmd'])
@@ -320,7 +374,12 @@ export function normalizeCommand(command, cwd) {
       if (argv[0] === 'run' && !(argv.length === 2 && ['check', 'bench'].includes(argv[1]))) return { ...normalized, risk: 'UNKNOWN' }
       if (!['test', 'run', 'ls'].includes(argv[0]) && !validPrefixTest) return { ...normalized, risk: 'UNKNOWN' }
     }
-    if (normalized.executable === 'git' && !['diff', 'status', 'show', 'log', 'rev-parse'].some((c) => argv.includes(c))) return { ...normalized, risk: 'UNKNOWN' }
+    if (normalized.executable === 'git') {
+      const gitRisk = classifyGitSubcommand(normalized.executable, argv)
+      if (gitRisk === 'HIGH_RISK') return { ...normalized, risk: 'HIGH_RISK' }
+      if (gitRisk == null) return { ...normalized, risk: 'UNKNOWN' }
+      return { ...normalized, risk: gitRisk }
+    }
     return { ...normalized, risk: 'SAFE_READ' }
   }
   if (['get-content', 'get-childitem', 'get-location', 'get-filehash', 'get-item', 'test-path'].includes(normalized.executable)) return { ...normalized, risk: 'SAFE_READ' }
@@ -437,8 +496,18 @@ export function permissionDecision(toolName, args = {}, session, options = {}) {
       return { kind: 'allow', classification: 'SCOPED_EFFORT_BENCH' }
     }
     if (command.risk === 'SCOPED_WRITE') {
-      const targets = pathArgs(command.executable, command.argv)
-      if (!targets.length || targets.some((p) => SENSITIVE.test(p) || !rootsOf(manifest, 'write').some((root) => pathWithinVerified(p, root, cwd)))) return localDeny('command_path_outside_write_scope', manifest, { operation: 'shell' })
+      if (command.executable === 'git') {
+        // Git writes operate on the repo containing the effective workdir (-C <dir> or cwd).
+        // When no path argument escapes the workspace, validate that workdir against write_roots.
+        const targets = pathArgs('copy-item', command.argv.filter((a) => !GIT_GLOBAL_FLAGS_WITH_VALUE.has(a) && !a.startsWith('-')))
+        const repoDir = targets.length ? lexicalPath(targets[0], cwd) : cwd
+        if (!repoDir || !rootsOf(manifest, 'write').some((root) => pathWithinVerified(repoDir, root, cwd))) {
+          return localDeny('command_path_outside_write_scope', manifest, { operation: 'shell', path: repoDir })
+        }
+      } else {
+        const targets = pathArgs(command.executable, command.argv)
+        if (!targets.length || targets.some((p) => SENSITIVE.test(p) || !rootsOf(manifest, 'write').some((root) => pathWithinVerified(p, root, cwd)))) return localDeny('command_path_outside_write_scope', manifest, { operation: 'shell' })
+      }
     }
     if (command.risk === 'HIGH_RISK') {
       const summary = approvalSummary({ ...command, manifest, env: options.env || {} })

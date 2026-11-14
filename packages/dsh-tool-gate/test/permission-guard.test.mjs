@@ -136,6 +136,42 @@ test('only literal read-only loopback probes and approved remote tests pass', ()
   for (const command of ['ssh 100.64.0.2 "rm x"', 'ssh example.com "pytest"', 'ssh 100.64.0.2 "kill 1"']) assert.equal(permissionDecision('pwsh', { command, workdir: work }, session(), { now: NOW + 1 }).kind, 'deny', command)
 })
 
+test('read-only git subcommands are SAFE_READ in write and read-only sessions', () => {
+  const ro = session(compileCapabilityManifest({ ...baseArgs, permissionPreset: 'read-only' }, { taskId: 'ro-git', parentSession: 'parent', now: NOW }))
+  for (const command of ['git status', 'git diff', 'git log --oneline -5', 'git show HEAD', 'git rev-parse --git-dir', 'git branch', 'git remote', 'git ls-files', 'git describe --tags', 'git tag', 'git --version', 'git version', 'git -C . status', 'git --no-pager log -1', 'git branch --list']) {
+    assert.equal(permissionDecision('pwsh', { command, workdir: work }, session(), { now: NOW + 1 }).kind, 'allow', command)
+    assert.equal(permissionDecision('pwsh', { command, workdir: work }, ro, { now: NOW + 1 }).kind, 'allow', `ro: ${command}`)
+  }
+})
+
+test('read-only sessions deny git add/commit/push', () => {
+  const roM = compileCapabilityManifest({ ...baseArgs, permissionPreset: 'read-only' }, { taskId: 'ro-git2', parentSession: 'parent', now: NOW })
+  for (const command of ['git add -A', 'git commit -m "x"', 'git push origin main']) {
+    assert.equal(deny('pwsh', { command, workdir: src }, roM).error.reason, 'command_path_outside_write_scope', command)
+  }
+})
+
+test('write sessions allow git add/commit/push within write roots as SCOPED_WRITE', () => {
+  for (const command of ['git add -A', 'git commit -m "feat: x"', 'git push origin main', 'git rm --cached x', 'git mv a b', 'git stash']) {
+    const d = permissionDecision('pwsh', { command, workdir: src }, session(), { now: NOW + 1 })
+    assert.equal(d.kind, 'allow', command)
+    assert.equal(d.classification, 'SCOPED_WRITE', command)
+  }
+})
+
+test('git force and rewrite variants are HOLD_HIGH_RISK', () => {
+  for (const command of ['git push --force origin main', 'git push -f origin main', 'git reset --hard HEAD~1', 'git clean -fd']) {
+    const d = permissionDecision('pwsh', { command, workdir: src }, session(), { now: NOW + 1 })
+    assert.equal(d.kind, 'deny', command)
+    assert.equal(d.decision, 'HOLD_HIGH_RISK', command)
+  }
+})
+
+test('git writes outside write roots and unknown git subcommands deny', () => {
+  assert.equal(deny('pwsh', { command: 'git add -A', workdir: work }).error.reason, 'command_path_outside_write_scope')
+  assert.equal(deny('pwsh', { command: 'git notes add -m x', workdir: src }).error.reason, 'command_not_statically_verifiable')
+})
+
 test('high-risk approval digest is canonical and detects argv/cwd/task tampering', () => {
   const d = permissionDecision('pwsh', { command: `Remove-Item ${join(src, 'a.txt')}` }, session(), { now: NOW + 1 })
   assert.equal(d.kind, 'deny'); assert.equal(d.decision, 'HOLD_HIGH_RISK')
